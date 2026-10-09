@@ -30,6 +30,14 @@ def load_functions(path):
             raise LoadError(f'{path}: no symbol table')
 
         relocatable = elf['e_type'] == 'ET_REL'
+        if relocatable:
+            # In an unlinked .o, branch/call targets are placeholders that the
+            # linker patches using these relocations. We don't apply them.
+            for section in elf.iter_sections():
+                if section['sh_type'] in ('SHT_REL', 'SHT_RELA') and section.num_relocations():
+                    raise LoadError(f'{path}: unlinked object has relocations '
+                                    f'({section.name}); link it first')
+
         functions = []
         for sym in symtab.iter_symbols():
             # ARM "mapping symbols" ($a, $t, $d) mark code/data regions; they

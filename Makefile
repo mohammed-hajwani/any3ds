@@ -1,13 +1,15 @@
 # Run inside WSL:  make test
 #
 # Chain per test program:
-#   tests/m0/X.{c,S} --arm-none-eabi-gcc--> out/m0/X.o
-#                    --python -m recomp-->  out/m0/gen_X.c
-#                    --clang + harness-->   out/m0/X_harness  (run it)
+#   tests/mN/X.{c,S} --arm-none-eabi-gcc-->  out/mN/X.o (M0) or X.elf (M1+, linked)
+#                    --python -m recomp-->   out/mN/gen_X.c
+#                    --clang + harness-->    out/mN/X_harness  (run it)
 
-ARM_CC    := arm-none-eabi-gcc
-OBJDUMP   := arm-none-eabi-objdump
-ARM_FLAGS := -marm -mcpu=mpcore -O1
+ARM_CC      := arm-none-eabi-gcc
+OBJDUMP     := arm-none-eabi-objdump
+ARM_FLAGS   := -marm -mcpu=mpcore -O1
+# Link at the 3DS homebrew load address, with no C library or startup code.
+ARM_LDFLAGS := -nostdlib -Wl,-Ttext=0x00100000 -Wl,--entry=0x00100000
 
 HOST_CC    := clang
 HOST_FLAGS := -std=c11 -O1 -g -Wall -Wextra -Werror \
@@ -17,24 +19,25 @@ HOST_FLAGS := -std=c11 -O1 -g -Wall -Wextra -Werror \
 VENV   := .venv
 PYTHON := $(VENV)/bin/python
 
-OUT         := out/m0
 RECOMP_SRC  := $(wildcard recomp/*.py)
-RUNTIME_HDR := $(wildcard runtime/*.h)
+RUNTIME_SRC := runtime/runtime.c
+RUNTIME_DEP := $(RUNTIME_SRC) $(wildcard runtime/*.h)
+RECOMP_DEP  := $(RECOMP_SRC) $(VENV)/.installed
+REJECT      := sh tests/expect_reject.sh $(PYTHON)
+
+M0 := out/m0
+M1 := out/m1
 
 # devkitARM lives outside PATH unless the shell profile adds it.
 ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test venv clean check-unsupported
-.SECONDARY:          # keep .o / generated .c around for inspection
+.PHONY: test test-m0 test-m1 venv clean
+.SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: $(OUT)/test.dis $(OUT)/shifts.dis $(OUT)/test_harness $(OUT)/shifts_harness check-unsupported
-	@echo '--- M0: test(a, b) = (a + b) * 3 ---'
-	@./$(OUT)/test_harness
-	@echo '--- barrel shifter ---'
-	@./$(OUT)/shifts_harness
+test: test-m0 test-m1
 
 venv: $(VENV)/.installed
 
@@ -43,41 +46,63 @@ $(VENV)/.installed: requirements.txt
 	$(PYTHON) -m pip install -q -r requirements.txt
 	touch $@
 
-$(OUT):
+$(M0) $(M1):
 	mkdir -p $@
 
-# Guest side: build bare ARM objects (no libctru).
-$(OUT)/%.o: tests/m0/%.c | $(OUT)
+# ---------------------------------------------------------------- M0
+
+$(M0)/%.o: tests/m0/%.c | $(M0)
 	$(ARM_CC) $(ARM_FLAGS) -c $< -o $@
 
-$(OUT)/%.o: tests/m0/%.S | $(OUT)
+$(M0)/%.o: tests/m0/%.S | $(M0)
 	$(ARM_CC) $(ARM_FLAGS) -c $< -o $@
 
-# Reference disassembly, to compare by eye with the generated C.
-$(OUT)/%.dis: $(OUT)/%.o
+$(M0)/%.dis: $(M0)/%.o
 	$(OBJDUMP) -d $< > $@
 
-# Recompile.
-$(OUT)/gen_%.c: $(OUT)/%.o $(RECOMP_SRC) $(VENV)/.installed
+$(M0)/gen_%.c: $(M0)/%.o $(RECOMP_DEP)
 	$(PYTHON) -m recomp $< -o $@
 
-# Host side: generated code + harness.
-$(OUT)/test_harness: tests/m0/harness.c $(OUT)/gen_test.c $(RUNTIME_HDR)
-	$(HOST_CC) $(HOST_FLAGS) tests/m0/harness.c $(OUT)/gen_test.c -o $@
+$(M0)/test_harness: tests/m0/harness.c $(M0)/gen_test.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M0)/gen_test.c $(RUNTIME_SRC) -o $@
 
-$(OUT)/shifts_harness: tests/m0/shifts_harness.c $(OUT)/gen_shifts.c $(RUNTIME_HDR)
-	$(HOST_CC) $(HOST_FLAGS) tests/m0/shifts_harness.c $(OUT)/gen_shifts.c -o $@
+$(M0)/shifts_harness: tests/m0/shifts_harness.c $(M0)/gen_shifts.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M0)/gen_shifts.c $(RUNTIME_SRC) -o $@
 
-# The recompiler must refuse code it can't translate, name the address and
-# mnemonic, and write no output.
-check-unsupported: $(OUT)/unsupported.o $(RECOMP_SRC) $(VENV)/.installed
-	@rm -f $(OUT)/gen_unsupported.c $(OUT)/gen_unsupported.h
-	@if $(PYTHON) -m recomp $< -o $(OUT)/gen_unsupported.c 2> $(OUT)/unsupported.err; then \
-	    echo 'FAIL: recompiler accepted an unsupported instruction'; exit 1; fi
-	@grep -Eq '^recomp: error: [0-9a-f]{8}: unsupported instruction `mul' $(OUT)/unsupported.err || \
-	    { echo 'FAIL: unexpected error message:'; cat $(OUT)/unsupported.err; exit 1; }
-	@test ! -e $(OUT)/gen_unsupported.c || { echo 'FAIL: output written despite error'; exit 1; }
-	@echo "PASS rejects unsupported code: $$(cat $(OUT)/unsupported.err)"
+test-m0: $(M0)/test.dis $(M0)/shifts.dis $(M0)/test_harness $(M0)/shifts_harness $(M0)/unsupported.o $(RECOMP_DEP)
+	@echo '=== M0: test(a, b) = (a + b) * 3 ==='
+	@timeout 60 ./$(M0)/test_harness
+	@echo '=== M0: barrel shifter ==='
+	@timeout 60 ./$(M0)/shifts_harness
+	@$(REJECT) $(M0)/unsupported.o 'unsupported instruction `mul'
+
+# ---------------------------------------------------------------- M1
+
+$(M1)/%.elf: tests/m1/%.c | $(M1)
+	$(ARM_CC) $(ARM_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
+$(M1)/%.elf: tests/m1/%.S | $(M1)
+	$(ARM_CC) $(ARM_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
+$(M1)/%.dis: $(M1)/%.elf
+	$(OBJDUMP) -d $< > $@
+
+$(M1)/gen_%.c: $(M1)/%.elf $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@
+
+# harness.c #includes funcs.c as the host-native reference.
+$(M1)/funcs_harness: tests/m1/harness.c tests/m1/funcs.c $(M1)/gen_funcs.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M1)/gen_funcs.c $(RUNTIME_SRC) -o $@
+
+$(M1)/flags_harness: tests/m1/flags_harness.c $(M1)/gen_flags.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M1)/gen_flags.c $(RUNTIME_SRC) -o $@
+
+test-m1: $(M1)/funcs.dis $(M1)/flags.dis $(M1)/funcs_harness $(M1)/flags_harness $(M1)/bad_bl.elf $(M0)/unsupported.o $(RECOMP_DEP)
+	@echo '=== M1: differential test vs native ==='
+	@timeout 60 ./$(M1)/funcs_harness
+	@echo '=== M1: flags and condition codes ==='
+	@timeout 60 ./$(M1)/flags_harness
+	@$(REJECT) $(M1)/bad_bl.elf 'is not the start of a known function'
 
 clean:
 	rm -rf out

@@ -12,7 +12,7 @@ def _comment(insn):
 
 
 def emit(functions, header_name):
-    """`functions` is a list of (Function, [(insn, [C statements])]).
+    """`functions` is a list of translate.TranslatedFunction.
 
     Returns (c_source, header_source).
     """
@@ -21,19 +21,23 @@ def emit(functions, header_name):
         f'#include "{header_name}"',
         '',
     ]
-    for fn, body in functions:
-        c.append(f'/* {fn.name} */')
-        c.append(f'void {c_name(fn.addr)}(Ctx *ctx)')
+    for tf in functions:
+        c.append(f'/* {tf.fn.name} */')
+        c.append(f'void {c_name(tf.fn.addr)}(Ctx *ctx)')
         c.append('{')
-        for insn, stmts in body:
+        if tf.uses_ret:
+            c.append('    const uint32_t ret = ctx->r[14];  /* return address we were called with */')
+        for insn, lines in tf.body:
+            if insn.address in tf.labels:
+                c.append(f'L_{insn.address:08x}:')
             c.append(f'    {_comment(insn)}')
-            c.extend(f'    {s}' for s in stmts)
+            c.extend(f'    {line}' for line in lines)
         c.append('}')
         c.append('')
 
     c.append('const RecompSym recomp_syms[] = {')
-    for fn, _ in functions:
-        c.append(f'    {{ "{fn.name}", 0x{fn.addr:08x}u, {c_name(fn.addr)} }},')
+    for tf in functions:
+        c.append(f'    {{ "{tf.fn.name}", 0x{tf.fn.addr:08x}u, {c_name(tf.fn.addr)} }},')
     c.append('};')
     c.append('const size_t recomp_nsyms = sizeof recomp_syms / sizeof recomp_syms[0];')
     c.append('')
@@ -54,7 +58,7 @@ def emit(functions, header_name):
         '#include "context.h"',
         '',
     ]
-    h.extend(f'void {c_name(fn.addr)}(Ctx *ctx);  /* {fn.name} */' for fn, _ in functions)
+    h.extend(f'void {c_name(tf.fn.addr)}(Ctx *ctx);  /* {tf.fn.name} */' for tf in functions)
     h.append('')
     h.append('#endif')
 

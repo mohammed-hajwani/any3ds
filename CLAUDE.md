@@ -69,7 +69,13 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
 - An unsupported instruction is a **hard error** at recompile time, naming the address and mnemonic. Never silently skip anything.
 - Conditional execution (almost every ARM instruction can be conditional) becomes `if (cond_XX(ctx)) { ... }`. Implement it from milestone 1.
 
-## Milestone 0 (current): recompile one function
+## Status
+
+- **M0 done.** `make test-m0`.
+- **M1 done.** `make test-m1`. Tests are linked ELFs at `0x00100000` (unlinked `.o` files with relocations are rejected), and harnesses diff recompiled code against the same C compiled natively. push/pop and guest memory (`runtime/runtime.c`, 4 GiB `mmap`) came forward from M2, because every non-leaf function saves `lr` on the stack.
+- Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
+
+## Milestone 0: recompile one function
 
 Input `tests/m0/test.c`:
 

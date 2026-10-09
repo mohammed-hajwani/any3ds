@@ -23,12 +23,13 @@ def main(argv=None):
         if not functions:
             raise LoadError(f'{args.input}: no function symbols found')
 
+        entries = {fn.addr: fn for fn in functions}
         translated = []
         for fn in functions:
             if fn.thumb:
                 raise LoadError(f'{fn.addr:08x} {fn.name}: Thumb code is not supported yet (M4)')
             insns = disassemble_arm(fn.code, fn.addr)
-            translated.append((fn, translate_function(fn, insns)))
+            translated.append(translate_function(fn, insns, entries))
 
         header = args.output.with_suffix('.h')
         c_src, h_src = emit(translated, header.name)
@@ -41,8 +42,8 @@ def main(argv=None):
     header.write_text(h_src, newline='\n')
     args.output.write_text(c_src, newline='\n')
 
-    for fn, body in translated:
-        print(f'  {c_name(fn.addr)}  {fn.name}  ({len(body)} instructions)')
+    for tf in translated:
+        print(f'  {c_name(tf.fn.addr)}  {tf.fn.name}  ({len(tf.body)} instructions)')
     print(f'wrote {args.output} and {header.name}')
     return 0
 
