@@ -1,0 +1,8 @@
+# Never commit game code, dumps, keys or generated output (see CLAUDE.md).
+dumps/
+out/
+
+.venv/
+__pycache__/
+*.pyc
+*.o

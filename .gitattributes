@@ -1,0 +1,2 @@
+# Builds run inside WSL; keep LF everywhere so make and shell scripts work.
+* text=auto eol=lf

@@ -1,0 +1,3 @@
+# Capstone 6 renamed the ARM condition-code/operand constants; stay on 5.x for now.
+capstone>=5,<6
+pyelftools
