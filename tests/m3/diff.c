@@ -9,7 +9,7 @@
  *      RECOMP_TRACE / write hook is compared with Unicorn's next step.
  * The first difference is reported with the instruction that caused it.
  *
- * Usage: <prog>_diff [runs-per-function] [skip,list,of,functions]
+ * Usage: <prog>_diff [runs-per-function] [skip,list | +only,list]
  *
  * Functions that take function pointers (or pointers to structs holding
  * them) are skipped: random inputs would make them call random addresses.
@@ -129,14 +129,13 @@ static bool on_write(uc_engine *u, uc_mem_type type, uint64_t addr, int size, in
 
 typedef enum { UC_RETURNED, UC_LIMIT, UC_FAULT } UcEnd;
 
-static UcEnd run_unicorn(uint32_t entry, const uint32_t *r, uint32_t nzcv, const uint64_t *d, uint32_t fp_nzcv,
+static UcEnd run_unicorn(uint32_t entry, const uint32_t *r, uint32_t nzcv, const uint64_t *d, uint32_t fpscr,
                          Step *fin)
 {
     for (int i = 0; i < 15; i++)
         check_uc(uc_reg_write(uc, uc_regs[i], &r[i]), "reg write");
     for (int i = 0; i < 16; i++)
         check_uc(uc_reg_write(uc, uc_dregs[i], &d[i]), "vfp reg write");
-    uint32_t fpscr = fp_nzcv << 28;     /* round to nearest, no flush-to-zero, no default NaN */
     check_uc(uc_reg_write(uc, UC_ARM_REG_FPSCR, &fpscr), "fpscr write");
     uint32_t cpsr;
     uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr);
@@ -323,17 +322,25 @@ int main(int argc, char **argv)
     check_uc(uc_hook_add(uc, &h_write, UC_HOOK_MEM_WRITE, (void *)on_write, NULL, 1, 0), "write hook");
 
     uint64_t total_steps = 0;
-    int limited = 0;
+    int limited = 0, tested = 0;
     for (size_t fi = 0; fi < recomp_nsyms; fi++) {
         const RecompSym *sym = &recomp_syms[fi];
         cur_fn = sym->name;
+        /* "+a,b,c" runs only those functions; "a,b,c" skips them. */
+        int only = skip[0] == '+';
+        const char *list = only ? skip + 1 : skip;
         size_t len = strlen(sym->name);
-        const char *hit = strstr(skip, sym->name);
-        if (hit && (hit == skip || hit[-1] == ',') && (hit[len] == ',' || hit[len] == 0)) {
+        const char *hit = strstr(list, sym->name);
+        while (hit && !((hit == list || hit[-1] == ',') && (hit[len] == ',' || hit[len] == 0)))
+            hit = strstr(hit + 1, sym->name);
+        if (only && !hit)
+            continue;
+        if (!only && hit) {
             printf("SKIP %-12s (takes function pointers)\n", sym->name);
             continue;
         }
         uint64_t fn_steps = 0;
+        tested++;
 
         for (cur_run = 0; cur_run < runs; cur_run++) {
             sync_memory();
@@ -348,10 +355,12 @@ int main(int argc, char **argv)
             uint64_t d[16];
             for (int i = 0; i < 16; i++)
                 d[i] = random_vfp();
-            uint32_t fp_nzcv = rnd() & 0xF;
+            /* Half the runs in IEEE mode, half in libctru's RunFast mode
+               (flush-to-zero + default NaN); always round to nearest. */
+            uint32_t fpscr = (rnd() & 0xFu) << 28 | (rnd() % 2 ? 0x03000000u : 0);
 
             Step fin;
-            UcEnd end = run_unicorn(sym->addr, r, nzcv, d, fp_nzcv, &fin);
+            UcEnd end = run_unicorn(sym->addr, r, nzcv, d, fpscr, &fin);
             limited += end != UC_RETURNED;
 
             Ctx ctx;
@@ -359,7 +368,7 @@ int main(int argc, char **argv)
             memcpy(ctx.r, r, sizeof r);
             ctx.n = (nzcv >> 3) & 1; ctx.z = (nzcv >> 2) & 1; ctx.c = (nzcv >> 1) & 1; ctx.v = nzcv & 1;
             memcpy(ctx.vfp.x, d, sizeof d);
-            ctx.fpscr = fp_nzcv << 28;
+            ctx.fpscr = fpscr;
             ctx.mem = mem;
             step = nwrites = 0;
             prev_text = NULL;
@@ -398,8 +407,8 @@ int main(int argc, char **argv)
         total_steps += fn_steps;
     }
 
-    printf("all %zu functions match unicorn: %" PRIu64 " instructions compared, %d runs hit the %d-instruction limit\n",
-           recomp_nsyms, total_steps, limited, LIMIT);
+    printf("all %d functions match unicorn: %" PRIu64 " instructions compared, %d runs hit the %d-instruction limit\n",
+           tested, total_steps, limited, LIMIT);
     uc_close(uc);
     guest_mem_free(mem);
     return 0;

@@ -87,6 +87,12 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
   - **Indirect calls** (`blx rX`, `bx rX`) go through `recomp_call` and a binary-searched `recomp_find` table. An unknown target aborts loudly.
   - **New instructions:** `clz`, `umull`/`smull`/`umlal`/`smlal`, `ldrd`/`strd`, `rev`/`rev16`/`revsh`, `sxtb`/`sxth`/`uxth`, and `push {sp, ...}`.
   - **Diff driver:** accepts a skip list for functions that take function pointers.
+- **M6a done (recompiles real libctru).** `make test-m6` builds the canonical libctru hello world (`tests/m6/hello.c`) against real libctru + newlib, recompiles all 303 functions into ~47k lines of C that compile cleanly, and diffs newlib's hand-optimised strcmp/memcpy/memset/memmove/strlen/strchr against Unicorn. What real code added:
+  - **Instructions:** `mrc` TLS reads (`Ctx.tls`), barriers as no-ops, `ldrex`/`strex`/`clrex` (a monitor in `Ctx`), `svc` → `recomp_svc` (an OS-layer hook, currently aborting with the svc number), `uadd8`/`sel` (`Ctx.ge`), `rsc`, `udf`, `push {…pc}`, and `ldrd` over its own base.
+  - **noreturn calls:** a call with nothing after it gets `recomp_no_return`.
+  - **Loader fixes:** functions are clipped at the next symbol, and unlabelled code in `$a`/`$t` regions becomes functions.
+  - **VFP RunFast mode:** FPSCR FZ+DN, which libctru sets on every thread, via `vmsr fpscr`. Half of all Unicorn runs use it.
+- **Next: M6b, the OS layer.** Implement the svcs and the IPC services hello.c needs (srv, apt, gsp, hid, …), then run it.
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function

@@ -33,7 +33,7 @@ from capstone.arm import (
     ARM_INS_STMIB, ARM_INS_STR, ARM_INS_STRB, ARM_INS_STRH, ARM_INS_SUB,
     ARM_INS_TEQ, ARM_INS_TST, ARM_INS_UXTB,
     ARM_INS_VABS, ARM_INS_VADD, ARM_INS_VCMP, ARM_INS_VCMPE, ARM_INS_VCVT,
-    ARM_INS_VCVTR, ARM_INS_VDIV, ARM_INS_VLDMDB, ARM_INS_VLDMIA, ARM_INS_VLDR,
+    ARM_INS_VCVTR, ARM_INS_VDIV, ARM_INS_VMSR, ARM_INS_VLDMDB, ARM_INS_VLDMIA, ARM_INS_VLDR,
     ARM_INS_VMLA, ARM_INS_VMLS, ARM_INS_VMOV, ARM_INS_VMRS, ARM_INS_VMUL,
     ARM_INS_VNEG, ARM_INS_VNMLA, ARM_INS_VNMLS, ARM_INS_VNMUL, ARM_INS_VPOP,
     ARM_INS_VPUSH, ARM_INS_VSQRT, ARM_INS_VSTMDB, ARM_INS_VSTMIA, ARM_INS_VSTR,
@@ -894,10 +894,12 @@ def _vfp_arith(insn, fc):
     if insn.id in _VFP_UNARY:
         (k, d), (_, m) = _vfp_regs(insn, 2)
         w = 32 if k == 's' else 64
-        return [f'{_vref(k, d)} = vfp_{_VFP_UNARY[insn.id]}{w}({_vref(k, m)});']
+        op = _VFP_UNARY[insn.id]
+        ctx_arg = '' if op in ('neg', 'abs') else 'ctx, '    # neg/abs only touch the sign bit
+        return [f'{_vref(k, d)} = vfp_{op}{w}({ctx_arg}{_vref(k, m)});']
     (k, d), (_, n), (_, m) = _vfp_regs(insn, 3)
     w = 32 if k == 's' else 64
-    return [f'{_vref(k, d)} = vfp_{_VFP_BINARY[insn.id]}{w}({_vref(k, n)}, {_vref(k, m)});']
+    return [f'{_vref(k, d)} = vfp_{_VFP_BINARY[insn.id]}{w}(ctx, {_vref(k, n)}, {_vref(k, m)});']
 
 
 def _vfp_mac(insn, fc):
@@ -906,13 +908,13 @@ def _vfp_mac(insn, fc):
     (ARM ARM: product = FPMul(n, m); result = FPAdd(+-d, +-product))."""
     (k, d), (_, n), (_, m) = _vfp_regs(insn, 3)
     w = 32 if k == 's' else 64
-    dd, prod = _vref(k, d), f'vfp_mul{w}({_vref(k, n)}, {_vref(k, m)})'
+    dd, prod = _vref(k, d), f'vfp_mul{w}(ctx, {_vref(k, n)}, {_vref(k, m)})'
     neg = f'vfp_neg{w}'
     expr = {
-        ARM_INS_VMLA:  f'vfp_add{w}({dd}, {prod})',                # d + n*m
-        ARM_INS_VMLS:  f'vfp_add{w}({dd}, {neg}({prod}))',         # d - n*m
-        ARM_INS_VNMLA: f'vfp_add{w}({neg}({dd}), {neg}({prod}))',  # -d - n*m
-        ARM_INS_VNMLS: f'vfp_add{w}({neg}({dd}), {prod})',         # -d + n*m
+        ARM_INS_VMLA:  f'vfp_add{w}(ctx, {dd}, {prod})',                # d + n*m
+        ARM_INS_VMLS:  f'vfp_add{w}(ctx, {dd}, {neg}({prod}))',         # d - n*m
+        ARM_INS_VNMLA: f'vfp_add{w}(ctx, {neg}({dd}), {neg}({prod}))',  # -d - n*m
+        ARM_INS_VNMLS: f'vfp_add{w}(ctx, {neg}({dd}), {prod})',         # -d + n*m
         ARM_INS_VNMUL: f'{neg}({prod})',                           # -(n*m)
     }[insn.id]
     return [f'{dd} = {expr};']
@@ -936,6 +938,15 @@ def _vfp_cmp(insn, fc):
     return [f'vfp_cmp{w}(ctx, {_vref(k, a)}, {b});']
 
 
+def _vmsr(insn, fc):
+    """vmsr fpscr, rX: set the VFP mode/flags (libctru sets RunFast)."""
+    ops = insn.operands
+    names = [insn.reg_name(op.reg) for op in ops if op.type == ARM_OP_REG]
+    if len(names) != 2 or names[0] != 'fpscr' or _REGS.get(names[1], PC) == PC:
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    return [f'vfp_set_fpscr(ctx, ctx->r[{_REGS[names[1]]}]);']
+
+
 def _vmrs(insn, fc):
     # `vmrs APSR_nzcv, fpscr` (Capstone's id for it is the old name FMSTAT)
     # copies the VFP compare flags into the CPU flags.
@@ -946,8 +957,8 @@ def _vmrs(insn, fc):
 
 
 _CVT = {    # (to, from) -> C expression template on the raw source bits {x}
-    ('f64', 'f32'): 'vfp_f32_to_f64({x})',
-    ('f32', 'f64'): 'vfp_f64_to_f32({x})',
+    ('f64', 'f32'): 'vfp_f32_to_f64(ctx, {x})',
+    ('f32', 'f64'): 'vfp_f64_to_f32(ctx, {x})',
     ('s32', 'f32'): 'vfp_to_s32((double)f32({x}))',
     ('u32', 'f32'): 'vfp_to_u32((double)f32({x}))',
     ('s32', 'f64'): 'vfp_to_s32(f64({x}))',
@@ -1176,6 +1187,7 @@ _HANDLERS = {
     ARM_INS_VCMP: _vfp_cmp,
     ARM_INS_VCMPE: _vfp_cmp,
     ARM_INS_VMRS: _vmrs,
+    ARM_INS_VMSR: _vmsr,
     ARM_INS_FMSTAT: _vmrs,
     ARM_INS_VCVT: _vcvt,
     ARM_INS_VCVTR: _vcvt,
@@ -1249,6 +1261,12 @@ def translate_function(fn, insns, entries, program=None):
 
         next_addr = insns[i + 1].address if i + 1 < len(insns) else fn.end
         if next_addr != insn.address + insn.size or i + 1 == len(insns):
+            if not fc.terminates and insn.id in (ARM_INS_BL, ARM_INS_BLX) and insn.cc == ARM_CC_AL:
+                # A call with nothing after it: the compiler knew the callee
+                # never returns (exit, abort, threadExit). If it ever does,
+                # stop loudly rather than run into whatever follows.
+                body[-1][2].append(f'recomp_no_return(ctx, {_imm(insn.address)});')
+                fc.terminates = True
             if not fc.terminates:
                 # Without this check, the C function would quietly stop here
                 # while the guest CPU would run on into whatever comes next.

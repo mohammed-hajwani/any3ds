@@ -253,6 +253,9 @@ static inline void recomp_svc(Ctx *ctx, uint32_t number) { recomp_svc_handler(ct
 /* `udf`: a deliberate trap (e.g. __builtin_trap()); the guest wanted to crash. */
 void recomp_udf(Ctx *ctx, uint32_t addr) __attribute__((noreturn));
 
+/* A call the compiler treated as never returning (nothing follows it) did return. */
+void recomp_no_return(Ctx *ctx, uint32_t addr) __attribute__((noreturn));
+
 /* ldrex/strex: exclusive (atomic) access. With one guest thread running
    at a time, the monitor reduces to "was this address ldrex'd, with no
    clrex/strex since?". strex returns 0 on success, 1 on failure. */

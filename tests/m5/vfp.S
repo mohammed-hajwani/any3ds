@@ -121,6 +121,18 @@ FUNC literals
 2:  .double -3.25
     .size literals, . - literals
 
+@ ---- switching to libctru's RunFast mode (flush-to-zero + default NaN) ----
+FUNC runfast
+    mov r0, #0x03000000
+    vmsr fpscr, r0
+    vadd.f32 s4, s0, s1
+    vmul.f64 d3, d1, d2
+    vcvt.f32.f64 s5, d2
+    vcmp.f32 s0, s1
+    vmrs APSR_nzcv, fpscr
+    movvs r1, #1
+END runfast
+
 @ ---- conditional VFP instruction ----
 FUNC cond_vmov
     cmp r0, r1

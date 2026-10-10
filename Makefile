@@ -38,11 +38,11 @@ ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real venv clean
+.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-m6 venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real
+test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-m6
 
 venv: $(VENV)/.installed
 
@@ -316,6 +316,44 @@ test-real: $(REAL)/real_arm_harness $(REAL)/real_thumb_harness $(REAL_DIFFS) $(R
 	    echo "=== real: $$(basename $$d _diff) vs unicorn ==="; \
 	    timeout 180 ./$$d 100 $(REAL_SKIP) || exit 1; \
 	done
+
+# ---------------------------------------------------------------- M6
+#
+# The canonical libctru "hello world", built against the real libctru +
+# newlib exactly as 3DS homebrew is, then recompiled in full. Running it
+# needs the OS layer (svc + IPC services), which comes next; for now the
+# check is that every function recompiles, the C compiles, and newlib's
+# hand-optimised string/memory routines match Unicorn.
+
+DEVKITPRO ?= /opt/devkitpro
+CTRU := $(DEVKITPRO)/libctru
+CTRU_FLAGS := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -O2 -mword-relocations \
+              -ffunction-sections -I$(CTRU)/include
+M6 := out/m6
+M6_DIFF_ONLY := +strcmp,memcpy,memset,memmove,strlen,strchr
+
+$(M6):
+	mkdir -p $@
+
+$(M6)/hello.elf: tests/m6/hello.c | $(M6)
+	$(ARM_CC) $(CTRU_FLAGS) -specs=3dsx.specs -L$(CTRU)/lib $< -lctru -lm -o $@
+
+$(M6)/hello.dis: $(M6)/hello.elf
+	$(OBJDUMP) -d $< > $@
+
+$(M6)/gen_hello.c: $(M6)/hello.elf $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@ > $(M6)/recomp.log
+
+$(M6)/gen_hello.o: $(M6)/gen_hello.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) -c $< -o $@
+
+$(eval $(call m3_prog,m6/hello))
+
+test-m6: $(M6)/gen_hello.o $(M3)/hello_diff $(M6)/hello.dis
+	@echo "=== M6: libctru hello world: $$(grep -c '^  f_' $(M6)/recomp.log) functions recompiled," \
+	      "$$(wc -l < $(M6)/gen_hello.c) lines of C, compiled cleanly ==="
+	@echo '=== M6: newlib string/memory routines vs unicorn ==='
+	@timeout 300 ./$(M3)/hello_diff 100 $(M6_DIFF_ONLY)
 
 clean:
 	rm -rf out

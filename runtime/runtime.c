@@ -45,6 +45,20 @@ static void svc_unimplemented(Ctx *ctx, uint32_t number)
 
 SvcHandler recomp_svc_handler = svc_unimplemented;
 
+void recomp_bad_fpscr(Ctx *ctx, uint32_t value)
+{
+    fprintf(stderr, "recomp: guest set FPSCR = 0x%08" PRIx32 ": a rounding mode, short-vector mode or"
+            " trap enable that is not modelled (lr = 0x%08" PRIx32 ")\n", value, ctx->r[14]);
+    abort();
+}
+
+void recomp_no_return(Ctx *ctx, uint32_t addr)
+{
+    fprintf(stderr, "recomp: the call at 0x%08" PRIx32 " was expected never to return, but it did"
+            " (lr = 0x%08" PRIx32 ")\n", addr, ctx->r[14]);
+    abort();
+}
+
 void recomp_udf(Ctx *ctx, uint32_t addr)
 {
     fprintf(stderr, "recomp: guest executed udf (a deliberate trap) at 0x%08" PRIx32 " (lr = 0x%08" PRIx32 ")\n",

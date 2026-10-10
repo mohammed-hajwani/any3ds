@@ -4,7 +4,7 @@ A **static recompiler** for Nintendo 3DS code. It translates 32-bit ARM (ARMv6K)
 
 Why ahead of time? iOS doesn't allow JIT compilation, so 3DS emulators on iPhone fall back to slow interpreters. If the whole program is translated before it runs, nothing has to be generated at runtime.
 
-> **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls), M2 (memory: loads/stores, literal pools, switch tables), M3 (instruction-by-instruction differential testing against Unicorn), M4 (Thumb + ARM/Thumb interworking) and M5 (VFP floating point) are done. Development currently targets x86-64 Linux; iOS comes much later.
+> **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls), M2 (memory: loads/stores, literal pools, switch tables), M3 (instruction-by-instruction differential testing against Unicorn), M4 (Thumb + ARM/Thumb interworking), M5 (VFP floating point) and M6a (recompiling a real libctru homebrew app in full) are done. Development currently targets x86-64 Linux; iOS comes much later.
 
 ## How it works
 
@@ -114,7 +114,8 @@ dumps/  out/       gitignored: your own dumps and all generated code
 | M4 | Thumb mode and ARM/Thumb interworking, register shifts, mul/mla | ✅ |
 | M5 | VFP floating point (VFPv2, hard-float ABI, exact ARM NaN rules) | ✅ |
 | — | Real-code readiness: -O2 + libgcc, indirect calls, tail calls, function discovery | ✅ |
-| M6 | Full libctru homebrew app, `SVC` → stub OS → Azahar HLE | next |
+| M6a | Recompile a real libctru homebrew app in full (303 functions, RunFast VFP, atomics, svc hook) | ✅ |
+| M6b | OS layer: svc + IPC services, then run the app | next |
 | later | Cycle counting, CRO relocation, indirect-jump table + interpreter fallback, Metal renderer, iOS shell app | |
 
 ## Contributing
