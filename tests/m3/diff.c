@@ -31,10 +31,12 @@ typedef struct {
     uint32_t addr;
     uint32_t r[15];             /* r0..r14 */
     uint32_t nzcv;
+    uint64_t d[16];             /* VFP d0-d15 (= s0-s31) */
+    uint32_t fp_nzcv;           /* FPSCR compare flags */
     size_t   writes_before;     /* writes made by earlier instructions */
 } Step;
 
-typedef struct { uint32_t addr, size, value; } Write;
+typedef struct { uint32_t addr, size; uint64_t value; } Write;
 
 /* Unicorn's run: the reference trace. */
 static Step  *ref;
@@ -79,15 +81,22 @@ static const int uc_regs[15] = {
     UC_ARM_REG_R10, UC_ARM_REG_R11, UC_ARM_REG_R12, UC_ARM_REG_SP, UC_ARM_REG_LR,
 };
 
-static void read_uc_state(uint32_t *r, uint32_t *nzcv)
+static int uc_dregs[16];
+
+static void read_uc_state(uint32_t *r, uint32_t *nzcv, uint64_t *d, uint32_t *fp_nzcv)
 {
-    void *ptrs[15];
+    void *ptrs[16];
     for (int i = 0; i < 15; i++)
         ptrs[i] = &r[i];
     uc_reg_read_batch(uc, (int *)uc_regs, ptrs, 15);
-    uint32_t cpsr;
+    uint32_t cpsr, fpscr;
     uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr);
     *nzcv = cpsr >> 28;
+    for (int i = 0; i < 16; i++)
+        ptrs[i] = &d[i];
+    uc_reg_read_batch(uc, uc_dregs, ptrs, 16);
+    uc_reg_read(uc, UC_ARM_REG_FPSCR, &fpscr);
+    *fp_nzcv = fpscr >> 28;
 }
 
 static void on_code(uc_engine *u, uint64_t addr, uint32_t size, void *user)
@@ -100,7 +109,7 @@ static void on_code(uc_engine *u, uint64_t addr, uint32_t size, void *user)
     Step *s = &ref[ref_len++];
     s->addr = (uint32_t)addr;
     s->writes_before = ref_nwrites;
-    read_uc_state(s->r, &s->nzcv);
+    read_uc_state(s->r, &s->nzcv, s->d, &s->fp_nzcv);
 }
 
 static bool on_write(uc_engine *u, uc_mem_type type, uint64_t addr, int size, int64_t value, void *user)
@@ -110,17 +119,22 @@ static bool on_write(uc_engine *u, uc_mem_type type, uint64_t addr, int size, in
         ref_wcap = ref_wcap ? 2 * ref_wcap : 4096;
         ref_writes = realloc(ref_writes, ref_wcap * sizeof *ref_writes);
     }
-    uint32_t mask = size >= 4 ? 0xFFFFFFFFu : (1u << (8 * size)) - 1;
-    ref_writes[ref_nwrites++] = (Write){ (uint32_t)addr, (uint32_t)size, (uint32_t)value & mask };
+    uint64_t mask = size >= 8 ? ~0ull : (1ull << (8 * size)) - 1;
+    ref_writes[ref_nwrites++] = (Write){ (uint32_t)addr, (uint32_t)size, (uint64_t)value & mask };
     return true;
 }
 
 typedef enum { UC_RETURNED, UC_LIMIT, UC_FAULT } UcEnd;
 
-static UcEnd run_unicorn(uint32_t entry, const uint32_t *r, uint32_t nzcv, uint32_t *final_r, uint32_t *final_nzcv)
+static UcEnd run_unicorn(uint32_t entry, const uint32_t *r, uint32_t nzcv, const uint64_t *d, uint32_t fp_nzcv,
+                         Step *fin)
 {
     for (int i = 0; i < 15; i++)
         check_uc(uc_reg_write(uc, uc_regs[i], &r[i]), "reg write");
+    for (int i = 0; i < 16; i++)
+        check_uc(uc_reg_write(uc, uc_dregs[i], &d[i]), "vfp reg write");
+    uint32_t fpscr = fp_nzcv << 28;     /* round to nearest, no flush-to-zero, no default NaN */
+    check_uc(uc_reg_write(uc, UC_ARM_REG_FPSCR, &fpscr), "fpscr write");
     uint32_t cpsr;
     uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr);
     cpsr = (cpsr & 0x0FFFFFFFu & ~0x20u) | (nzcv << 28);      /* flags; ARM (not Thumb) state */
@@ -128,7 +142,7 @@ static UcEnd run_unicorn(uint32_t entry, const uint32_t *r, uint32_t nzcv, uint3
 
     ref_len = ref_nwrites = 0;
     uc_err e = uc_emu_start(uc, entry, RETURN_ADDR, 0, LIMIT);
-    read_uc_state(final_r, final_nzcv);
+    read_uc_state(fin->r, &fin->nzcv, fin->d, &fin->fp_nzcv);
     uint32_t pc;
     uc_reg_read(uc, UC_ARM_REG_PC, &pc);
     if (e != UC_ERR_OK)
@@ -167,15 +181,26 @@ static void report_state(const Ctx *ctx, const Step *s)
         if (ours[i] != theirs)
             printf("    %c   recompiled %" PRIu32 "  unicorn %" PRIu32 "\n", flag[i], ours[i], theirs);
     }
+    for (int i = 0; i < 16; i++)
+        if (ctx->vfp.x[i] != s->d[i])
+            printf("    d%-2d recompiled 0x%016" PRIx64 "  unicorn 0x%016" PRIx64 "  (s%d/s%d)\n",
+                   i, ctx->vfp.x[i], s->d[i], 2 * i, 2 * i + 1);
+    if (ctx->fpscr >> 28 != s->fp_nzcv)
+        printf("    fpscr nzcv recompiled %" PRIx32 "  unicorn %" PRIx32 "\n", ctx->fpscr >> 28, s->fp_nzcv);
 }
 
-static int same_state(const Ctx *ctx, const uint32_t *r, uint32_t nzcv)
+static int same_state(const Ctx *ctx, const Step *s)
 {
     for (int i = 0; i < 15; i++)
-        if (ctx->r[i] != r[i])
+        if (ctx->r[i] != s->r[i])
             return 0;
+    for (int i = 0; i < 16; i++)
+        if (ctx->vfp.x[i] != s->d[i])
+            return 0;
+    uint32_t nzcv = s->nzcv;
     return ctx->n == ((nzcv >> 3) & 1) && ctx->z == ((nzcv >> 2) & 1)
-        && ctx->c == ((nzcv >> 1) & 1) && ctx->v == (nzcv & 1);
+        && ctx->c == ((nzcv >> 1) & 1) && ctx->v == (nzcv & 1)
+        && ctx->fpscr >> 28 == s->fp_nzcv;
 }
 
 static void check_writes_done(void)
@@ -184,7 +209,7 @@ static void check_writes_done(void)
     if (nwrites < expected) {
         report_header();
         const Write *w = &ref_writes[nwrites];
-        printf("    missing write: unicorn wrote [0x%08" PRIx32 "] = 0x%" PRIx32 " (%" PRIu32 " bytes)\n",
+        printf("    missing write: unicorn wrote [0x%08" PRIx32 "] = 0x%" PRIx64 " (%" PRIu32 " bytes)\n",
                w->addr, w->value, w->size);
         longjmp(stop, STOP_DIVERGED);
     }
@@ -197,7 +222,7 @@ void recomp_trace(Ctx *ctx, uint32_t addr, const char *text)
         longjmp(stop, STOP_LIMIT);      /* Unicorn stopped here; compared everything it ran */
 
     const Step *s = &ref[step];
-    if (addr != s->addr || !same_state(ctx, s->r, s->nzcv)) {
+    if (addr != s->addr || !same_state(ctx, s)) {
         report_header();
         if (addr != s->addr)
             printf("    next instruction: recompiled %08" PRIx32 " `%s`, unicorn %08" PRIx32 "\n", addr, text, s->addr);
@@ -209,15 +234,15 @@ void recomp_trace(Ctx *ctx, uint32_t addr, const char *text)
     step++;
 }
 
-void recomp_trace_write(uint32_t addr, uint32_t size, uint32_t value)
+void recomp_trace_write(uint32_t addr, uint32_t size, uint64_t value)
 {
     size_t limit = step < ref_len ? ref[step].writes_before : ref_nwrites;
     const Write *w = nwrites < limit ? &ref_writes[nwrites] : NULL;
     if (!w || w->addr != addr || w->size != size || w->value != value) {
         report_header();
-        printf("    recompiled wrote [0x%08" PRIx32 "] = 0x%" PRIx32 " (%" PRIu32 " bytes)\n", addr, value, size);
+        printf("    recompiled wrote [0x%08" PRIx32 "] = 0x%" PRIx64 " (%" PRIu32 " bytes)\n", addr, value, size);
         if (w)
-            printf("    unicorn    wrote [0x%08" PRIx32 "] = 0x%" PRIx32 " (%" PRIu32 " bytes)\n", w->addr, w->value, w->size);
+            printf("    unicorn    wrote [0x%08" PRIx32 "] = 0x%" PRIx64 " (%" PRIu32 " bytes)\n", w->addr, w->value, w->size);
         else
             printf("    unicorn made no such write\n");
         longjmp(stop, STOP_DIVERGED);
@@ -254,6 +279,27 @@ static uint32_t random_arg(void)
     }
 }
 
+/* VFP register contents: special values (NaNs incl. signalling ones,
+   infinities, denormals, signed zeros, values near the int32 limits) as
+   float pairs or doubles, ordinary doubles, or random bits. */
+static uint64_t random_vfp(void)
+{
+    static const uint32_t fs[] = { 0x00000000, 0x80000000, 0x3F800000, 0xBF800000, 0x3FC00000, 0x7F800000,
+                                   0xFF800000, 0x7FC00000, 0xFFC12345, 0x7F812345, 0x00000001, 0x80400000,
+                                   0x7F7FFFFF, 0x4F000000, 0xCF000001, 0x4F800000 };
+    static const uint64_t ds[] = { 0x0000000000000000ull, 0x8000000000000000ull, 0x3FF0000000000000ull,
+                                   0xC00A000000000000ull, 0x7FF0000000000000ull, 0xFFF0000000000000ull,
+                                   0x7FF8000000000000ull, 0x7FF4000000000123ull, 0x0000000000000001ull,
+                                   0x41E0000000000000ull, 0xC1E0000000200000ull, 0x41F0000000000000ull,
+                                   0x7FEFFFFFFFFFFFFFull };
+    switch (rnd() % 4) {
+    case 0:  return fs[rnd() % 16] | (uint64_t)fs[rnd() % 16] << 32;
+    case 1:  return ds[rnd() % (sizeof ds / sizeof ds[0])];
+    case 2:  return (uint64_t)(0x3F0u + rnd() % 0x20) << 52 | (uint64_t)rnd() << 20;  /* ordinary doubles */
+    default: return (uint64_t)rnd() << 32 | rnd();
+    }
+}
+
 int main(int argc, char **argv)
 {
     int runs = argc > 1 ? atoi(argv[1]) : 100;
@@ -262,6 +308,12 @@ int main(int argc, char **argv)
     check_uc(uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc), "open");
     check_uc(uc_ctl_set_cpu_model(uc, UC_CPU_ARM_11MPCORE), "cpu model");   /* the 3DS's CPU */
     check_uc(uc_mem_map(uc, 0, 0x100000000ull, UC_PROT_ALL), "map 4 GiB");   /* same flat space as ours */
+    for (int i = 0; i < 16; i++)
+        uc_dregs[i] = UC_ARM_REG_D0 + i;
+    /* Switch the VFP on: coprocessor access (CPACR cp10/cp11) and FPEXC.EN. */
+    uint32_t cpacr = 0x00F00000u, fpexc = 0x40000000u;
+    check_uc(uc_reg_write(uc, UC_ARM_REG_C1_C0_2, &cpacr), "cpacr");
+    check_uc(uc_reg_write(uc, UC_ARM_REG_FPEXC, &fpexc), "fpexc");
     uc_hook h_code, h_write;
     check_uc(uc_hook_add(uc, &h_code, UC_HOOK_CODE, (void *)on_code, NULL, 1, 0), "code hook");
     check_uc(uc_hook_add(uc, &h_write, UC_HOOK_MEM_WRITE, (void *)on_write, NULL, 1, 0), "write hook");
@@ -283,15 +335,21 @@ int main(int argc, char **argv)
             r[13] = STACK_TOP - 64;     /* room above sp for stack arguments */
             r[14] = RETURN_ADDR;
             uint32_t nzcv = rnd() & 0xF;
+            uint64_t d[16];
+            for (int i = 0; i < 16; i++)
+                d[i] = random_vfp();
+            uint32_t fp_nzcv = rnd() & 0xF;
 
-            uint32_t uc_r[15], uc_nzcv;
-            UcEnd end = run_unicorn(sym->addr, r, nzcv, uc_r, &uc_nzcv);
+            Step fin;
+            UcEnd end = run_unicorn(sym->addr, r, nzcv, d, fp_nzcv, &fin);
             limited += end != UC_RETURNED;
 
             Ctx ctx;
             memset(&ctx, 0, sizeof ctx);
             memcpy(ctx.r, r, sizeof r);
             ctx.n = (nzcv >> 3) & 1; ctx.z = (nzcv >> 2) & 1; ctx.c = (nzcv >> 1) & 1; ctx.v = nzcv & 1;
+            memcpy(ctx.vfp.x, d, sizeof d);
+            ctx.fpscr = fp_nzcv << 28;
             ctx.mem = mem;
             step = nwrites = 0;
             prev_text = NULL;
@@ -308,12 +366,9 @@ int main(int argc, char **argv)
                            ref_len);
                     return 1;
                 }
-                if (!same_state(&ctx, uc_r, uc_nzcv)) {
+                if (!same_state(&ctx, &fin)) {
                     report_header();
                     printf("  (final state after return)\n");
-                    Step fin = { 0 };
-                    memcpy(fin.r, uc_r, sizeof fin.r);
-                    fin.nzcv = uc_nzcv;
                     report_state(&ctx, &fin);
                     return 1;
                 }

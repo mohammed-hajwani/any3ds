@@ -12,7 +12,8 @@ ARM_FLAGS   := -marm -mcpu=mpcore -O1
 ARM_LDFLAGS := -nostdlib -Wl,-Ttext=0x00100000 -Wl,--entry=0x00100000
 
 HOST_CC    := clang
-HOST_FLAGS := -std=c11 -O1 -g -Wall -Wextra -Werror \
+# -fno-math-errno: sqrt becomes one instruction (and needs no libm).
+HOST_FLAGS := -std=c11 -O1 -g -Wall -Wextra -Werror -fno-math-errno \
               -fsanitize=undefined,address -fno-sanitize-recover=all \
               -Iruntime
 
@@ -30,17 +31,18 @@ M1 := out/m1
 M2 := out/m2
 M3 := out/m3
 M4 := out/m4
+M5 := out/m5
 
 # devkitARM lives outside PATH unless the shell profile adds it.
 ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 venv clean
+.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1 test-m2 test-m3 test-m4
+test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5
 
 venv: $(VENV)/.installed
 
@@ -49,7 +51,7 @@ $(VENV)/.installed: requirements.txt
 	$(PYTHON) -m pip install -q -r requirements.txt
 	touch $@
 
-$(M0) $(M1) $(M2) $(M3) $(M4):
+$(M0) $(M1) $(M2) $(M3) $(M4) $(M5):
 	mkdir -p $@
 
 # ---------------------------------------------------------------- M0
@@ -236,6 +238,43 @@ test-m4: $(M4_HARNESSES) $(M4_DIFFS) $(M4_BAD) $(M4)/mem_thumb.dis $(M4)/thumb.d
 	@$(REJECT) $(M4)/bad_mode.elf 'ARM code inside a Thumb function'
 	@echo '=== M4: self-test (planted Thumb pc bug must be pinpointed) ==='
 	@sh tests/m3/selftest.sh $(PYTHON) $(HOST_CC) thumb-pc $(M4)/thumb.elf 'ldr r1, \[pc' r1 $(HOST_FLAGS)
+
+# ---------------------------------------------------------------- M5
+#
+# VFPv2 floating point (ARM mode only: Thumb-1 has no VFP instructions),
+# hard-float ABI as used for 3DS homebrew.
+
+VFP_FLAGS := -marm -mcpu=mpcore -mfloat-abi=hard -mfpu=vfp -O1 -fno-math-errno
+
+$(M5)/fp.elf: tests/m5/fp.c | $(M5)
+	$(ARM_CC) $(VFP_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
+$(M5)/%.elf: tests/m5/%.S | $(M5)
+	$(ARM_CC) $(VFP_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
+$(M5)/%.dis: $(M5)/%.elf
+	$(OBJDUMP) -d $< > $@
+
+$(M5)/gen_%.c: $(M5)/%.elf $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@
+
+$(M5)/fp_harness: tests/m5/harness.c tests/m5/fp.c $(M5)/gen_fp.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M5)/gen_fp.c $(RUNTIME_SRC) -o $@
+
+M5_PROGS := m5/fp m5/vfp
+$(foreach p,$(M5_PROGS),$(eval $(call m3_prog,$(p))))
+M5_DIFFS := $(foreach p,$(M5_PROGS),$(M3)/$(notdir $(p))_diff)
+
+test-m5: $(M5)/fp_harness $(M5_DIFFS) $(M5)/bad_vcvtr.elf $(M5)/fp.dis $(M5)/vfp.dis $(RECOMP_DEP)
+	@echo '=== M5: fp vs native ==='
+	@timeout 60 ./$(M5)/fp_harness
+	@for d in $(M5_DIFFS); do \
+	    echo "=== M5: $$(basename $$d _diff) vs unicorn ==="; \
+	    timeout 120 ./$$d || exit 1; \
+	done
+	@$(REJECT) $(M5)/bad_vcvtr.elf 'FPSCR rounding mode'
+	@echo '=== M5: self-test (planted x86-NaN bug must be pinpointed) ==='
+	@sh tests/m3/selftest.sh $(PYTHON) $(HOST_CC) vfp-sqrt $(M5)/vfp.elf 'vsqrt.f32' d4 $(HOST_FLAGS)
 
 clean:
 	rm -rf out

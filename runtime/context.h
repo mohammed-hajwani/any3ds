@@ -10,6 +10,18 @@ typedef struct {
     uint32_t r[16];        // r0–r15 (r13 = sp, r14 = lr, r15 = pc)
     uint32_t n, z, c, v;   // condition flags, kept as 0/1
     uint8_t *mem;          // base of the 4 GiB guest address space
+
+    /* VFPv2: 32 single-precision registers s0-s31, which overlap the 16
+       double registers d0-d15 (d[k] = s[2k] low half, s[2k+1] high half).
+       Generated code works on the raw bits (u/x) so no NaN payload is ever
+       changed by the host; f/d are value views for harnesses. */
+    union {
+        uint32_t u[32];
+        uint64_t x[16];
+        float    f[32];
+        double   d[16];
+    } vfp;
+    uint32_t fpscr;        // only the NZCV compare flags (bits 31-28) are modelled
 } Ctx;
 
 /* ---- Tracing (M3 differential testing) ----
@@ -19,7 +31,7 @@ typedef struct {
    pay anything. */
 #ifdef RECOMP_TRACING
 void recomp_trace(Ctx *ctx, uint32_t addr, const char *text);
-void recomp_trace_write(uint32_t addr, uint32_t size, uint32_t value);
+void recomp_trace_write(uint32_t addr, uint32_t size, uint64_t value);
 #define RECOMP_TRACE(addr, text) recomp_trace(ctx, (addr), (text))
 #define TRACE_WRITE(a, size, v)  recomp_trace_write((a), (size), (v))
 #else
@@ -77,6 +89,21 @@ static inline void write16(Ctx *c, uint32_t a, uint32_t v)
 }
 
 static inline void write8(Ctx *c, uint32_t a, uint32_t v)  { TRACE_WRITE(a, 1, v & 0xFFu); c->mem[a] = (uint8_t)v; }
+
+/* 64-bit accesses (VFP doubles): low word at the lower address. */
+static inline uint64_t read64(Ctx *c, uint32_t a)
+{
+    return read32(c, a) | (uint64_t)read32(c, a + 4u) << 32;
+}
+
+static inline void write64(Ctx *c, uint32_t a, uint64_t v)
+{
+    TRACE_WRITE(a, 8, v);
+    uint32_t lo = (uint32_t)v, hi = (uint32_t)(v >> 32);
+    if (a > 0xFFFFFFF8u) { write_wrapped(c, a, lo, 4); write_wrapped(c, a + 4u, hi, 4); return; }
+    memcpy(c->mem + a, &lo, 4);
+    memcpy(c->mem + a + 4, &hi, 4);
+}
 
 /* ---- Condition codes (ARM ARM, "Condition codes" table) ---- */
 
@@ -166,6 +193,8 @@ static inline uint32_t shift_ror(Ctx *ctx, uint32_t x, uint32_t amount, int set_
     if (set_c) ctx->c = v >> 31;            /* ...but still sets C from bit 31 */
     return v;
 }
+
+#include "vfp.h"
 
 /* ---- Calls and returns ---- */
 

@@ -11,6 +11,7 @@ Supported:
 Anything else is a hard error -- never skip an instruction.
 """
 
+import struct
 from dataclasses import dataclass, field
 
 from capstone import CS_MODE_THUMB
@@ -20,13 +21,19 @@ from capstone.arm import (
     ARM_CC_PL, ARM_CC_VC, ARM_CC_VS,
     ARM_INS_ADC, ARM_INS_ADD, ARM_INS_ADR, ARM_INS_AND, ARM_INS_ASR, ARM_INS_B,
     ARM_INS_BIC, ARM_INS_BL, ARM_INS_BLX, ARM_INS_BX, ARM_INS_CMN, ARM_INS_CMP,
-    ARM_INS_EOR, ARM_INS_HINT, ARM_INS_LDM, ARM_INS_LDMDA, ARM_INS_LDMDB, ARM_INS_LDMIB,
+    ARM_INS_EOR, ARM_INS_FMSTAT, ARM_INS_HINT, ARM_INS_LDM, ARM_INS_LDMDA, ARM_INS_LDMDB, ARM_INS_LDMIB,
     ARM_INS_LDR, ARM_INS_LDRB, ARM_INS_LDRH, ARM_INS_LDRSB, ARM_INS_LDRSH,
     ARM_INS_LSL, ARM_INS_LSR, ARM_INS_MLA, ARM_INS_MOV, ARM_INS_MOVS, ARM_INS_MUL, ARM_INS_MVN, ARM_INS_NOP,
     ARM_INS_ORR, ARM_INS_POP, ARM_INS_PUSH, ARM_INS_ROR, ARM_INS_RRX,
     ARM_INS_RSB, ARM_INS_SBC, ARM_INS_STM, ARM_INS_STMDA, ARM_INS_STMDB,
     ARM_INS_STMIB, ARM_INS_STR, ARM_INS_STRB, ARM_INS_STRH, ARM_INS_SUB,
     ARM_INS_TEQ, ARM_INS_TST, ARM_INS_UXTB,
+    ARM_INS_VABS, ARM_INS_VADD, ARM_INS_VCMP, ARM_INS_VCMPE, ARM_INS_VCVT,
+    ARM_INS_VCVTR, ARM_INS_VDIV, ARM_INS_VLDMDB, ARM_INS_VLDMIA, ARM_INS_VLDR,
+    ARM_INS_VMLA, ARM_INS_VMLS, ARM_INS_VMOV, ARM_INS_VMRS, ARM_INS_VMUL,
+    ARM_INS_VNEG, ARM_INS_VNMLA, ARM_INS_VNMLS, ARM_INS_VNMUL, ARM_INS_VPOP,
+    ARM_INS_VPUSH, ARM_INS_VSQRT, ARM_INS_VSTMDB, ARM_INS_VSTMIA, ARM_INS_VSTR,
+    ARM_INS_VSUB,
     ARM_OP_IMM, ARM_OP_MEM, ARM_OP_REG,
     ARM_SFT_ASR, ARM_SFT_ASR_REG, ARM_SFT_INVALID, ARM_SFT_LSL, ARM_SFT_LSL_REG,
     ARM_SFT_LSR, ARM_SFT_LSR_REG, ARM_SFT_ROR, ARM_SFT_ROR_REG, ARM_SFT_RRX,
@@ -720,6 +727,217 @@ def _block(insn, fc):
     return lines
 
 
+# ---------------------------------------------------------------- VFP (M5)
+#
+# VFPv2, ARM mode only (Thumb-1 has no VFP instructions). Registers are
+# moved around as raw bits; all arithmetic goes through runtime/vfp.h,
+# which implements ARM's NaN and conversion rules exactly.
+
+def _vreg(insn, op):
+    """('s', n) or ('d', n) for a VFP register operand."""
+    if op.type != ARM_OP_REG:
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    name = insn.reg_name(op.reg)
+    if name[0] in 'sd' and name[1:].isdigit():
+        return name[0], int(name[1:])
+    raise UnsupportedInstruction(insn, f'expected a VFP register, got {name}')
+
+
+def _vref(kind, n):
+    """C lvalue for a VFP register's raw bits."""
+    return f'ctx->vfp.u[{n}]' if kind == 's' else f'ctx->vfp.x[{n}]'
+
+
+def _vfp_regs(insn, count):
+    ops = insn.operands
+    if len(ops) != count:
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    regs = [_vreg(insn, op) for op in ops]
+    if len({k for k, _ in regs}) != 1:
+        raise UnsupportedInstruction(insn, 'mixed single/double operands')
+    return regs
+
+
+_VFP_BINARY = {ARM_INS_VADD: 'add', ARM_INS_VSUB: 'sub', ARM_INS_VMUL: 'mul', ARM_INS_VDIV: 'div'}
+_VFP_UNARY = {ARM_INS_VSQRT: 'sqrt', ARM_INS_VNEG: 'neg', ARM_INS_VABS: 'abs'}
+
+
+def _vfp_arith(insn, fc):
+    if insn.id in _VFP_UNARY:
+        (k, d), (_, m) = _vfp_regs(insn, 2)
+        w = 32 if k == 's' else 64
+        return [f'{_vref(k, d)} = vfp_{_VFP_UNARY[insn.id]}{w}({_vref(k, m)});']
+    (k, d), (_, n), (_, m) = _vfp_regs(insn, 3)
+    w = 32 if k == 's' else 64
+    return [f'{_vref(k, d)} = vfp_{_VFP_BINARY[insn.id]}{w}({_vref(k, n)}, {_vref(k, m)});']
+
+
+def _vfp_mac(insn, fc):
+    """The multiply-accumulate family. On VFPv2 these are NOT fused: the
+    product is rounded, then added, each step with its own NaN rules
+    (ARM ARM: product = FPMul(n, m); result = FPAdd(+-d, +-product))."""
+    (k, d), (_, n), (_, m) = _vfp_regs(insn, 3)
+    w = 32 if k == 's' else 64
+    dd, prod = _vref(k, d), f'vfp_mul{w}({_vref(k, n)}, {_vref(k, m)})'
+    neg = f'vfp_neg{w}'
+    expr = {
+        ARM_INS_VMLA:  f'vfp_add{w}({dd}, {prod})',                # d + n*m
+        ARM_INS_VMLS:  f'vfp_add{w}({dd}, {neg}({prod}))',         # d - n*m
+        ARM_INS_VNMLA: f'vfp_add{w}({neg}({dd}), {neg}({prod}))',  # -d - n*m
+        ARM_INS_VNMLS: f'vfp_add{w}({neg}({dd}), {prod})',         # -d + n*m
+        ARM_INS_VNMUL: f'{neg}({prod})',                           # -(n*m)
+    }[insn.id]
+    return [f'{dd} = {expr};']
+
+
+def _vfp_cmp(insn, fc):
+    """vcmp/vcmpe set FPSCR's NZCV (vcmpe differs only in raising Invalid
+    for quiet NaNs, and exception flags aren't modelled)."""
+    ops = insn.operands
+    k, a = _vreg(insn, ops[0])
+    w = 32 if k == 's' else 64
+    if len(ops) == 2 and ops[1].type == ARM_OP_IMM:            # compare with #0.0
+        if ops[1].imm != 0:
+            raise UnsupportedInstruction(insn, 'unexpected operand shape')
+        b = '0u' if k == 's' else '0ull'
+    else:
+        (k2, bn) = _vreg(insn, ops[1])
+        if k2 != k:
+            raise UnsupportedInstruction(insn, 'mixed single/double operands')
+        b = _vref(k, bn)
+    return [f'vfp_cmp{w}(ctx, {_vref(k, a)}, {b});']
+
+
+def _vmrs(insn, fc):
+    # `vmrs APSR_nzcv, fpscr` (Capstone's id for it is the old name FMSTAT)
+    # copies the VFP compare flags into the CPU flags.
+    names = [insn.reg_name(op.reg) for op in insn.operands if op.type == ARM_OP_REG]
+    if insn.id == ARM_INS_FMSTAT or names == ['apsr_nzcv', 'fpscr']:
+        return ['vfp_flags_to_cpu(ctx);']
+    raise UnsupportedInstruction(insn, 'reading the whole FPSCR (exception flags and modes are not modelled)')
+
+
+_CVT = {    # (to, from) -> C expression template on the raw source bits {x}
+    ('f64', 'f32'): 'vfp_f32_to_f64({x})',
+    ('f32', 'f64'): 'vfp_f64_to_f32({x})',
+    ('s32', 'f32'): 'vfp_to_s32((double)f32({x}))',
+    ('u32', 'f32'): 'vfp_to_u32((double)f32({x}))',
+    ('s32', 'f64'): 'vfp_to_s32(f64({x}))',
+    ('u32', 'f64'): 'vfp_to_u32(f64({x}))',
+    ('f32', 's32'): 'f32_bits((float)(int32_t){x})',
+    ('f32', 'u32'): 'f32_bits((float){x})',
+    ('f64', 's32'): 'f64_bits((double)(int32_t){x})',
+    ('f64', 'u32'): 'f64_bits((double){x})',
+}
+
+
+def _vcvt(insn, fc):
+    if insn.id == ARM_INS_VCVTR:
+        # Rounds with the FPSCR rounding mode, which isn't modelled.
+        raise UnsupportedInstruction(insn, 'vcvtr uses the FPSCR rounding mode (not modelled)')
+    parts = insn.mnemonic.split('.')
+    if len(parts) != 3 or (parts[1], parts[2]) not in _CVT:
+        raise UnsupportedInstruction(insn, 'fixed-point or unexpected conversion')
+    (kd, d), (km, m) = (_vreg(insn, op) for op in insn.operands)
+    return [f'{_vref(kd, d)} = {_CVT[(parts[1], parts[2])].format(x=_vref(km, m))};']
+
+
+def _vmov(insn, fc):
+    """Every VFPv2 vmov is a plain bit copy (no NaN processing)."""
+    ops = insn.operands
+    if any(op.type != ARM_OP_REG for op in ops):
+        raise UnsupportedInstruction(insn, 'vmov with an immediate is VFPv3, not on the 3DS')
+    names = [insn.reg_name(op.reg) for op in ops]
+
+    def kind(name):         # 's' / 'd' VFP register, 'r' core register (not pc)
+        if name[0] in 'sd' and name[1:].isdigit():
+            return name[0]
+        return 'r' if _REGS.get(name, PC) != PC else '?'
+
+    kinds = ''.join(kind(n) for n in names)
+    if '?' in kinds:
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+
+    def core(i):
+        return _REGS[names[i]]
+
+    def vfp(i):
+        return int(names[i][1:])
+
+    if kinds == 'rs':
+        return [f'ctx->r[{core(0)}] = ctx->vfp.u[{vfp(1)}];']
+    if kinds == 'sr':
+        return [f'ctx->vfp.u[{vfp(0)}] = ctx->r[{core(1)}];']
+    if kinds in ('ss', 'dd'):
+        return [f'{_vref(kinds[0], vfp(0))} = {_vref(kinds[0], vfp(1))};']
+    if kinds == 'rrd':      # d -> two core registers (low word first)
+        return ['{', f'    uint64_t v = ctx->vfp.x[{vfp(2)}];',
+                f'    ctx->r[{core(0)}] = (uint32_t)v;', f'    ctx->r[{core(1)}] = (uint32_t)(v >> 32);', '}']
+    if kinds == 'drr':
+        return [f'ctx->vfp.x[{vfp(0)}] = ctx->r[{core(1)}] | (uint64_t)ctx->r[{core(2)}] << 32;']
+    raise UnsupportedInstruction(insn, 'unexpected operand shape')
+
+
+def _vldr_vstr(insn, fc):
+    k, n = _vreg(insn, insn.operands[0])
+    addr = _address(insn)
+    if addr.mode != 'offset':
+        raise UnsupportedInstruction(insn, 'unexpected addressing mode')
+    size = 4 if k == 's' else 8
+    where = _imm(addr.const) if addr.const is not None else addr.apply(addr.base)
+    reg = _vref(k, n)
+    if insn.id == ARM_INS_VSTR:
+        return [f'write{8 * size}(ctx, {where}, {reg});']
+    if addr.const is not None and fc.program:
+        data = fc.program.literal(addr.const, size)
+        if data is not None:
+            # A literal pool constant: fold it, and show its value.
+            bits = int.from_bytes(data, 'little')
+            value = struct.unpack('<f' if k == 's' else '<d', data)[0]
+            suffix = 'u' if k == 's' else 'ull'
+            return [f'{reg} = 0x{bits:0{2 * size}x}{suffix};  /* {value!r}, literal @{addr.const:08x} */']
+    return [f'{reg} = read{8 * size}(ctx, {where});']
+
+
+_VFP_BLOCK = {      # id: (load?, decrement-before?)
+    ARM_INS_VLDMIA: (True, False), ARM_INS_VLDMDB: (True, True),
+    ARM_INS_VSTMIA: (False, False), ARM_INS_VSTMDB: (False, True),
+    ARM_INS_VPOP: (True, False), ARM_INS_VPUSH: (False, True),
+}
+
+
+def _vfp_block(insn, fc):
+    """vldm/vstm (ia, db) and vpush (= vstmdb sp!) / vpop (= vldmia sp!)."""
+    load, decrement = _VFP_BLOCK[insn.id]
+    ops = list(insn.operands)
+    if insn.id in (ARM_INS_VPUSH, ARM_INS_VPOP):
+        rn, wback = SP, True
+    else:
+        rn, ops = _reg_num(insn, ops[0].reg), ops[1:]
+        wback = bool((_encoding(insn) >> 21) & 1)       # the W bit
+    if rn == PC:
+        raise UnsupportedInstruction(insn, 'pc as the base register')
+    regs = [_vreg(insn, op) for op in ops]
+    k = regs[0][0]
+    if any(rk != k for rk, _ in regs):
+        raise UnsupportedInstruction(insn, 'mixed single/double registers')
+    size = 4 if k == 's' else 8
+    total = size * len(regs)
+    start = -total if decrement else 0
+
+    lines = ['{', f'    uint32_t b = ctx->r[{rn}];']
+    for i, (_, n) in enumerate(regs):
+        a = _block_addr(start + size * i)
+        if load:
+            lines.append(f'    {_vref(k, n)} = read{8 * size}(ctx, {a});')
+        else:
+            lines.append(f'    write{8 * size}(ctx, {a}, {_vref(k, n)});')
+    if wback:
+        lines.append(f'    ctx->r[{rn}] = {_block_addr(-total if decrement else total)};')
+    lines.append('}')
+    return lines
+
+
 def _nop(insn, fc):
     # In ARM mode Capstone reports nop as one of the HINT family
     # (nop/yield/wfe/wfi/sev). Only a true nop is harmless to drop.
@@ -747,6 +965,18 @@ _HANDLERS = {
     **{op: _block for op in _BLOCK},
     ARM_INS_NOP: _nop,
     ARM_INS_HINT: _nop,
+    **{op: _vfp_arith for op in (*_VFP_BINARY, *_VFP_UNARY)},
+    **{op: _vfp_mac for op in (ARM_INS_VMLA, ARM_INS_VMLS, ARM_INS_VNMLA, ARM_INS_VNMLS, ARM_INS_VNMUL)},
+    ARM_INS_VCMP: _vfp_cmp,
+    ARM_INS_VCMPE: _vfp_cmp,
+    ARM_INS_VMRS: _vmrs,
+    ARM_INS_FMSTAT: _vmrs,
+    ARM_INS_VCVT: _vcvt,
+    ARM_INS_VCVTR: _vcvt,
+    ARM_INS_VMOV: _vmov,
+    ARM_INS_VLDR: _vldr_vstr,
+    ARM_INS_VSTR: _vldr_vstr,
+    **{op: _vfp_block for op in _VFP_BLOCK},
 }
 
 
