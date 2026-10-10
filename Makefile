@@ -107,7 +107,7 @@ test-m1: $(M1)/funcs.dis $(M1)/flags.dis $(M1)/funcs_harness $(M1)/flags_harness
 	@timeout 60 ./$(M1)/funcs_harness
 	@echo '=== M1: flags and condition codes ==='
 	@timeout 60 ./$(M1)/flags_harness
-	@$(REJECT) $(M1)/bad_bl.elf 'is not inside any known function'
+	@$(REJECT) $(M1)/bad_bl.elf 'not inside any known function or code region'
 
 # ---------------------------------------------------------------- M2
 

@@ -22,6 +22,23 @@ def _decode(fn):
     return insns
 
 
+def _orphan_function(program, target, insn):
+    """Code with no function symbol at all, e.g. the helper newlib's
+    hand-written strcmp keeps just before its own symbol. Accepted only
+    where the assembler marked code ($a/$t); it runs to the end of that
+    region or the next function, whichever comes first."""
+    region = program.code_region(target)
+    if region is None:
+        raise LoadError(f'{insn.address:08x}: {insn.mnemonic} target {target:08x} '
+                        'is not inside any known function or code region')
+    _, end, thumb = region
+    end = min([end] + [f.addr for f in program.functions if f.addr > target])
+    code = program.read(target, end - target)
+    if code is None:
+        raise LoadError(f'{target:08x}: code region outside the program image')
+    return Function(f'code_{target:08x}', target, code, thumb, [(target, end)])
+
+
 def discover_functions(program):
     """Symbol table functions, plus every call/branch target that isn't one.
 
@@ -49,12 +66,12 @@ def discover_functions(program):
             if insn.id == ARM_INS_B and fn.addr <= target < fn.end:
                 continue                    # an ordinary branch within the function
             container = next((f for f in program.functions if f.addr < target < f.end), None)
-            if container is None:
-                raise LoadError(f'{insn.address:08x}: {insn.mnemonic} target {target:08x} '
-                                'is not inside any known function')
-            off = target - container.addr
-            new = Function(f'{container.name}+0x{off:x}', target, container.code[off:], container.thumb,
-                           [(max(s, target), e) for s, e in container.code_ranges if e > target])
+            if container is not None:
+                off = target - container.addr
+                new = Function(f'{container.name}+0x{off:x}', target, container.code[off:], container.thumb,
+                               [(max(s, target), e) for s, e in container.code_ranges if e > target])
+            else:
+                new = _orphan_function(program, target, insn)
             entries[target] = new
             functions.append(new)
             queue.append(new)

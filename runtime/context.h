@@ -22,6 +22,11 @@ typedef struct {
         double   d[16];
     } vfp;
     uint32_t fpscr;        // only the NZCV compare flags (bits 31-28) are modelled
+
+    uint32_t ge;           // ARMv6 SIMD "greater or equal" flags (bits 3-0), for sel
+    uint32_t tls;          // CP15 c13 TPIDRURO: the thread-local storage pointer
+    uint32_t excl_addr;    // ldrex/strex exclusive monitor: the address ldrex marked,
+    uint32_t excl_valid;   //   and whether the monitor is armed
 } Ctx;
 
 /* ---- Tracing (M3 differential testing) ----
@@ -236,6 +241,59 @@ GuestFn recomp_lookup(const char *name);
 /* Find a recompiled function by its guest entry address, with bit 0 set
    for Thumb functions (as in a function pointer); NULL if there is none. */
 GuestFn recomp_find(uint32_t addr);
+
+/* ---- The OS boundary ----
+   `svc #n` (a system call into the 3DS kernel) calls recomp_svc, which the
+   OS layer sets; arguments and results travel in the registers as on
+   hardware. Until a call is implemented it stops with its number. */
+typedef void (*SvcHandler)(Ctx *ctx, uint32_t number);
+extern SvcHandler recomp_svc_handler;
+static inline void recomp_svc(Ctx *ctx, uint32_t number) { recomp_svc_handler(ctx, number); }
+
+/* `udf`: a deliberate trap (e.g. __builtin_trap()); the guest wanted to crash. */
+void recomp_udf(Ctx *ctx, uint32_t addr) __attribute__((noreturn));
+
+/* ldrex/strex: exclusive (atomic) access. With one guest thread running
+   at a time, the monitor reduces to "was this address ldrex'd, with no
+   clrex/strex since?". strex returns 0 on success, 1 on failure. */
+static inline uint32_t ldrex32(Ctx *ctx, uint32_t a) { ctx->excl_addr = a; ctx->excl_valid = 1; return read32(ctx, a); }
+static inline uint32_t ldrex16(Ctx *ctx, uint32_t a) { ctx->excl_addr = a; ctx->excl_valid = 1; return read16(ctx, a); }
+static inline uint32_t ldrex8(Ctx *ctx, uint32_t a)  { ctx->excl_addr = a; ctx->excl_valid = 1; return read8(ctx, a); }
+
+#define STREX_BODY(write)                                       \
+    if (!ctx->excl_valid || ctx->excl_addr != a) {              \
+        ctx->excl_valid = 0;                                    \
+        return 1;                                               \
+    }                                                           \
+    ctx->excl_valid = 0;                                        \
+    write(ctx, a, v);                                           \
+    return 0;
+static inline uint32_t strex32(Ctx *ctx, uint32_t a, uint32_t v) { STREX_BODY(write32) }
+static inline uint32_t strex16(Ctx *ctx, uint32_t a, uint32_t v) { STREX_BODY(write16) }
+static inline uint32_t strex8(Ctx *ctx, uint32_t a, uint32_t v)  { STREX_BODY(write8) }
+#undef STREX_BODY
+
+/* uadd8: four independent byte additions; GE[i] = carry out of byte i.
+   sel: pick each byte from the first operand where GE[i] is set. */
+static inline uint32_t arm_uadd8(Ctx *ctx, uint32_t a, uint32_t b)
+{
+    uint32_t r = 0, ge = 0;
+    for (int i = 0; i < 4; i++) {
+        uint32_t sum = ((a >> (8 * i)) & 0xFF) + ((b >> (8 * i)) & 0xFF);
+        r |= (sum & 0xFF) << (8 * i);
+        ge |= (sum >> 8) << i;
+    }
+    ctx->ge = ge;
+    return r;
+}
+
+static inline uint32_t arm_sel(Ctx *ctx, uint32_t a, uint32_t b)
+{
+    uint32_t r = 0;
+    for (int i = 0; i < 4; i++)
+        r |= (((ctx->ge >> i) & 1) ? a : b) & (0xFFu << (8 * i));
+    return r;
+}
 
 /* An indirect call/jump to an address no recompiled function starts at. */
 void recomp_bad_call(Ctx *ctx, uint32_t addr) __attribute__((noreturn));

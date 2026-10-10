@@ -1,7 +1,7 @@
-@ Negative test: a bl to code that belongs to no function symbol at all.
-@ (A bl into the *middle* of a known function is fine: the recompiler
-@ makes that target an entry point of its own. But code outside every
-@ function is unknown territory, so this must be a hard error.)
+@ Negative test: a bl into a data section. Calls into the middle of a
+@ function, or into assembler-marked code with no symbol, are fine (the
+@ recompiler makes them entry points), but data is not code: this must be
+@ a hard error.
 
     .syntax unified
     .arm
@@ -11,10 +11,10 @@
     .type caller, %function
 caller:
     push {r4, lr}
-    bl orphan
+    bl not_code
     pop {r4, pc}
     .size caller, . - caller
 
-orphan:                         @ plain label, not inside any function
-    mov r0, #2
-    bx lr
+    .data
+not_code:                       @ a word in .data, not code
+    .word 0xe12fff1e

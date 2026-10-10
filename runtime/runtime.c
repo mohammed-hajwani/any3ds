@@ -35,6 +35,23 @@ void recomp_bad_jump(Ctx *ctx, uint32_t from, uint32_t value)
     abort();
 }
 
+static void svc_unimplemented(Ctx *ctx, uint32_t number)
+{
+    fprintf(stderr, "recomp: svc 0x%02" PRIx32 " is not implemented by the OS layer"
+            " (r0-r3 = %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 ", lr = 0x%08" PRIx32 ")\n",
+            number, ctx->r[0], ctx->r[1], ctx->r[2], ctx->r[3], ctx->r[14]);
+    abort();
+}
+
+SvcHandler recomp_svc_handler = svc_unimplemented;
+
+void recomp_udf(Ctx *ctx, uint32_t addr)
+{
+    fprintf(stderr, "recomp: guest executed udf (a deliberate trap) at 0x%08" PRIx32 " (lr = 0x%08" PRIx32 ")\n",
+            addr, ctx->r[14]);
+    abort();
+}
+
 void recomp_bad_call(Ctx *ctx, uint32_t addr)
 {
     fprintf(stderr,

@@ -40,6 +40,21 @@ class Program:
     segments: list
     data_symbols: dict      # name -> guest address (linked executables only)
     data_ranges: list       # sorted [(start, end)] marked $d by the assembler
+    code_regions: list = field(default_factory=list)  # sorted [(start, end, thumb)] marked $a/$t
+
+    def code_region(self, addr):
+        """The assembler-marked code region containing addr, or None."""
+        for start, end, thumb in self.code_regions:
+            if start <= addr < end:
+                return start, end, thumb
+        return None
+
+    def read(self, addr, size):
+        """Bytes of the program image (file contents only), or None."""
+        for seg in self.segments:
+            if seg.vaddr <= addr and addr + size <= seg.vaddr + len(seg.data):
+                return seg.data[addr - seg.vaddr:addr - seg.vaddr + size]
+        return None
 
     def literal(self, addr, size):
         """Bytes of a read-only literal at `addr`, or None if it isn't one.
@@ -151,24 +166,30 @@ def load_program(path):
             # in a linked executable it is a virtual address.
             sec_start = 0 if relocatable else section['sh_addr']
             size = sym['st_size']
-            if size == 0:
-                later = [a for a in starts[shndx] if a > addr]
-                size = (min(later) if later else sec_start + section['sh_size']) - addr
+            later = [a for a in starts[shndx] if a > addr]
+            next_start = min(later) if later else sec_start + section['sh_size']
+            if size == 0 or addr + size > next_start:
+                # No size, or (newlib's hand-written strcmp) a size that runs
+                # into the next function: end where the next one begins.
+                size = next_start - addr
             offset = addr - sec_start
             code = section.data()[offset:offset + size]
             fn = Function(sym.name, addr, code, bool(value & 1))
             fn.code_ranges = _code_ranges(fn, marks.get(shndx, []))
             functions.append(fn)
 
-        data_ranges = []
+        data_ranges, code_regions = [], []
         for shndx, lst in marks.items():
             section = elf.get_section(shndx)
             sec_end = (0 if relocatable else section['sh_addr']) + section['sh_size']
             for i, (addr, kind) in enumerate(lst):
+                end = lst[i + 1][0] if i + 1 < len(lst) else sec_end
                 if kind == 'd':
-                    end = lst[i + 1][0] if i + 1 < len(lst) else sec_end
                     data_ranges.append((addr, end))
+                elif section['sh_flags'] & 0x4:     # SHF_EXECINSTR
+                    code_regions.append((addr, end, kind == 't'))
         data_ranges.sort()
+        code_regions.sort()
 
         segments = [] if relocatable else [
             Segment(s['p_vaddr'], s.data(), s['p_memsz'], bool(s['p_flags'] & 2))
@@ -189,4 +210,4 @@ def load_program(path):
             merged[-1].aliases.append(fn.name)
             continue
         merged.append(fn)
-    return Program(merged, segments, data_symbols, data_ranges)
+    return Program(merged, segments, data_symbols, data_ranges, code_regions)

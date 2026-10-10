@@ -20,12 +20,14 @@ from capstone.arm import (
     ARM_CC_LE, ARM_CC_LO, ARM_CC_LS, ARM_CC_LT, ARM_CC_MI, ARM_CC_NE,
     ARM_CC_PL, ARM_CC_VC, ARM_CC_VS,
     ARM_INS_ADC, ARM_INS_ADD, ARM_INS_ADR, ARM_INS_AND, ARM_INS_ASR, ARM_INS_B,
-    ARM_INS_BIC, ARM_INS_BL, ARM_INS_BLX, ARM_INS_BX, ARM_INS_CLZ, ARM_INS_CMN, ARM_INS_CMP,
+    ARM_INS_BIC, ARM_INS_BL, ARM_INS_BLX, ARM_INS_BX, ARM_INS_CLREX, ARM_INS_CLZ, ARM_INS_CMN, ARM_INS_CMP,
     ARM_INS_EOR, ARM_INS_FMSTAT, ARM_INS_HINT, ARM_INS_LDM, ARM_INS_LDMDA, ARM_INS_LDMDB, ARM_INS_LDMIB,
-    ARM_INS_LDR, ARM_INS_LDRB, ARM_INS_LDRD, ARM_INS_LDRH, ARM_INS_LDRSB, ARM_INS_LDRSH,
+    ARM_INS_LDR, ARM_INS_LDRB, ARM_INS_LDRD, ARM_INS_LDREX, ARM_INS_LDREXB, ARM_INS_LDREXH,
+    ARM_INS_LDRH, ARM_INS_LDRSB, ARM_INS_LDRSH, ARM_INS_MCR, ARM_INS_MRC,
     ARM_INS_LSL, ARM_INS_LSR, ARM_INS_MLA, ARM_INS_MOV, ARM_INS_MOVS, ARM_INS_MUL, ARM_INS_MVN, ARM_INS_NOP,
     ARM_INS_ORR, ARM_INS_POP, ARM_INS_PUSH, ARM_INS_ROR, ARM_INS_RRX,
-    ARM_INS_REV, ARM_INS_REV16, ARM_INS_REVSH, ARM_INS_RSB, ARM_INS_SBC, ARM_INS_SMLAL,
+    ARM_INS_REV, ARM_INS_REV16, ARM_INS_REVSH, ARM_INS_RSB, ARM_INS_RSC, ARM_INS_SBC, ARM_INS_SEL,
+    ARM_INS_SMLAL, ARM_INS_STREX, ARM_INS_STREXB, ARM_INS_STREXH, ARM_INS_SVC, ARM_INS_UADD8, ARM_INS_UDF,
     ARM_INS_SMULL, ARM_INS_STM, ARM_INS_STRD, ARM_INS_SXTB, ARM_INS_SXTH, ARM_INS_UMLAL, ARM_INS_UMULL,
     ARM_INS_UXTH, ARM_INS_STMDA, ARM_INS_STMDB,
     ARM_INS_STMIB, ARM_INS_STR, ARM_INS_STRB, ARM_INS_STRH, ARM_INS_SUB,
@@ -244,6 +246,7 @@ _ARITH_FLAGS = {
     'sub': 'sub_flags(ctx, {n}, {m})',
     'sbc': 'sbc_flags(ctx, {n}, {m})',
     'rsb': 'sub_flags(ctx, {m}, {n})',
+    'rsc': 'sbc_flags(ctx, {m}, {n})',
 }
 
 # id: (C expression, writes Rd, flag kind)
@@ -253,6 +256,7 @@ _BINARY = {
     ARM_INS_SUB: ('{n} - {m}', True, 'sub'),
     ARM_INS_SBC: ('{n} - {m} - (1u - ctx->c)', True, 'sbc'),
     ARM_INS_RSB: ('{m} - {n}', True, 'rsb'),
+    ARM_INS_RSC: ('{m} - {n} - (1u - ctx->c)', True, 'rsc'),
     ARM_INS_AND: ('{n} & {m}', True, 'logic'),
     ARM_INS_ORR: ('{n} | {m}', True, 'logic'),
     ARM_INS_EOR: ('{n} ^ {m}', True, 'logic'),
@@ -768,14 +772,15 @@ def _ldrd_strd(insn, fc):
     if addr.mode != 'offset' and addr.rn in (rt, rt2):
         raise UnsupportedInstruction(insn, 'writeback to a transferred register is unpredictable')
     if insn.id == ARM_INS_LDRD:
-        if addr.mode == 'offset' and addr.rn == rt:
-            raise UnsupportedInstruction(insn, 'loading over the base register is unpredictable')
         access = 'ctx->r[{t}] = read32(ctx, {a}); ctx->r[{t2}] = read32(ctx, {a} + 4u)'
     else:
         access = 'write32(ctx, {a}, ctx->r[{t}]); write32(ctx, {a} + 4u, ctx->r[{t2}])'
     if addr.mode == 'offset':
-        where = _imm(addr.const) if addr.const is not None else f'({addr.apply(addr.base)})'
-        return [part.strip() + ';' for part in access.format(t=rt, t2=rt2, a=where).split(';')]
+        # The address is computed once up front: ldrd may load over its own
+        # base register.
+        where = _imm(addr.const) if addr.const is not None else addr.apply(addr.base)
+        parts = [part.strip() + ';' for part in access.format(t=rt, t2=rt2, a='a').split(';')]
+        return ['{', f'    uint32_t a = {where};'] + [f'    {part}' for part in parts] + ['}']
     return _with_writeback(addr, rt, access.format(t=rt, t2=rt2, a='a'))
 
 
@@ -821,7 +826,7 @@ def _block(insn, fc):
         # (A store is fine when the base is the lowest register in the list:
         # its original value is stored, e.g. libgcc's `push {sp, lr}`.)
         raise UnsupportedInstruction(insn, 'writeback with the base register in the list is unpredictable')
-    if PC in regs and not load:
+    if PC in regs and not load and _is_thumb(insn):
         raise UnsupportedInstruction(insn, 'storing pc')
     is_return = load and PC in regs
     if is_return and not (rn == SP and wback and mode == 'ia'):
@@ -831,7 +836,10 @@ def _block(insn, fc):
     lines = ['{', f'    uint32_t b = ctx->r[{rn}];']
     for i, r in enumerate(regs):
         a = _block_addr(start + 4 * i)
-        if not load:
+        if not load and r == PC:
+            # Storing pc stores this instruction + 8 (ARM11's choice).
+            lines.append(f'    write32(ctx, {a}, {_imm(_pc(insn))});')
+        elif not load:
             lines.append(f'    write32(ctx, {a}, ctx->r[{r}]);')
         elif r == PC:
             lines.append(f'    uint32_t pc = read32(ctx, {a});')
@@ -1058,6 +1066,71 @@ def _vfp_block(insn, fc):
     return lines
 
 
+# ---------------------------------------------------------------- system (M6)
+
+def _coproc(insn, fc):
+    """mrc/mcr p15: decoded from the encoding fields, and only the
+    operations user-mode 3DS code actually performs are accepted."""
+    w = _encoding(insn)
+    coproc, opc1, crn, rt = (w >> 8) & 0xF, (w >> 21) & 7, (w >> 16) & 0xF, (w >> 12) & 0xF
+    opc2, crm, is_read = (w >> 5) & 7, w & 0xF, (w >> 20) & 1
+    if coproc == 15 and opc1 == 0 and is_read and (crn, crm, opc2) == (13, 0, 3) and rt != PC:
+        # TPIDRURO: the thread-local storage pointer (libctru keeps each
+        # thread's IPC command buffer there).
+        return [f'ctx->r[{rt}] = ctx->tls;']
+    if coproc == 15 and opc1 == 0 and not is_read and (crn, crm) in ((7, 10), (7, 5)) and opc2 in (4, 5):
+        # Data synchronisation / memory barrier, prefetch flush: no effect
+        # on recompiled code running one guest thread at a time.
+        return ['/* barrier: no-op */']
+    raise UnsupportedInstruction(insn, f'coprocessor p{coproc} c{crn} c{crm} op {opc1}/{opc2}')
+
+
+_EXCL_LOADS = {ARM_INS_LDREX: 'ldrex32', ARM_INS_LDREXH: 'ldrex16', ARM_INS_LDREXB: 'ldrex8'}
+_EXCL_STORES = {ARM_INS_STREX: 'strex32', ARM_INS_STREXH: 'strex16', ARM_INS_STREXB: 'strex8'}
+
+
+def _exclusive(insn, fc):
+    """ldrex/strex (atomics): see the exclusive monitor in context.h."""
+    ops = insn.operands
+    mem = ops[-1]
+    if mem.type != ARM_OP_MEM or mem.mem.index or mem.mem.disp:
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    base = _read_reg(insn, mem.mem.base)
+    if insn.id in _EXCL_LOADS:
+        rt = _dest_reg(insn, ops[0])
+        return [f'ctx->r[{rt}] = {_EXCL_LOADS[insn.id]}(ctx, {base});']
+    rd, rt = _dest_reg(insn, ops[0]), _reg_num(insn, ops[1].reg)
+    if rd in (rt, _reg_num(insn, mem.mem.base)) or rt == PC:
+        raise UnsupportedInstruction(insn, 'strex status register overlaps an operand (unpredictable)')
+    return [f'ctx->r[{rd}] = {_EXCL_STORES[insn.id]}(ctx, {base}, ctx->r[{rt}]);  /* 0 = stored */']
+
+
+def _clrex(insn, fc):
+    return ['ctx->excl_valid = 0;']
+
+
+def _svc(insn, fc):
+    """A system call into the 3DS kernel: handed to the OS layer."""
+    (op,) = insn.operands
+    return [f'recomp_svc(ctx, {_imm(op.imm)});']
+
+
+def _simd8(insn, fc):
+    """uadd8 (sets the GE flags) and sel (uses them), as newlib's strcmp does."""
+    ops = insn.operands
+    if len(ops) != 3 or any(op.type != ARM_OP_REG for op in ops):
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    rd = _dest_reg(insn, ops[0])
+    n, m = _read_reg(insn, ops[1].reg), _read_reg(insn, ops[2].reg)
+    helper = 'arm_uadd8' if insn.id == ARM_INS_UADD8 else 'arm_sel'
+    return [f'ctx->r[{rd}] = {helper}(ctx, {n}, {m});']
+
+
+def _udf(insn, fc):
+    fc.terminates = True
+    return [f'recomp_udf(ctx, {_imm(insn.address)});  /* deliberate trap */']
+
+
 def _nop(insn, fc):
     # In ARM mode Capstone reports nop as one of the HINT family
     # (nop/yield/wfe/wfi/sev). Only a true nop is harmless to drop.
@@ -1089,6 +1162,14 @@ _HANDLERS = {
     **{op: _store for op in _STORES},
     **{op: _block for op in _BLOCK},
     ARM_INS_NOP: _nop,
+    ARM_INS_MRC: _coproc,
+    ARM_INS_MCR: _coproc,
+    **{op: _exclusive for op in (*_EXCL_LOADS, *_EXCL_STORES)},
+    ARM_INS_CLREX: _clrex,
+    ARM_INS_SVC: _svc,
+    ARM_INS_UADD8: _simd8,
+    ARM_INS_SEL: _simd8,
+    ARM_INS_UDF: _udf,
     ARM_INS_HINT: _nop,
     **{op: _vfp_arith for op in (*_VFP_BINARY, *_VFP_UNARY)},
     **{op: _vfp_mac for op in (ARM_INS_VMLA, ARM_INS_VMLS, ARM_INS_VNMLA, ARM_INS_VNMLS, ARM_INS_VNMUL)},
