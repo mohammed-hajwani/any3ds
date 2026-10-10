@@ -143,6 +143,22 @@ static void os_svc(Ctx *ctx, uint32_t n)
         ctx->r[0] = 0;
         return;
     }
+    case 0x08:      /* CreateThread(&handle, entry, arg, stack top, priority, core) */
+        /* No scheduler yet: remember the thread but don't run it, so we can
+           see what the main thread does next. */
+        printf("    -> thread entry %08" PRIx32 " NOT started (no scheduler yet)\n", ctx->r[1]);
+        ctx->r[0] = 0;
+        ctx->r[1] = new_named_handle("thread", &next_handle);
+        return;
+    case 0x24:      /* WaitSynchronization1(handle, timeout) */
+    case 0x25:      /* WaitSynchronizationN(&index, handles, count, wait all, timeout) */
+        printf("    -> wait returns at once (no scheduler yet)\n");
+        ctx->r[0] = 0;
+        ctx->r[1] = 0;
+        return;
+    case 0x0A:      /* SleepThread(ns) */
+        ctx->r[0] = 0;
+        return;
     case 0x32:      /* SendSyncRequest(handle): an IPC request */
         ipc_request(ctx, ctx->r[0], &next_handle);
         ctx->r[0] = 0;

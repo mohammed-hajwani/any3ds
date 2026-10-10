@@ -95,8 +95,15 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
 - **M6b started: the recompiled hello world runs.** The ELF entry point (libctru crt0's `_start`, a plain label) now seeds function discovery and is exported as `recomp_entry`. `make run-m6` (`tests/m6/run_hello.c`) starts it with a stack and TLS block, answers the first kernel calls, and logs every svc:
   - **Calls answered so far:** CreateAddressArbiter, GetResourceLimit and its limit/current values, CloseHandle, ControlMemory (a 30 MiB heap at 0x08000000 and a 32 MiB linear heap at 0x14000000), and handles for mutexes and events.
   - **First cut of IPC:** ConnectToPort and SendSyncRequest work through the command buffer at TLS + 0x80. `srv:` answers RegisterClient, EnableNotification and GetServiceHandle; other services get a bare success reply, and every request is logged.
-  - **Where it stops today:** after srv:RegisterClient, srv:GetServiceHandle("APT:S") and APT:S commands 0x0001 (GetLockHandle) and 0x0002 (Initialize), it reaches `svcCreateThread` (libctru's APT event thread). **Next:** threads (host threads or a cooperative scheduler), then real APT/GSP/HID/FS replies, probably reusing Azahar's HLE services.
-- Run everything with `make test`
+  - **Where it stops today:** with threads recorded but not run and waits returning at once, the sequence is:
+    1. srv:RegisterClient, then srv:GetServiceHandle("APT:S") before every APT call.
+    2. APT GetLockHandle (0x01) → Initialize (0x02) → CreateThread (the APT event thread at 0x001070a4) → Enable (0x03) → NotifyToWait (0x43).
+    3. GlanceParameter (0x0D) **in a loop**, waiting for the wakeup parameter that a real APT sends.
+
+    **Next:**
+    1. Threads (host threads or a cooperative scheduler).
+    2. Real APT replies: hand out the wakeup parameter.
+    3. Then GSP (shared memory, framebuffers), HID and FS. Azahar's HLE services are the likely source.
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function
