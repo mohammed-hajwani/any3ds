@@ -15,6 +15,13 @@ typedef struct {
 static inline uint32_t read32(Ctx *c, uint32_t a)  { uint32_t v; memcpy(&v, c->mem + a, 4); return v; }
 static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem + a, &v, 4); }
 
+/* Narrow accesses. Loads zero-extend; ldrsb/ldrsh sign-extend at the call
+   site. memcpy also makes unaligned accesses work, as on the 3DS. */
+static inline uint32_t read16(Ctx *c, uint32_t a)  { uint16_t v; memcpy(&v, c->mem + a, 2); return v; }
+static inline uint32_t read8(Ctx *c, uint32_t a)   { return c->mem[a]; }
+static inline void     write16(Ctx *c, uint32_t a, uint32_t v) { uint16_t h = (uint16_t)v; memcpy(c->mem + a, &h, 2); }
+static inline void     write8(Ctx *c, uint32_t a, uint32_t v)  { c->mem[a] = (uint8_t)v; }
+
 /* ---- Condition codes (ARM ARM, "Condition codes" table) ---- */
 
 static inline int cond_eq(const Ctx *c) { return c->z; }
@@ -67,6 +74,10 @@ typedef void (*GuestFn)(Ctx *ctx);
    with breaks the "host call stack mirrors guest call stack" assumption. */
 void recomp_bad_return(Ctx *ctx, uint32_t got, uint32_t want) __attribute__((noreturn));
 
+/* A jump-table index outside the table: the guest would jump somewhere
+   we never recompiled. */
+void recomp_bad_jump(Ctx *ctx, uint32_t from, uint32_t index) __attribute__((noreturn));
+
 /* Used inside generated functions, which keep their entry lr in `ret`. */
 #define RETURN_TO(addr) do {                                    \
         uint32_t to_ = (addr);                                  \
@@ -87,6 +98,13 @@ extern const size_t    recomp_nsyms;
 
 /* Find a recompiled function by guest symbol name; NULL if absent. */
 GuestFn recomp_lookup(const char *name);
+
+/* Copy the program's segments (code, .rodata, .data; zeroed .bss) into
+   guest memory at their link addresses. Emitted with the generated code. */
+void recomp_load_image(uint8_t *mem);
+
+/* Guest address of a data symbol (global variable); 0 if absent. */
+uint32_t recomp_data_lookup(const char *name);
 
 /* ---- Guest memory (runtime.c) ---- */
 

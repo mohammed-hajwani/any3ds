@@ -73,6 +73,7 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
 
 - **M0 done.** `make test-m0`.
 - **M1 done.** `make test-m1`. Tests are linked ELFs at `0x00100000` (unlinked `.o` files with relocations are rejected), and harnesses diff recompiled code against the same C compiled natively. push/pop and guest memory (`runtime/runtime.c`, 4 GiB `mmap`) came forward from M2, because every non-leaf function saves `lr` on the stack.
+- **M2 done.** `make test-m2`. Covers loads and stores in every addressing mode, ldm/stm (ia/ib/da/db), literal pools (folded to constants using the `$a`/`$d` mapping symbols), gcc's `add pc, pc, rX, lsl #2` switch tables, and the program image loaded into guest memory (`recomp_load_image`) with a data-symbol table. Capstone gotcha: its `post_index` flag is always False for ldrh/strh/ldrsb/ldrsh, so we read the P bit (bit 24) from the encoding instead.
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function

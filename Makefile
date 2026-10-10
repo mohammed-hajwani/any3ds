@@ -27,17 +27,18 @@ REJECT      := sh tests/expect_reject.sh $(PYTHON)
 
 M0 := out/m0
 M1 := out/m1
+M2 := out/m2
 
 # devkitARM lives outside PATH unless the shell profile adds it.
 ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 venv clean
+.PHONY: test test-m0 test-m1 test-m2 venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1
+test: test-m0 test-m1 test-m2
 
 venv: $(VENV)/.installed
 
@@ -46,7 +47,7 @@ $(VENV)/.installed: requirements.txt
 	$(PYTHON) -m pip install -q -r requirements.txt
 	touch $@
 
-$(M0) $(M1):
+$(M0) $(M1) $(M2):
 	mkdir -p $@
 
 # ---------------------------------------------------------------- M0
@@ -103,6 +104,38 @@ test-m1: $(M1)/funcs.dis $(M1)/flags.dis $(M1)/funcs_harness $(M1)/flags_harness
 	@echo '=== M1: flags and condition codes ==='
 	@timeout 60 ./$(M1)/flags_harness
 	@$(REJECT) $(M1)/bad_bl.elf 'is not the start of a known function'
+
+# ---------------------------------------------------------------- M2
+
+$(M2)/%.elf: tests/m2/%.c | $(M2)
+	$(ARM_CC) $(ARM_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
+$(M2)/%.elf: tests/m2/%.S | $(M2)
+	$(ARM_CC) $(ARM_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
+$(M2)/%.dis: $(M2)/%.elf
+	$(OBJDUMP) -d $< > $@
+
+$(M2)/gen_%.c: $(M2)/%.elf $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@
+
+# harness.c #includes mem.c as the host-native reference.
+$(M2)/mem_harness: tests/m2/harness.c tests/m2/mem.c $(M2)/gen_mem.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M2)/gen_mem.c $(RUNTIME_SRC) -o $@
+
+$(M2)/addr_harness: tests/m2/addr_harness.c $(M2)/gen_addr.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M2)/gen_addr.c $(RUNTIME_SRC) -o $@
+
+M2_BAD := $(M2)/bad_ldr_pc.elf $(M2)/bad_ldm_wb.elf $(M2)/bad_pool.elf
+
+test-m2: $(M2)/mem.dis $(M2)/addr.dis $(M2)/mem_harness $(M2)/addr_harness $(M2_BAD) $(RECOMP_DEP)
+	@echo '=== M2: differential test vs native ==='
+	@timeout 60 ./$(M2)/mem_harness
+	@echo '=== M2: addressing modes and block transfers ==='
+	@timeout 60 ./$(M2)/addr_harness
+	@$(REJECT) $(M2)/bad_ldr_pc.elf 'load into pc'
+	@$(REJECT) $(M2)/bad_ldm_wb.elf 'base register in the list is unpredictable'
+	@$(REJECT) $(M2)/bad_pool.elf 'runs into data'
 
 clean:
 	rm -rf out

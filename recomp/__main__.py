@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from .disasm import DisasmError, disassemble_arm
-from .elf_loader import LoadError, load_functions
+from .elf_loader import LoadError, load_program
 from .emit_c import c_name, emit
 from .translate import UnsupportedInstruction, translate_function
 
@@ -19,20 +19,25 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
-        functions = load_functions(args.input)
-        if not functions:
+        program = load_program(args.input)
+        if not program.functions:
             raise LoadError(f'{args.input}: no function symbols found')
 
-        entries = {fn.addr: fn for fn in functions}
+        entries = {fn.addr: fn for fn in program.functions}
         translated = []
-        for fn in functions:
+        for fn in program.functions:
             if fn.thumb:
                 raise LoadError(f'{fn.addr:08x} {fn.name}: Thumb code is not supported yet (M4)')
-            insns = disassemble_arm(fn.code, fn.addr)
-            translated.append(translate_function(fn, insns, entries))
+            if not fn.code_ranges:
+                raise LoadError(f'{fn.addr:08x} {fn.name}: contains no ARM code')
+            # Only decode code; literal pools inside the function are data.
+            insns = []
+            for start, end in fn.code_ranges:
+                insns += disassemble_arm(fn.code[start - fn.addr:end - fn.addr], start)
+            translated.append(translate_function(fn, insns, entries, program))
 
         header = args.output.with_suffix('.h')
-        c_src, h_src = emit(translated, header.name)
+        c_src, h_src = emit(translated, header.name, program)
     except (LoadError, DisasmError, UnsupportedInstruction) as e:
         # Nothing has been written yet, so a failed run leaves no stale output.
         print(f'recomp: error: {e}', file=sys.stderr)
@@ -43,7 +48,8 @@ def main(argv=None):
     args.output.write_text(c_src, newline='\n')
 
     for tf in translated:
-        print(f'  {c_name(tf.fn.addr)}  {tf.fn.name}  ({len(tf.body)} instructions)')
+        n = sum(1 for _, _, lines in tf.body if lines)
+        print(f'  {c_name(tf.fn.addr)}  {tf.fn.name}  ({n} instructions)')
     print(f'wrote {args.output} and {header.name}')
     return 0
 

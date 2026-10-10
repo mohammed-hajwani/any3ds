@@ -1,4 +1,4 @@
-"""Write translated functions and their symbol table as C source."""
+"""Write translated functions, the program image and symbol tables as C."""
 
 import re
 
@@ -7,11 +7,15 @@ def c_name(addr):
     return f'f_{addr:08x}'
 
 
-def _comment(insn):
-    return f'/* {insn.address:08x}: {insn.mnemonic} {insn.op_str}'.rstrip() + ' */'
+def _bytes_array(name, data):
+    lines = [f'static const uint8_t {name}[{max(len(data), 1)}] = {{']
+    for i in range(0, len(data), 16):
+        lines.append('    ' + ', '.join(f'0x{b:02x}' for b in data[i:i + 16]) + ',')
+    lines.append('};')
+    return lines
 
 
-def emit(functions, header_name):
+def emit(functions, header_name, program=None):
     """`functions` is a list of translate.TranslatedFunction.
 
     Returns (c_source, header_source).
@@ -27,10 +31,10 @@ def emit(functions, header_name):
         c.append('{')
         if tf.uses_ret:
             c.append('    const uint32_t ret = ctx->r[14];  /* return address we were called with */')
-        for insn, lines in tf.body:
-            if insn.address in tf.labels:
-                c.append(f'L_{insn.address:08x}:')
-            c.append(f'    {_comment(insn)}')
+        for addr, comment, lines in tf.body:
+            if addr in tf.labels:
+                c.append(f'L_{addr:08x}:')
+            c.append(f'    /* {comment} */')
             c.extend(f'    {line}' for line in lines)
         c.append('}')
         c.append('')
@@ -47,6 +51,40 @@ def emit(functions, header_name):
     c.append('        if (strcmp(recomp_syms[i].name, name) == 0)')
     c.append('            return recomp_syms[i].fn;')
     c.append('    return NULL;')
+    c.append('}')
+    c.append('')
+
+    # The program image: every loadable segment, copied to its guest address.
+    segments = program.segments if program else []
+    for seg in segments:
+        c.extend(_bytes_array(f'seg_{seg.vaddr:08x}', seg.data))
+        c.append('')
+    c.append('void recomp_load_image(uint8_t *mem)')
+    c.append('{')
+    if not segments:
+        c.append('    (void)mem;')
+    for seg in segments:
+        name = f'seg_{seg.vaddr:08x}'
+        kind = 'rw' if seg.writable else 'ro'
+        c.append(f'    memcpy(mem + 0x{seg.vaddr:08x}u, {name}, {len(seg.data)});  /* {kind} */')
+        if seg.memsz > len(seg.data):
+            c.append(f'    memset(mem + 0x{seg.vaddr + len(seg.data):08x}u, 0, {seg.memsz - len(seg.data)});  /* .bss */')
+    c.append('}')
+    c.append('')
+
+    # Data symbols, so tools and harnesses can find globals by name.
+    c.append('static const struct { const char *name; uint32_t addr; } data_syms[] = {')
+    for name, addr in sorted((program.data_symbols if program else {}).items()):
+        c.append(f'    {{ "{name}", 0x{addr:08x}u }},')
+    c.append('    { NULL, 0 },')
+    c.append('};')
+    c.append('')
+    c.append('uint32_t recomp_data_lookup(const char *name)')
+    c.append('{')
+    c.append('    for (size_t i = 0; data_syms[i].name; i++)')
+    c.append('        if (strcmp(data_syms[i].name, name) == 0)')
+    c.append('            return data_syms[i].addr;')
+    c.append('    return 0;')
     c.append('}')
 
     guard = 'RECOMP_' + re.sub(r'\W', '_', header_name).upper()

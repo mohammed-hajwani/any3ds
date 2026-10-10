@@ -26,6 +26,15 @@ void guest_mem_free(uint8_t *mem)
     munmap(mem, GUEST_SPACE);
 }
 
+void recomp_bad_jump(Ctx *ctx, uint32_t from, uint32_t index)
+{
+    fprintf(stderr,
+            "recomp: jump table at 0x%08" PRIx32 " indexed with %" PRIu32
+            ", outside the recompiled targets (lr = 0x%08" PRIx32 ")\n",
+            from, index, ctx->r[14]);
+    abort();
+}
+
 void recomp_bad_return(Ctx *ctx, uint32_t got, uint32_t want)
 {
     fprintf(stderr,
