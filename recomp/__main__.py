@@ -4,10 +4,62 @@ import argparse
 import sys
 from pathlib import Path
 
+from capstone.arm import ARM_INS_B, ARM_INS_BLX
+
 from .disasm import DisasmError, disassemble
-from .elf_loader import LoadError, load_program
+from .elf_loader import Function, LoadError, load_program
 from .emit_c import c_name, emit
-from .translate import UnsupportedInstruction, translate_function
+from .translate import UnsupportedInstruction, direct_branch_target, translate_function
+
+
+def _decode(fn):
+    """Disassemble a function's code ranges (literal pools inside are data)."""
+    if not fn.code_ranges:
+        raise LoadError(f'{fn.addr:08x} {fn.name}: contains no code')
+    insns = []
+    for start, end in fn.code_ranges:
+        insns += disassemble(fn.code[start - fn.addr:end - fn.addr], start, fn.thumb)
+    return insns
+
+
+def discover_functions(program):
+    """Symbol table functions, plus every call/branch target that isn't one.
+
+    Hand-written code (libgcc's division routines, for instance) calls and
+    tail-branches into the *middle* of other functions: alternate entry
+    points with no symbol. Each such target becomes a function of its own,
+    running from the target to the end of the function containing it; that
+    code is simply recompiled twice. Returns (functions, decoded insns).
+    """
+    functions = list(program.functions)
+    entries = {fn.addr: fn for fn in functions}
+    decoded = {}
+    queue = list(functions)
+    while queue:
+        fn = queue.pop()
+        decoded[fn.addr] = insns = _decode(fn)
+        for insn in insns:
+            target = direct_branch_target(insn)
+            if target is None:
+                continue
+            if insn.id == ARM_INS_BLX and fn.thumb:
+                target &= ~3                # Thumb blx #imm goes to ARM code: word-aligned
+            if target in entries:
+                continue
+            if insn.id == ARM_INS_B and fn.addr <= target < fn.end:
+                continue                    # an ordinary branch within the function
+            container = next((f for f in program.functions if f.addr < target < f.end), None)
+            if container is None:
+                raise LoadError(f'{insn.address:08x}: {insn.mnemonic} target {target:08x} '
+                                'is not inside any known function')
+            off = target - container.addr
+            new = Function(f'{container.name}+0x{off:x}', target, container.code[off:], container.thumb,
+                           [(max(s, target), e) for s, e in container.code_ranges if e > target])
+            entries[target] = new
+            functions.append(new)
+            queue.append(new)
+    functions.sort(key=lambda f: f.addr)
+    return functions, decoded
 
 
 def main(argv=None):
@@ -25,16 +77,9 @@ def main(argv=None):
         if not program.functions:
             raise LoadError(f'{args.input}: no function symbols found')
 
-        entries = {fn.addr: fn for fn in program.functions}
-        translated = []
-        for fn in program.functions:
-            if not fn.code_ranges:
-                raise LoadError(f'{fn.addr:08x} {fn.name}: contains no code')
-            # Only decode code; literal pools inside the function are data.
-            insns = []
-            for start, end in fn.code_ranges:
-                insns += disassemble(fn.code[start - fn.addr:end - fn.addr], start, fn.thumb)
-            translated.append(translate_function(fn, insns, entries, program))
+        functions, decoded = discover_functions(program)
+        entries = {fn.addr: fn for fn in functions}
+        translated = [translate_function(fn, decoded[fn.addr], entries, program) for fn in functions]
 
         header = args.output.with_suffix('.h')
         c_src, h_src = emit(translated, header.name, program, trace=args.trace)

@@ -20,12 +20,14 @@ from capstone.arm import (
     ARM_CC_LE, ARM_CC_LO, ARM_CC_LS, ARM_CC_LT, ARM_CC_MI, ARM_CC_NE,
     ARM_CC_PL, ARM_CC_VC, ARM_CC_VS,
     ARM_INS_ADC, ARM_INS_ADD, ARM_INS_ADR, ARM_INS_AND, ARM_INS_ASR, ARM_INS_B,
-    ARM_INS_BIC, ARM_INS_BL, ARM_INS_BLX, ARM_INS_BX, ARM_INS_CMN, ARM_INS_CMP,
+    ARM_INS_BIC, ARM_INS_BL, ARM_INS_BLX, ARM_INS_BX, ARM_INS_CLZ, ARM_INS_CMN, ARM_INS_CMP,
     ARM_INS_EOR, ARM_INS_FMSTAT, ARM_INS_HINT, ARM_INS_LDM, ARM_INS_LDMDA, ARM_INS_LDMDB, ARM_INS_LDMIB,
-    ARM_INS_LDR, ARM_INS_LDRB, ARM_INS_LDRH, ARM_INS_LDRSB, ARM_INS_LDRSH,
+    ARM_INS_LDR, ARM_INS_LDRB, ARM_INS_LDRD, ARM_INS_LDRH, ARM_INS_LDRSB, ARM_INS_LDRSH,
     ARM_INS_LSL, ARM_INS_LSR, ARM_INS_MLA, ARM_INS_MOV, ARM_INS_MOVS, ARM_INS_MUL, ARM_INS_MVN, ARM_INS_NOP,
     ARM_INS_ORR, ARM_INS_POP, ARM_INS_PUSH, ARM_INS_ROR, ARM_INS_RRX,
-    ARM_INS_RSB, ARM_INS_SBC, ARM_INS_STM, ARM_INS_STMDA, ARM_INS_STMDB,
+    ARM_INS_REV, ARM_INS_REV16, ARM_INS_REVSH, ARM_INS_RSB, ARM_INS_SBC, ARM_INS_SMLAL,
+    ARM_INS_SMULL, ARM_INS_STM, ARM_INS_STRD, ARM_INS_SXTB, ARM_INS_SXTH, ARM_INS_UMLAL, ARM_INS_UMULL,
+    ARM_INS_UXTH, ARM_INS_STMDA, ARM_INS_STMDB,
     ARM_INS_STMIB, ARM_INS_STR, ARM_INS_STRB, ARM_INS_STRH, ARM_INS_SUB,
     ARM_INS_TEQ, ARM_INS_TST, ARM_INS_UXTB,
     ARM_INS_VABS, ARM_INS_VADD, ARM_INS_VCMP, ARM_INS_VCMPE, ARM_INS_VCVT,
@@ -406,14 +408,80 @@ def _mul(insn, fc):
     return _emit_dp(rd, expr, 'logic', _sets_flags(insn), None)
 
 
-def _uxtb(insn, fc):
-    """Zero-extend the low byte, after an optional rotation by 8/16/24."""
+_EXTENDS = {
+    ARM_INS_UXTB: '{x} & 0xffu',
+    ARM_INS_UXTH: '{x} & 0xffffu',
+    ARM_INS_SXTB: '(uint32_t)(int32_t)(int8_t){x}',
+    ARM_INS_SXTH: '(uint32_t)(int32_t)(int16_t){x}',
+}
+
+
+def _extend(insn, fc):
+    """uxtb/uxth/sxtb/sxth: zero/sign-extend the low byte or halfword, after
+    an optional rotation by 8/16/24 (ARM only)."""
     ops = insn.operands
     if len(ops) != 2 or ops[1].type != ARM_OP_REG:
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
     rd = _dest_reg(insn, ops[0])
     x, _ = _shift_imm(insn, _read_reg(insn, ops[1].reg), ops[1].shift.type, ops[1].shift.value)
-    return [f'ctx->r[{rd}] = {x} & 0xffu;']
+    if x != _read_reg(insn, ops[1].reg):
+        x = f'({x})'
+    return [f'ctx->r[{rd}] = {_EXTENDS[insn.id].format(x=x)};']
+
+
+_REVERSES = {
+    ARM_INS_REV: '__builtin_bswap32({x})',
+    ARM_INS_REV16: '((({x} & 0x00ff00ffu) << 8) | (({x} >> 8) & 0x00ff00ffu))',
+    ARM_INS_REVSH: '(uint32_t)(int32_t)(int16_t)((({x} & 0xffu) << 8) | (({x} >> 8) & 0xffu))',
+}
+
+
+def _reverse(insn, fc):
+    """rev (byte swap), rev16 (swap within each halfword), revsh (swap the
+    low halfword and sign-extend)."""
+    ops = insn.operands
+    if len(ops) != 2 or any(op.type != ARM_OP_REG for op in ops):
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    rd = _dest_reg(insn, ops[0])
+    return [f'ctx->r[{rd}] = {_REVERSES[insn.id].format(x=_read_reg(insn, ops[1].reg))};']
+
+
+def _clz(insn, fc):
+    """Count leading zeros (ARM only); clz of 0 is 32."""
+    ops = insn.operands
+    if len(ops) != 2 or any(op.type != ARM_OP_REG for op in ops):
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    rd = _dest_reg(insn, ops[0])
+    return [f'ctx->r[{rd}] = arm_clz({_read_reg(insn, ops[1].reg)});']
+
+
+_LONG_MUL = {   # id: (signed, accumulate)
+    ARM_INS_UMULL: (False, False), ARM_INS_SMULL: (True, False),
+    ARM_INS_UMLAL: (False, True), ARM_INS_SMLAL: (True, True),
+}
+
+
+def _long_mul(insn, fc):
+    """umull/smull/umlal/smlal: 32 x 32 -> 64-bit product into rdlo:rdhi
+    (plus the 64-bit value already there, for the accumulating forms).
+    With S, N and Z come from the 64-bit result."""
+    signed, acc = _LONG_MUL[insn.id]
+    ops = insn.operands
+    if len(ops) != 4 or any(op.type != ARM_OP_REG for op in ops):
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    lo, hi = _dest_reg(insn, ops[0]), _dest_reg(insn, ops[1])
+    if lo == hi:
+        raise UnsupportedInstruction(insn, 'rdlo == rdhi is unpredictable')
+    n, m = (_read_reg(insn, op.reg) for op in ops[2:])
+    prod = f'(uint64_t)((int64_t)(int32_t){n} * (int32_t){m})' if signed else f'(uint64_t){n} * {m}'
+    if acc:
+        prod = f'((uint64_t)ctx->r[{hi}] << 32 | ctx->r[{lo}]) + {prod}'
+    lines = ['{', f'    uint64_t p = {prod};',
+             f'    ctx->r[{lo}] = (uint32_t)p;', f'    ctx->r[{hi}] = (uint32_t)(p >> 32);']
+    if _sets_flags(insn):
+        lines += ['    ctx->n = (uint32_t)(p >> 63);', '    ctx->z = p == 0;']
+    lines.append('}')
+    return lines
 
 
 # ---------------------------------------------------------------- control flow
@@ -425,14 +493,28 @@ def _branch_target(insn):
     return op.imm & 0xFFFFFFFF
 
 
+def direct_branch_target(insn):
+    """Target of a b/bl/blx #imm, or None. Used for function discovery."""
+    if insn.id in (ARM_INS_B, ARM_INS_BL, ARM_INS_BLX) and len(insn.operands) == 1 \
+            and insn.operands[0].type == ARM_OP_IMM:
+        return insn.operands[0].imm & 0xFFFFFFFF
+    return None
+
+
 def _b(insn, fc):
     target = _branch_target(insn)
-    if not fc.start <= target < fc.end:
-        raise UnsupportedInstruction(
-            insn, f'branch to {target:08x} leaves {fc.fn.name} (tail calls come later)')
-    fc.labels.add(target)
     fc.terminates = True
-    return [f'goto L_{target:08x};']
+    if fc.start <= target < fc.end:
+        fc.labels.add(target)
+        return [f'goto L_{target:08x};']
+    # A tail call: jump to another function, which then returns straight to
+    # our caller (lr is untouched). In C: call it, then return.
+    callee = fc.entries.get(target)
+    if callee is None:
+        raise UnsupportedInstruction(insn, f'branch to {target:08x}, which is not a known function')
+    if callee.thumb != _is_thumb(insn):
+        raise UnsupportedInstruction(insn, f'branch to {callee.name} would need a mode switch')
+    return [f'{c_name(target)}(ctx);  /* tail call: {callee.name} */', 'return;']
 
 
 def _bl(insn, fc):
@@ -443,9 +525,15 @@ def _bl(insn, fc):
     it has bit 0 set, so the callee's `bx lr` knows to return to Thumb.
     """
     op = insn.operands[0]
+    ret = (insn.address + insn.size) | int(_is_thumb(insn))
     if insn.id == ARM_INS_BLX and op.type == ARM_OP_REG:
-        raise UnsupportedInstruction(insn, 'indirect call through a register (needs the '
-                                           'address lookup table from a later milestone)')
+        # An indirect call (function pointer, vtable): the target is only
+        # known at runtime, so look it up in the table of recompiled
+        # functions. Bit 0 of the address selects Thumb, as on hardware.
+        if _reg_num(insn, op.reg) == PC:
+            raise UnsupportedInstruction(insn, 'blx pc is unpredictable')
+        return ['{', f'    uint32_t target = {_read_reg(insn, op.reg)};',
+                f'    ctx->r[14] = {_imm(ret)};', '    recomp_call(ctx, target);', '}']
     target = _branch_target(insn)
     callee = fc.entries.get(target)
     if callee is None:
@@ -455,7 +543,6 @@ def _bl(insn, fc):
     if callee.thumb != expected_mode:
         mode = 'Thumb' if callee.thumb else 'ARM'
         raise UnsupportedInstruction(insn, f'calls {callee.name}, a {mode} function, without switching mode')
-    ret = (insn.address + insn.size) | int(_is_thumb(insn))
     return [f'ctx->r[14] = {_imm(ret)};', f'{c_name(target)}(ctx);  /* {callee.name} */']
 
 
@@ -467,7 +554,12 @@ def _bx(insn, fc):
         fc.uses_ret = True
         fc.terminates = True
         return ['RETURN_TO(ctx->r[14]);']
-    raise UnsupportedInstruction(insn, 'bx to a register other than lr (indirect jumps come later)')
+    if op.type == ARM_OP_REG and _reg_num(insn, op.reg) != PC:
+        # An indirect tail call (e.g. through a function pointer): look the
+        # target up, call it, and return to our caller.
+        fc.terminates = True
+        return [f'recomp_call(ctx, {_read_reg(insn, op.reg)});  /* indirect tail call */', 'return;']
+    raise UnsupportedInstruction(insn, 'bx pc')
 
 
 def _computed_jump(insn, fc, op):
@@ -557,11 +649,12 @@ def _offset(insn, op, subtracted):
     raise UnsupportedInstruction(insn, f'offset operand type {op.type}')
 
 
-def _address(insn):
+def _address(insn, mem_index=1):
+    """Decode the memory operand (operand `mem_index`; 2 for ldrd/strd)."""
     ops = insn.operands
-    if len(ops) < 2 or ops[1].type != ARM_OP_MEM:
+    if len(ops) <= mem_index or ops[mem_index].type != ARM_OP_MEM:
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
-    mem = ops[1]
+    mem = ops[mem_index]
     rn = _reg_num(insn, mem.mem.base)
     addr = _Addr(rn, _read_reg(insn, mem.mem.base))
 
@@ -570,12 +663,13 @@ def _address(insn):
     # Capstone's post_index flag: it's always False for ldrh/strh/ldrsb/ldrsh.
     # Thumb-1 loads/stores have no pre/post-index forms: always plain offset.
     post = False if _is_thumb(insn) else not (_encoding(insn) >> 24) & 1
-    if post != (len(ops) == 3):
+    if post != (len(ops) == mem_index + 2):
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
 
     if post:
-        # Capstone gives the post-index offset as a third operand.
-        addr.offset, addr.mode = _offset(insn, ops[2], ops[2].subtracted), 'post'
+        # Capstone gives the post-index offset as an extra operand.
+        off = ops[mem_index + 1]
+        addr.offset, addr.mode = _offset(insn, off, off.subtracted), 'post'
     elif mem.mem.index:
         x, _ = _shift_imm(insn, _read_reg(insn, mem.mem.index), mem.shift.type, mem.shift.value)
         addr.offset = ('-' if mem.subtracted else '+', x)
@@ -661,6 +755,30 @@ def _store(insn, fc):
     return _with_writeback(addr, rt, f'{helper}(ctx, a, ctx->r[{rt}])')
 
 
+def _ldrd_strd(insn, fc):
+    """ldrd/strd: two registers (rt, rt+1) from/to two consecutive words,
+    with the same addressing modes as ldrh."""
+    ops = insn.operands
+    if len(ops) < 3 or ops[0].type != ARM_OP_REG or ops[1].type != ARM_OP_REG:
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    rt, rt2 = _reg_num(insn, ops[0].reg), _reg_num(insn, ops[1].reg)
+    if rt % 2 or rt2 != rt + 1 or rt2 == PC:
+        raise UnsupportedInstruction(insn, 'ldrd/strd needs an even/odd register pair below pc')
+    addr = _address(insn, mem_index=2)
+    if addr.mode != 'offset' and addr.rn in (rt, rt2):
+        raise UnsupportedInstruction(insn, 'writeback to a transferred register is unpredictable')
+    if insn.id == ARM_INS_LDRD:
+        if addr.mode == 'offset' and addr.rn == rt:
+            raise UnsupportedInstruction(insn, 'loading over the base register is unpredictable')
+        access = 'ctx->r[{t}] = read32(ctx, {a}); ctx->r[{t2}] = read32(ctx, {a} + 4u)'
+    else:
+        access = 'write32(ctx, {a}, ctx->r[{t}]); write32(ctx, {a} + 4u, ctx->r[{t2}])'
+    if addr.mode == 'offset':
+        where = _imm(addr.const) if addr.const is not None else f'({addr.apply(addr.base)})'
+        return [part.strip() + ';' for part in access.format(t=rt, t2=rt2, a=where).split(';')]
+    return _with_writeback(addr, rt, access.format(t=rt, t2=rt2, a='a'))
+
+
 # ---------------------------------------------------------------- ldm / stm
 
 # id: (load?, mode). push = stmdb sp!, pop = ldmia sp!.
@@ -699,7 +817,9 @@ def _block(insn, fc):
 
     if rn == PC:
         raise UnsupportedInstruction(insn, 'pc as the base register')
-    if wback and rn in regs:
+    if wback and rn in regs and (load or rn != regs[0]):
+        # (A store is fine when the base is the lowest register in the list:
+        # its original value is stored, e.g. libgcc's `push {sp, lr}`.)
         raise UnsupportedInstruction(insn, 'writeback with the base register in the list is unpredictable')
     if PC in regs and not load:
         raise UnsupportedInstruction(insn, 'storing pc')
@@ -952,7 +1072,12 @@ _HANDLERS = {
     **{op: _binary for op in _BINARY},
     **{op: _unary for op in _UNARY},
     **{op: _shift_mnemonic for op in _SHIFT_MNEMONICS},
-    ARM_INS_UXTB: _uxtb,
+    **{op: _extend for op in _EXTENDS},
+    **{op: _reverse for op in _REVERSES},
+    **{op: _long_mul for op in _LONG_MUL},
+    ARM_INS_CLZ: _clz,
+    ARM_INS_LDRD: _ldrd_strd,
+    ARM_INS_STRD: _ldrd_strd,
     ARM_INS_B: _b,
     ARM_INS_BL: _bl,
     ARM_INS_BLX: _bl,

@@ -196,6 +196,9 @@ static inline uint32_t shift_ror(Ctx *ctx, uint32_t x, uint32_t amount, int set_
 
 #include "vfp.h"
 
+/* clz: count leading zero bits; clz(0) is 32 (C's __builtin_clz(0) is undefined). */
+static inline uint32_t arm_clz(uint32_t x) { return x ? (uint32_t)__builtin_clz(x) : 32; }
+
 /* ---- Calls and returns ---- */
 
 /* Every recompiled guest function has this signature. */
@@ -229,6 +232,23 @@ extern const size_t    recomp_nsyms;
 
 /* Find a recompiled function by guest symbol name; NULL if absent. */
 GuestFn recomp_lookup(const char *name);
+
+/* Find a recompiled function by its guest entry address, with bit 0 set
+   for Thumb functions (as in a function pointer); NULL if there is none. */
+GuestFn recomp_find(uint32_t addr);
+
+/* An indirect call/jump to an address no recompiled function starts at. */
+void recomp_bad_call(Ctx *ctx, uint32_t addr) __attribute__((noreturn));
+
+/* Indirect calls (function pointers, vtables): the target is only known
+   at runtime, so it's looked up in the table of recompiled functions. */
+static inline void recomp_call(Ctx *ctx, uint32_t addr)
+{
+    GuestFn fn = recomp_find(addr);
+    if (!fn)
+        recomp_bad_call(ctx, addr);
+    fn(ctx);
+}
 
 /* Copy the program's segments (code, .rodata, .data; zeroed .bss) into
    guest memory at their link addresses. Emitted with the generated code. */

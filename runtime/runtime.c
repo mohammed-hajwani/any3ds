@@ -35,6 +35,15 @@ void recomp_bad_jump(Ctx *ctx, uint32_t from, uint32_t value)
     abort();
 }
 
+void recomp_bad_call(Ctx *ctx, uint32_t addr)
+{
+    fprintf(stderr,
+            "recomp: indirect call/jump to 0x%08" PRIx32 ", where no recompiled %s function starts"
+            " (lr = 0x%08" PRIx32 ")\n",
+            addr, addr & 1 ? "Thumb" : "ARM", ctx->r[14]);
+    abort();
+}
+
 void recomp_bad_return(Ctx *ctx, uint32_t got, uint32_t want)
 {
     fprintf(stderr,

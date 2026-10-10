@@ -38,11 +38,11 @@ ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 venv clean
+.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5
+test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real
 
 venv: $(VENV)/.installed
 
@@ -79,7 +79,7 @@ test-m0: $(M0)/test.dis $(M0)/shifts.dis $(M0)/test_harness $(M0)/shifts_harness
 	@timeout 60 ./$(M0)/test_harness
 	@echo '=== M0: barrel shifter ==='
 	@timeout 60 ./$(M0)/shifts_harness
-	@$(REJECT) $(M0)/unsupported.o 'unsupported instruction `umull'
+	@$(REJECT) $(M0)/unsupported.o 'unsupported instruction `qadd'
 
 # ---------------------------------------------------------------- M1
 
@@ -107,7 +107,7 @@ test-m1: $(M1)/funcs.dis $(M1)/flags.dis $(M1)/funcs_harness $(M1)/flags_harness
 	@timeout 60 ./$(M1)/funcs_harness
 	@echo '=== M1: flags and condition codes ==='
 	@timeout 60 ./$(M1)/flags_harness
-	@$(REJECT) $(M1)/bad_bl.elf 'is not the start of a known function'
+	@$(REJECT) $(M1)/bad_bl.elf 'is not inside any known function'
 
 # ---------------------------------------------------------------- M2
 
@@ -222,7 +222,7 @@ M4_HARNESSES := $(M4)/funcs_thumb_harness $(M4)/mem_thumb_harness $(M4)/vshift_a
 M4_PROGS := m4/funcs_thumb m4/mem_thumb m4/vshift_arm m4/vshift_thumb m4/interwork m4/thumb m4/arm_regshift
 $(foreach p,$(M4_PROGS),$(eval $(call m3_prog,$(p))))
 M4_DIFFS := $(foreach p,$(M4_PROGS),$(M3)/$(notdir $(p))_diff)
-M4_BAD := $(M4)/bad_thumb2.elf $(M4)/bad_blx_reg.elf $(M4)/bad_mode.elf
+M4_BAD := $(M4)/bad_thumb2.elf $(M4)/bad_mode.elf
 
 test-m4: $(M4_HARNESSES) $(M4_DIFFS) $(M4_BAD) $(M4)/mem_thumb.dis $(M4)/thumb.dis $(M4)/interwork.dis $(RECOMP_DEP)
 	@for h in $(M4_HARNESSES); do \
@@ -234,7 +234,6 @@ test-m4: $(M4_HARNESSES) $(M4_DIFFS) $(M4_BAD) $(M4)/mem_thumb.dis $(M4)/thumb.d
 	    timeout 120 ./$$d || exit 1; \
 	done
 	@$(REJECT) $(M4)/bad_thumb2.elf 'Thumb-2 instruction'
-	@$(REJECT) $(M4)/bad_blx_reg.elf 'indirect call'
 	@$(REJECT) $(M4)/bad_mode.elf 'ARM code inside a Thumb function'
 	@echo '=== M4: self-test (planted Thumb pc bug must be pinpointed) ==='
 	@sh tests/m3/selftest.sh $(PYTHON) $(HOST_CC) thumb-pc $(M4)/thumb.elf 'ldr r1, \[pc' r1 $(HOST_FLAGS)
@@ -275,6 +274,48 @@ test-m5: $(M5)/fp_harness $(M5_DIFFS) $(M5)/bad_vcvtr.elf $(M5)/fp.dis $(M5)/vfp
 	@$(REJECT) $(M5)/bad_vcvtr.elf 'FPSCR rounding mode'
 	@echo '=== M5: self-test (planted x86-NaN bug must be pinpointed) ==='
 	@sh tests/m3/selftest.sh $(PYTHON) $(HOST_CC) vfp-sqrt $(M5)/vfp.elf 'vsqrt.f32' d4 $(HOST_FLAGS)
+
+# ---------------------------------------------------------------- real code
+#
+# What -O2 code and libgcc look like: function pointers (indirect calls),
+# vtables, tail calls, calls into the middle of functions, 64-bit maths,
+# clz/rev/extends/ldrd. ARM and Thumb builds, both linked with libgcc.
+
+REAL := out/real
+REAL_LDFLAGS := $(ARM_LDFLAGS) -Wl,--use-blx
+
+$(REAL):
+	mkdir -p $@
+
+$(REAL)/real_arm.elf: tests/real/real.c | $(REAL)
+	$(ARM_CC) $(VFP_FLAGS) -O2 $(REAL_LDFLAGS) $< -lgcc -o $@
+
+$(REAL)/real_thumb.elf: tests/real/real.c | $(REAL)
+	$(ARM_CC) $(THUMB_FLAGS) -O2 $(REAL_LDFLAGS) $< -lgcc -o $@
+
+$(REAL)/%.dis: $(REAL)/%.elf
+	$(OBJDUMP) -d $< > $@
+
+$(REAL)/gen_%.c: $(REAL)/%.elf $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@
+
+$(REAL)/%_harness: tests/real/harness.c tests/real/real.c $(REAL)/gen_%.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(REAL)/gen_$*.c $(RUNTIME_SRC) -o $@
+
+REAL_PROGS := real/real_arm real/real_thumb
+$(foreach p,$(REAL_PROGS),$(eval $(call m3_prog,$(p))))
+REAL_DIFFS := $(foreach p,$(REAL_PROGS),$(M3)/$(notdir $(p))_diff)
+REAL_SKIP := isort,shape_total
+
+test-real: $(REAL)/real_arm_harness $(REAL)/real_thumb_harness $(REAL_DIFFS) $(REAL)/real_arm.dis $(REAL)/real_thumb.dis
+	@for h in $(REAL)/real_arm_harness $(REAL)/real_thumb_harness; do \
+	    echo "=== real: $$(basename $$h _harness) vs native ==="; \
+	    timeout 60 ./$$h || exit 1; \
+	done
+	@for d in $(REAL_DIFFS); do \
+	    echo "=== real: $$(basename $$d _diff) vs unicorn ==="; \
+	    timeout 180 ./$$d 100 $(REAL_SKIP) || exit 1; \
+	done
 
 clean:
 	rm -rf out

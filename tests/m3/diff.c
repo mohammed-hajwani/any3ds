@@ -9,7 +9,10 @@
  *      RECOMP_TRACE / write hook is compared with Unicorn's next step.
  * The first difference is reported with the instruction that caused it.
  *
- * Usage: <prog>_diff [runs-per-function]
+ * Usage: <prog>_diff [runs-per-function] [skip,list,of,functions]
+ *
+ * Functions that take function pointers (or pointers to structs holding
+ * them) are skipped: random inputs would make them call random addresses.
  */
 #include <inttypes.h>
 #include <setjmp.h>
@@ -303,6 +306,7 @@ static uint64_t random_vfp(void)
 int main(int argc, char **argv)
 {
     int runs = argc > 1 ? atoi(argv[1]) : 100;
+    const char *skip = argc > 2 ? argv[2] : "";
 
     mem = guest_mem_alloc();
     check_uc(uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc), "open");
@@ -323,6 +327,12 @@ int main(int argc, char **argv)
     for (size_t fi = 0; fi < recomp_nsyms; fi++) {
         const RecompSym *sym = &recomp_syms[fi];
         cur_fn = sym->name;
+        size_t len = strlen(sym->name);
+        const char *hit = strstr(skip, sym->name);
+        if (hit && (hit == skip || hit[-1] == ',') && (hit[len] == ',' || hit[len] == 0)) {
+            printf("SKIP %-12s (takes function pointers)\n", sym->name);
+            continue;
+        }
         uint64_t fn_steps = 0;
 
         for (cur_run = 0; cur_run < runs; cur_run++) {

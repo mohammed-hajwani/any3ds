@@ -18,7 +18,8 @@ class Function:
     addr: int               # guest address (bit 0 cleared)
     code: bytes             # every byte of the symbol, code and data
     thumb: bool             # symbol value had bit 0 set => Thumb code
-    code_ranges: list = field(default_factory=list)   # [(start, end)] of ARM code
+    code_ranges: list = field(default_factory=list)   # [(start, end)] of code
+    aliases: list = field(default_factory=list)       # other names for the same function
 
     @property
     def end(self):
@@ -120,25 +121,41 @@ def load_program(path):
                                     f'({section.name}); link it first')
 
         marks = _mapping_symbols(symtab)
-        functions, data_symbols = [], {}
+        data_symbols = {}
+        func_syms = []
         for sym in symtab.iter_symbols():
             shndx = sym['st_shndx']
-            if not isinstance(shndx, int) or sym['st_size'] == 0:   # SHN_UNDEF, SHN_ABS, ...
+            if not isinstance(shndx, int):          # SHN_UNDEF, SHN_ABS, ...
                 continue
             kind = sym['st_info']['type']
-            if kind == 'STT_OBJECT' and not relocatable:
+            if kind == 'STT_OBJECT' and not relocatable and sym['st_size']:
                 data_symbols[sym.name] = sym['st_value']
-            if kind != 'STT_FUNC':
-                continue
+            if kind == 'STT_FUNC':
+                func_syms.append(sym)
 
+        # Hand-written assembly (e.g. libgcc's __aeabi_uldivmod) often has no
+        # .size, so its symbol says 0 bytes. Assume such a function runs up
+        # to the next function symbol in its section (or the section's end).
+        starts = {}
+        for sym in func_syms:
+            starts.setdefault(sym['st_shndx'], []).append(sym['st_value'] & ~1)
+
+        functions = []
+        for sym in func_syms:
+            shndx = sym['st_shndx']
             section = elf.get_section(shndx)
             value = sym['st_value']
             # Bit 0 of a function symbol is the Thumb bit, not part of the address.
             addr = value & ~1
             # In a relocatable .o, st_value is an offset into its section;
             # in a linked executable it is a virtual address.
-            offset = addr if relocatable else addr - section['sh_addr']
-            code = section.data()[offset:offset + sym['st_size']]
+            sec_start = 0 if relocatable else section['sh_addr']
+            size = sym['st_size']
+            if size == 0:
+                later = [a for a in starts[shndx] if a > addr]
+                size = (min(later) if later else sec_start + section['sh_size']) - addr
+            offset = addr - sec_start
+            code = section.data()[offset:offset + size]
             fn = Function(sym.name, addr, code, bool(value & 1))
             fn.code_ranges = _code_ranges(fn, marks.get(shndx, []))
             functions.append(fn)
@@ -158,11 +175,18 @@ def load_program(path):
             for s in elf.iter_segments() if s['p_type'] == 'PT_LOAD'
         ]
 
-    functions.sort(key=lambda fn: fn.addr)
-    for prev, cur in zip(functions, functions[1:]):
-        if prev.addr == cur.addr:
-            raise LoadError(
-                f'{prev.name} and {cur.name} both live at {cur.addr:08x}. '
-                'Objects with several code sections (e.g. -ffunction-sections) '
-                'need linking first.')
-    return Program(functions, segments, data_symbols, data_ranges)
+    functions.sort(key=lambda fn: (fn.addr, -len(fn.code), fn.name))
+    merged = []
+    for fn in functions:
+        if merged and merged[-1].addr == fn.addr:
+            if relocatable:
+                raise LoadError(
+                    f'{merged[-1].name} and {fn.name} both live at {fn.addr:08x}. '
+                    'Objects with several code sections (e.g. -ffunction-sections) '
+                    'need linking first.')
+            # In a linked program, two names at one address are aliases
+            # (libgcc has e.g. __aeabi_idiv0 = __aeabi_ldiv0): one function.
+            merged[-1].aliases.append(fn.name)
+            continue
+        merged.append(fn)
+    return Program(merged, segments, data_symbols, data_ranges)

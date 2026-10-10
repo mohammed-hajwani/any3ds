@@ -1,6 +1,7 @@
-@ Negative test: a bl into the middle of a function.
-@ The recompiler only knows how to call function entry points, so this
-@ must be a hard error rather than a call to the wrong place.
+@ Negative test: a bl to code that belongs to no function symbol at all.
+@ (A bl into the *middle* of a known function is fine: the recompiler
+@ makes that target an entry point of its own. But code outside every
+@ function is unknown territory, so this must be a hard error.)
 
     .syntax unified
     .arm
@@ -10,15 +11,10 @@
     .type caller, %function
 caller:
     push {r4, lr}
-    bl callee_mid
+    bl orphan
     pop {r4, pc}
     .size caller, . - caller
 
-    .global callee
-    .type callee, %function
-callee:
-    mov r0, #1
-callee_mid:                     @ plain label, not a function symbol
+orphan:                         @ plain label, not inside any function
     mov r0, #2
     bx lr
-    .size callee, . - callee

@@ -51,7 +51,8 @@ def emit(functions, header_name, program=None, trace=False):
     # real `bx` target.
     c.append('const RecompSym recomp_syms[] = {')
     for tf in functions:
-        c.append(f'    {{ "{tf.fn.name}", 0x{tf.fn.addr | int(tf.fn.thumb):08x}u, {c_name(tf.fn.addr)} }},')
+        for name in [tf.fn.name] + tf.fn.aliases:
+            c.append(f'    {{ "{name}", 0x{tf.fn.addr | int(tf.fn.thumb):08x}u, {c_name(tf.fn.addr)} }},')
     c.append('};')
     c.append('const size_t recomp_nsyms = sizeof recomp_syms / sizeof recomp_syms[0];')
     c.append('')
@@ -60,6 +61,24 @@ def emit(functions, header_name, program=None, trace=False):
     c.append('    for (size_t i = 0; i < recomp_nsyms; i++)')
     c.append('        if (strcmp(recomp_syms[i].name, name) == 0)')
     c.append('            return recomp_syms[i].fn;')
+    c.append('    return NULL;')
+    c.append('}')
+    c.append('')
+
+    # Entry address -> function, sorted, for indirect calls (recomp_call).
+    c.append('static const struct { uint32_t addr; GuestFn fn; } by_addr[] = {')
+    for tf in sorted(functions, key=lambda tf: tf.fn.addr | int(tf.fn.thumb)):
+        c.append(f'    {{ 0x{tf.fn.addr | int(tf.fn.thumb):08x}u, {c_name(tf.fn.addr)} }},  /* {tf.fn.name} */')
+    c.append('};')
+    c.append('')
+    c.append('GuestFn recomp_find(uint32_t addr)')
+    c.append('{')
+    c.append('    size_t lo = 0, hi = sizeof by_addr / sizeof by_addr[0];')
+    c.append('    while (lo < hi) {       /* binary search */')
+    c.append('        size_t mid = lo + (hi - lo) / 2;')
+    c.append('        if (by_addr[mid].addr == addr) return by_addr[mid].fn;')
+    c.append('        if (by_addr[mid].addr < addr) lo = mid + 1; else hi = mid;')
+    c.append('    }')
     c.append('    return NULL;')
     c.append('}')
     c.append('')
