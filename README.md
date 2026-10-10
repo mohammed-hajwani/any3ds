@@ -115,7 +115,7 @@ dumps/  out/       gitignored: your own dumps and all generated code
 | M5 | VFP floating point (VFPv2, hard-float ABI, exact ARM NaN rules) | ✅ |
 | — | Real-code readiness: -O2 + libgcc, indirect calls, tail calls, function discovery | ✅ |
 | M6a | Recompile a real libctru homebrew app in full (303 functions, RunFast VFP, atomics, svc hook) | ✅ |
-| M6b | OS layer: svc + IPC services, then run the app (started: runs to `svcConnectToPort("srv:")`) | in progress |
+| M6b | OS layer: svc + IPC services, then run the app (started: runs through srv + APT IPC to `svcCreateThread`) | in progress |
 | later | Cycle counting, CRO relocation, indirect-jump table + interpreter fallback, Metal renderer, iOS shell app | |
 
 ## Contributing

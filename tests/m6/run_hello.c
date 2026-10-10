@@ -41,6 +41,46 @@ static const char *svc_name(uint32_t n)
 
 static int svc_count;
 
+/* ---- IPC, very first cut: what does the app ask the services for? ----
+   Handles from ConnectToPort / srv:GetServiceHandle remember which service
+   they belong to. A request is a command buffer at TLS + 0x80: word 0 is
+   the header (command id << 16 | normal words << 6 | translate words). */
+#define MAX_HANDLES 64
+static char handle_names[MAX_HANDLES][9];
+
+static uint32_t new_named_handle(const char *name, uint32_t *next)
+{
+    uint32_t h = (*next)++;
+    snprintf(handle_names[h % MAX_HANDLES], sizeof handle_names[0], "%s", name);
+    return h;
+}
+
+static void ipc_request(Ctx *ctx, uint32_t handle, uint32_t *next_handle)
+{
+    uint32_t *cmd = (uint32_t *)(ctx->mem + ctx->tls + 0x80);
+    uint32_t header = cmd[0], id = header >> 16;
+    const char *svc = handle_names[handle % MAX_HANDLES];
+    printf("    IPC %-8s cmd 0x%04" PRIx32 " (header %08" PRIx32 ")\n", svc[0] ? svc : "?", id, header);
+
+    if (strcmp(svc, "srv:") == 0 && id == 0x5) {        /* GetServiceHandle(name[8], len, flags) */
+        char name[9] = { 0 };
+        memcpy(name, &cmd[1], 8);
+        uint32_t h = new_named_handle(name, next_handle);
+        printf("        -> service \"%s\" = handle 0x%" PRIx32 "\n", name, h);
+        cmd[0] = 0x00050042; cmd[1] = 0; cmd[2] = 0; cmd[3] = h;
+        return;
+    }
+    if (strcmp(svc, "srv:") == 0 && id == 0x2) {        /* EnableNotification -> semaphore */
+        cmd[0] = 0x00020042; cmd[1] = 0; cmd[2] = 0; cmd[3] = new_named_handle("sem", next_handle);
+        return;
+    }
+    /* Anything else: a bare "success" reply, so startup can carry on and
+       show what it asks for next. (Outputs beyond the result are zero.) */
+    memset(&cmd[2], 0, 14 * 4);
+    cmd[0] = id << 16 | 0x40;
+    cmd[1] = 0;
+}
+
 static void os_svc(Ctx *ctx, uint32_t n)
 {
     printf("svc 0x%02" PRIx32 " %-30s r0-r3 = %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "  lr = %08" PRIx32 "\n",
@@ -95,6 +135,18 @@ static void os_svc(Ctx *ctx, uint32_t n)
         ctx->r[0] = 0;
         return;
     }
+    case 0x2D: {    /* ConnectToPort(&handle, name) */
+        char name[9] = { 0 };
+        memcpy(name, ctx->mem + ctx->r[1], 8);
+        ctx->r[1] = new_named_handle(name, &next_handle);
+        printf("    -> port \"%s\" = handle 0x%" PRIx32 "\n", name, ctx->r[1]);
+        ctx->r[0] = 0;
+        return;
+    }
+    case 0x32:      /* SendSyncRequest(handle): an IPC request */
+        ipc_request(ctx, ctx->r[0], &next_handle);
+        ctx->r[0] = 0;
+        return;
     case 0x28: {    /* GetSystemTick: the 268 MHz ARM11 tick counter */
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
