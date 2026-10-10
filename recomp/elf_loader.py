@@ -76,8 +76,13 @@ def _mapping_symbols(symtab):
 
 
 def _code_ranges(fn, marks):
-    """Split a function's byte range into ARM code ranges using mapping symbols."""
-    state = 'a'                             # no mapping symbol at all: assume ARM
+    """Split a function's byte range into code ranges using mapping symbols.
+
+    A Thumb function (symbol bit 0 set) must contain only $t code and an
+    ARM function only $a code, plus $d data such as literal pools.
+    """
+    want = 't' if fn.thumb else 'a'
+    state = want                            # no mapping symbol at all: trust the symbol
     for addr, kind in marks:
         if addr <= fn.addr:
             state = kind
@@ -85,9 +90,11 @@ def _code_ranges(fn, marks):
 
     ranges, start = [], fn.addr
     for addr, kind in boundaries + [(fn.end, None)]:
-        if state == 't' and addr > start:
-            raise LoadError(f'{fn.addr:08x} {fn.name}: Thumb code is not supported yet (M4)')
-        if state == 'a' and addr > start:
+        if addr > start and state in 'at':
+            if state != want:
+                mode = {'a': 'ARM', 't': 'Thumb'}
+                raise LoadError(f'{start:08x} {fn.name}: {mode[state]} code inside a '
+                                f'{mode[want]} function; mixing modes in one function is not supported')
             ranges.append((start, addr))
         start, state = addr, kind
     return ranges
@@ -133,8 +140,7 @@ def load_program(path):
             offset = addr if relocatable else addr - section['sh_addr']
             code = section.data()[offset:offset + sym['st_size']]
             fn = Function(sym.name, addr, code, bool(value & 1))
-            if not fn.thumb:
-                fn.code_ranges = _code_ranges(fn, marks.get(shndx, []))
+            fn.code_ranges = _code_ranges(fn, marks.get(shndx, []))
             functions.append(fn)
 
         data_ranges = []

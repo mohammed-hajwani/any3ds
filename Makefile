@@ -29,17 +29,18 @@ M0 := out/m0
 M1 := out/m1
 M2 := out/m2
 M3 := out/m3
+M4 := out/m4
 
 # devkitARM lives outside PATH unless the shell profile adds it.
 ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 test-m2 test-m3 venv clean
+.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1 test-m2 test-m3
+test: test-m0 test-m1 test-m2 test-m3 test-m4
 
 venv: $(VENV)/.installed
 
@@ -48,7 +49,7 @@ $(VENV)/.installed: requirements.txt
 	$(PYTHON) -m pip install -q -r requirements.txt
 	touch $@
 
-$(M0) $(M1) $(M2) $(M3):
+$(M0) $(M1) $(M2) $(M3) $(M4):
 	mkdir -p $@
 
 # ---------------------------------------------------------------- M0
@@ -76,7 +77,7 @@ test-m0: $(M0)/test.dis $(M0)/shifts.dis $(M0)/test_harness $(M0)/shifts_harness
 	@timeout 60 ./$(M0)/test_harness
 	@echo '=== M0: barrel shifter ==='
 	@timeout 60 ./$(M0)/shifts_harness
-	@$(REJECT) $(M0)/unsupported.o 'unsupported instruction `mul'
+	@$(REJECT) $(M0)/unsupported.o 'unsupported instruction `umull'
 
 # ---------------------------------------------------------------- M1
 
@@ -162,7 +163,79 @@ test-m3: $(M3_DIFFS) out/m2/addr.elf $(RECOMP_DEP)
 	    timeout 120 ./$$d || exit 1; \
 	done
 	@echo '=== M3: self-test (planted bug must be pinpointed) ==='
-	@sh tests/m3/selftest.sh $(PYTHON) $(HOST_CC) $(HOST_FLAGS)
+	@sh tests/m3/selftest.sh $(PYTHON) $(HOST_CC) ldrsh out/m2/addr.elf 'ldrsh r1' r1 $(HOST_FLAGS)
+
+# ---------------------------------------------------------------- M4
+#
+# Thumb (ARMv6K = Thumb-1) and ARM/Thumb interworking. The M1/M2 programs
+# are rebuilt as Thumb and reuse their native-diff harnesses; every M4
+# program also runs in lockstep against Unicorn.
+
+THUMB_FLAGS := -mthumb -mcpu=mpcore -O1 -mthumb-interwork
+
+$(M4)/funcs_thumb.elf: tests/m1/funcs.c | $(M4)
+	$(ARM_CC) $(THUMB_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
+$(M4)/mem_thumb.elf: tests/m2/mem.c | $(M4)
+	$(ARM_CC) $(THUMB_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
+$(M4)/vshift_arm.elf: tests/m4/vshift.c | $(M4)
+	$(ARM_CC) $(ARM_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
+$(M4)/vshift_thumb.elf: tests/m4/vshift.c | $(M4)
+	$(ARM_CC) $(THUMB_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
+# One ARM file + one Thumb file, linked together. --use-blx makes the
+# linker switch modes with blx (ARMv5T+) instead of inserting "veneers"
+# (tiny stubs that mix both modes: `bx pc` + an ARM `b`), which the
+# recompiler doesn't recognise yet.
+$(M4)/interwork.elf: tests/m4/interwork_arm.c tests/m4/interwork_thumb.c tests/m4/interwork.h | $(M4)
+	$(ARM_CC) $(ARM_FLAGS) -mthumb-interwork -c tests/m4/interwork_arm.c -o $(M4)/interwork_arm.o
+	$(ARM_CC) $(THUMB_FLAGS) -c tests/m4/interwork_thumb.c -o $(M4)/interwork_thumb.o
+	$(ARM_CC) $(ARM_FLAGS) $(ARM_LDFLAGS) -Wl,--use-blx $(M4)/interwork_arm.o $(M4)/interwork_thumb.o -o $@
+
+$(M4)/%.elf: tests/m4/%.S | $(M4)
+	$(ARM_CC) $(ARM_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
+$(M4)/%.dis: $(M4)/%.elf
+	$(OBJDUMP) -d $< > $@
+
+$(M4)/gen_%.c: $(M4)/%.elf $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@
+
+$(M4)/funcs_thumb_harness: tests/m1/harness.c tests/m1/funcs.c $(M4)/gen_funcs_thumb.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M4)/gen_funcs_thumb.c $(RUNTIME_SRC) -o $@
+
+$(M4)/mem_thumb_harness: tests/m2/harness.c tests/m2/mem.c $(M4)/gen_mem_thumb.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M4)/gen_mem_thumb.c $(RUNTIME_SRC) -o $@
+
+$(M4)/vshift_%_harness: tests/m4/vshift_harness.c tests/m4/vshift.c $(M4)/gen_vshift_%.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M4)/gen_vshift_$*.c $(RUNTIME_SRC) -o $@
+
+$(M4)/interwork_harness: tests/m4/interwork_harness.c tests/m4/interwork_arm.c tests/m4/interwork_thumb.c $(M4)/gen_interwork.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M4)/gen_interwork.c $(RUNTIME_SRC) -o $@
+
+M4_HARNESSES := $(M4)/funcs_thumb_harness $(M4)/mem_thumb_harness $(M4)/vshift_arm_harness \
+                $(M4)/vshift_thumb_harness $(M4)/interwork_harness
+M4_PROGS := m4/funcs_thumb m4/mem_thumb m4/vshift_arm m4/vshift_thumb m4/interwork m4/thumb m4/arm_regshift
+$(foreach p,$(M4_PROGS),$(eval $(call m3_prog,$(p))))
+M4_DIFFS := $(foreach p,$(M4_PROGS),$(M3)/$(notdir $(p))_diff)
+M4_BAD := $(M4)/bad_thumb2.elf $(M4)/bad_blx_reg.elf $(M4)/bad_mode.elf
+
+test-m4: $(M4_HARNESSES) $(M4_DIFFS) $(M4_BAD) $(M4)/mem_thumb.dis $(M4)/thumb.dis $(M4)/interwork.dis $(RECOMP_DEP)
+	@for h in $(M4_HARNESSES); do \
+	    echo "=== M4: $$(basename $$h _harness) vs native ==="; \
+	    timeout 60 ./$$h || exit 1; \
+	done
+	@for d in $(M4_DIFFS); do \
+	    echo "=== M4: $$(basename $$d _diff) vs unicorn ==="; \
+	    timeout 120 ./$$d || exit 1; \
+	done
+	@$(REJECT) $(M4)/bad_thumb2.elf 'Thumb-2 instruction'
+	@$(REJECT) $(M4)/bad_blx_reg.elf 'indirect call'
+	@$(REJECT) $(M4)/bad_mode.elf 'ARM code inside a Thumb function'
+	@echo '=== M4: self-test (planted Thumb pc bug must be pinpointed) ==='
+	@sh tests/m3/selftest.sh $(PYTHON) $(HOST_CC) thumb-pc $(M4)/thumb.elf 'ldr r1, \[pc' r1 $(HOST_FLAGS)
 
 clean:
 	rm -rf out

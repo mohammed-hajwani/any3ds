@@ -13,22 +13,23 @@ Anything else is a hard error -- never skip an instruction.
 
 from dataclasses import dataclass, field
 
+from capstone import CS_MODE_THUMB
 from capstone.arm import (
     ARM_CC_AL, ARM_CC_EQ, ARM_CC_GE, ARM_CC_GT, ARM_CC_HI, ARM_CC_HS,
     ARM_CC_LE, ARM_CC_LO, ARM_CC_LS, ARM_CC_LT, ARM_CC_MI, ARM_CC_NE,
     ARM_CC_PL, ARM_CC_VC, ARM_CC_VS,
-    ARM_INS_ADC, ARM_INS_ADD, ARM_INS_AND, ARM_INS_ASR, ARM_INS_B,
-    ARM_INS_BIC, ARM_INS_BL, ARM_INS_BX, ARM_INS_CMN, ARM_INS_CMP,
+    ARM_INS_ADC, ARM_INS_ADD, ARM_INS_ADR, ARM_INS_AND, ARM_INS_ASR, ARM_INS_B,
+    ARM_INS_BIC, ARM_INS_BL, ARM_INS_BLX, ARM_INS_BX, ARM_INS_CMN, ARM_INS_CMP,
     ARM_INS_EOR, ARM_INS_HINT, ARM_INS_LDM, ARM_INS_LDMDA, ARM_INS_LDMDB, ARM_INS_LDMIB,
     ARM_INS_LDR, ARM_INS_LDRB, ARM_INS_LDRH, ARM_INS_LDRSB, ARM_INS_LDRSH,
-    ARM_INS_LSL, ARM_INS_LSR, ARM_INS_MOV, ARM_INS_MVN, ARM_INS_NOP,
+    ARM_INS_LSL, ARM_INS_LSR, ARM_INS_MLA, ARM_INS_MOV, ARM_INS_MOVS, ARM_INS_MUL, ARM_INS_MVN, ARM_INS_NOP,
     ARM_INS_ORR, ARM_INS_POP, ARM_INS_PUSH, ARM_INS_ROR, ARM_INS_RRX,
     ARM_INS_RSB, ARM_INS_SBC, ARM_INS_STM, ARM_INS_STMDA, ARM_INS_STMDB,
     ARM_INS_STMIB, ARM_INS_STR, ARM_INS_STRB, ARM_INS_STRH, ARM_INS_SUB,
     ARM_INS_TEQ, ARM_INS_TST, ARM_INS_UXTB,
     ARM_OP_IMM, ARM_OP_MEM, ARM_OP_REG,
-    ARM_SFT_ASR, ARM_SFT_ASR_REG, ARM_SFT_INVALID, ARM_SFT_LSL,
-    ARM_SFT_LSR, ARM_SFT_ROR, ARM_SFT_RRX,
+    ARM_SFT_ASR, ARM_SFT_ASR_REG, ARM_SFT_INVALID, ARM_SFT_LSL, ARM_SFT_LSL_REG,
+    ARM_SFT_LSR, ARM_SFT_LSR_REG, ARM_SFT_ROR, ARM_SFT_ROR_REG, ARM_SFT_RRX,
 )
 
 from .emit_c import c_name
@@ -95,22 +96,44 @@ def _imm(value):
     return f'{value}u' if value < 10 else f'0x{value:x}u'
 
 
+def _is_thumb(insn):
+    return bool(insn._cs.mode & CS_MODE_THUMB)
+
+
+def _pc(insn):
+    """What reading r15 gives: this instruction + 8 in ARM mode, + 4 in
+    Thumb (a leftover of the original 3-stage pipeline)."""
+    return insn.address + (4 if _is_thumb(insn) else 8)
+
+
 def _read_reg(insn, reg):
     n = _reg_num(insn, reg)
     if n == PC:
-        # In ARM mode, reading r15 gives the address of the current
-        # instruction + 8 (a leftover of the original 3-stage pipeline).
-        return _imm(insn.address + 8)
+        return _imm(_pc(insn))
     return f'ctx->r[{n}]'
 
 
+def _encoding(insn):
+    return int.from_bytes(insn.bytes, 'little')
+
+
 def _sets_flags(insn):
-    """The S bit (bit 20) of a data-processing encoding.
+    """Whether a data-processing instruction writes the flags, from its encoding.
 
     Don't trust Capstone's update_flags: it is True for adc/sbc/rsc even
     without S (they *read* the carry, they don't write the flags).
     """
-    return bool((int.from_bytes(insn.bytes, 'little') >> 20) & 1)
+    if not _is_thumb(insn):
+        return bool((_encoding(insn) >> 20) & 1)        # the S bit
+    # Thumb-1 has no S bit; it depends on the 16-bit format:
+    h = _encoding(insn)
+    if h >> 14 == 0b00:         # shift by immediate, add/sub, mov/cmp/add/sub #imm8
+        return True
+    if h >> 10 == 0b010000:     # register ALU ops (ands, eors, lsls rd, rs, ..., muls)
+        return True
+    if h >> 10 == 0b010001:     # high-register add/cmp/mov: only cmp sets flags
+        return (h >> 8) & 3 == 0b01
+    return False                # add rd, pc/sp, #imm; add/sub sp, #imm
 
 
 def _dest_reg(insn, op):
@@ -154,6 +177,35 @@ def _shift_imm(insn, x, kind, n):
     raise UnsupportedInstruction(insn, f'shift type {kind} by {n}')
 
 
+_REG_SHIFTS = {ARM_SFT_LSL_REG: 'lsl', ARM_SFT_LSR_REG: 'lsr', ARM_SFT_ASR_REG: 'asr', ARM_SFT_ROR_REG: 'ror'}
+_IMM_TO_REG_SHIFT = {ARM_SFT_LSL: ARM_SFT_LSL_REG, ARM_SFT_LSR: ARM_SFT_LSR_REG,
+                     ARM_SFT_ASR: ARM_SFT_ASR_REG, ARM_SFT_ROR: ARM_SFT_ROR_REG}
+
+
+def _shift_reg(insn, x_reg, kind, s_reg):
+    """Shift by an amount held in a register.
+
+    The amount isn't known until runtime, and ARM's rules for it (only the
+    bottom byte counts; 0, 32 and >32 each behave differently) live in the
+    runtime's shift_* helpers. Returns (expression, carry marker): the
+    marker says "the helper can set C itself" (see _pick_carry).
+    """
+    if PC in (_reg_num(insn, x_reg), _reg_num(insn, s_reg)):
+        # With a register-specified shift, pc reads as +12 in ARM mode.
+        raise UnsupportedInstruction(insn, 'pc with a register-specified shift')
+    x, s = _read_reg(insn, x_reg), _read_reg(insn, s_reg)
+    name = _REG_SHIFTS[kind]
+    return f'shift_{name}(ctx, {x}, {s}, 0)', ('helper', f'shift_{name}(ctx, {x}, {s}, 1)')
+
+
+def _pick_carry(m, carry, logical_s):
+    """Resolve a register-shift carry marker. Only logical ops with S take
+    the shifter's carry; then the helper variant that writes C is used."""
+    if isinstance(carry, tuple):
+        return (carry[1], None) if logical_s else (m, None)
+    return m, carry
+
+
 def _operand2(insn, op):
     """ARM's flexible second operand: returns (C expression, carry-out or None)."""
     if op.type == ARM_OP_IMM:
@@ -166,6 +218,9 @@ def _operand2(insn, op):
         carry = _imm(value >> 31) if rotated else None
         return _imm(value), carry
     if op.type == ARM_OP_REG:
+        if op.shift.type in _REG_SHIFTS:
+            # Capstone puts the amount register's id in shift.value.
+            return _shift_reg(insn, op.reg, op.shift.type, op.shift.value)
         return _shift_imm(insn, _read_reg(insn, op.reg), op.shift.type, op.shift.value)
     raise UnsupportedInstruction(insn, f'operand type {op.type}')
 
@@ -201,6 +256,7 @@ _BINARY = {
 
 _UNARY = {
     ARM_INS_MOV: '{m}',
+    ARM_INS_MOVS: '{m}',        # Thumb `movs rd, rm` (really lsls rd, rm, #0)
     ARM_INS_MVN: '~{m}',
 }
 
@@ -256,10 +312,14 @@ def _binary(insn, fc):
     if rn_op.type != ARM_OP_REG:
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
 
-    n = _read_reg(insn, rn_op.reg)
-    m, carry = _operand2(insn, op2)
-    expr = template.format(n=n, m=m) if template else None
+    if _is_thumb(insn) and _reg_num(insn, rn_op.reg) == PC and _encoding(insn) >> 11 == 0b10100:
+        # Thumb `add rd, pc, #imm` (adr) uses pc aligned down to 4.
+        n = _imm(_pc(insn) & ~3)
+    else:
+        n = _read_reg(insn, rn_op.reg)
     setflags = _sets_flags(insn) or not writes_rd
+    m, carry = _pick_carry(*_operand2(insn, op2), kind == 'logic' and setflags)
+    expr = template.format(n=n, m=m) if template else None
     return _emit_dp(rd, expr, kind, setflags, carry, n, m)
 
 
@@ -267,30 +327,76 @@ def _unary(insn, fc):
     ops = insn.operands
     if len(ops) != 2:
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    if _is_thumb(insn) and insn.id == ARM_INS_MOV and ops[0].type == ARM_OP_REG \
+            and _reg_num(insn, ops[0].reg) == PC:
+        return _computed_jump(insn, fc, ops[1])
     rd = _dest_reg(insn, ops[0])
-    m, carry = _operand2(insn, ops[1])
-    return _emit_dp(rd, _UNARY[insn.id].format(m=m), 'logic', _sets_flags(insn), carry)
+    setflags = _sets_flags(insn)
+    m, carry = _pick_carry(*_operand2(insn, ops[1]), setflags)
+    return _emit_dp(rd, _UNARY[insn.id].format(m=m), 'logic', setflags, carry)
 
 
 def _shift_mnemonic(insn, fc):
-    """`lsrs r3, r3, #1` etc.: Capstone's name for mov with a shifted operand."""
-    # Capstone attaches an immediate shift to the source operand, e.g.
-    # `lsrs r3, r3, #1` has operands [r3, r3 (lsr 1)]. A third operand
-    # means the amount comes from a register.
+    """`lsrs r3, r3, #1` etc.: Capstone's names for mov with a shifted operand.
+
+    The operand layouts Capstone uses:
+      ARM    lsl rd, rm, #n  -> [rd, rm (shift lsl n)]
+      ARM    lsl rd, rm, rs  -> [rd, rm, rs]
+      ARM    rrx rd, rm      -> [rd, rm]
+      Thumb  lsls rd, rm, #n -> [rd, rm, #n]
+      Thumb  lsls rd, rs     -> [rd, rs]          (rd = rd << rs)
+    """
     ops = insn.operands
-    if len(ops) == 3:
-        raise UnsupportedInstruction(insn, 'shift amount in a register')
-    if len(ops) != 2 or ops[1].type != ARM_OP_REG:
+    kind = _SHIFT_MNEMONICS[insn.id]
+    if any(op.type not in (ARM_OP_REG, ARM_OP_IMM) for op in ops) or ops[0].type != ARM_OP_REG:
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
     rd = _dest_reg(insn, ops[0])
-    x = _read_reg(insn, ops[1].reg)
-    if insn.id == ARM_INS_RRX:          # carries no shift info of its own
-        m, carry = _shift_imm(insn, x, ARM_SFT_RRX, 1)
+    thumb = _is_thumb(insn)
+
+    if insn.id == ARM_INS_RRX and len(ops) == 2:
+        m, carry = _shift_imm(insn, _read_reg(insn, ops[1].reg), ARM_SFT_RRX, 1)
+    elif len(ops) == 3 and ops[2].type == ARM_OP_IMM:
+        m, carry = _shift_imm(insn, _read_reg(insn, ops[1].reg), kind, ops[2].imm)
+    elif len(ops) == 3 and ops[2].type == ARM_OP_REG:
+        m, carry = _shift_reg(insn, ops[1].reg, _IMM_TO_REG_SHIFT[kind], ops[2].reg)
+    elif len(ops) == 2 and not thumb and ops[1].shift.type == kind:
+        m, carry = _shift_imm(insn, _read_reg(insn, ops[1].reg), kind, ops[1].shift.value)
+    elif len(ops) == 2 and thumb and ops[1].type == ARM_OP_REG:
+        m, carry = _shift_reg(insn, ops[0].reg, _IMM_TO_REG_SHIFT[kind], ops[1].reg)
     else:
-        if ops[1].shift.type != _SHIFT_MNEMONICS[insn.id]:
-            raise UnsupportedInstruction(insn, 'unexpected operand shape')
-        m, carry = _shift_imm(insn, x, ops[1].shift.type, ops[1].shift.value)
-    return _emit_dp(rd, m, 'logic', _sets_flags(insn), carry)
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    setflags = _sets_flags(insn)
+    m, carry = _pick_carry(m, carry, setflags)
+    return _emit_dp(rd, m, 'logic', setflags, carry)
+
+
+def _adr(insn, fc):
+    """adr rd, #off: an address relative to pc, known at recompile time.
+    Thumb uses pc (this instruction + 4) aligned down to 4; ARM uses + 8."""
+    ops = insn.operands
+    if len(ops) != 2 or ops[1].type != ARM_OP_IMM:
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    rd = _dest_reg(insn, ops[0])
+    base = _pc(insn) & ~3 if _is_thumb(insn) else _pc(insn)
+    return [f'ctx->r[{rd}] = {_imm(base + ops[1].imm)};']
+
+
+def _mul(insn, fc):
+    """mul/muls/mla: the low 32 bits of the product (plus rn for mla). With S, N and Z come from
+    the result; C and V are unchanged on ARMv6."""
+    ops = insn.operands
+    nops = 4 if insn.id == ARM_INS_MLA else (2, 3)
+    if any(op.type != ARM_OP_REG for op in ops) or len(ops) not in (nops if isinstance(nops, tuple) else (nops,)):
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    rd = _dest_reg(insn, ops[0])
+    sources = [ops[0], ops[1]] if len(ops) == 2 else list(ops[1:])
+    if any(_reg_num(insn, op.reg) == PC for op in sources):
+        raise UnsupportedInstruction(insn, 'pc as a multiply operand is unpredictable')
+    a, b = (_read_reg(insn, op.reg) for op in sources[:2])
+    expr = f'{a} * {b}'
+    if insn.id == ARM_INS_MLA:                  # multiply-accumulate: rd = rm * rs + rn
+        expr += f' + {_read_reg(insn, sources[2].reg)}'
+    return _emit_dp(rd, expr, 'logic', _sets_flags(insn), None)
 
 
 def _uxtb(insn, fc):
@@ -323,22 +429,55 @@ def _b(insn, fc):
 
 
 def _bl(insn, fc):
+    """bl, and blx #imm (a call that also switches ARM <-> Thumb).
+
+    The callee's mode is known statically, so either way it's a plain C
+    call. The return address goes in lr exactly as on hardware; in Thumb
+    it has bit 0 set, so the callee's `bx lr` knows to return to Thumb.
+    """
+    op = insn.operands[0]
+    if insn.id == ARM_INS_BLX and op.type == ARM_OP_REG:
+        raise UnsupportedInstruction(insn, 'indirect call through a register (needs the '
+                                           'address lookup table from a later milestone)')
     target = _branch_target(insn)
     callee = fc.entries.get(target)
     if callee is None:
         raise UnsupportedInstruction(
-            insn, f'bl target {target:08x} is not the start of a known function')
-    # The callee sees the real return address in lr, exactly as on hardware.
-    return [f'ctx->r[14] = {_imm(insn.address + 4)};', f'{c_name(target)}(ctx);  /* {callee.name} */']
+            insn, f'{insn.mnemonic} target {target:08x} is not the start of a known function')
+    expected_mode = (not _is_thumb(insn)) if insn.id == ARM_INS_BLX else _is_thumb(insn)
+    if callee.thumb != expected_mode:
+        mode = 'Thumb' if callee.thumb else 'ARM'
+        raise UnsupportedInstruction(insn, f'calls {callee.name}, a {mode} function, without switching mode')
+    ret = (insn.address + insn.size) | int(_is_thumb(insn))
+    return [f'ctx->r[14] = {_imm(ret)};', f'{c_name(target)}(ctx);  /* {callee.name} */']
 
 
 def _bx(insn, fc):
     (op,) = insn.operands
     if op.type == ARM_OP_REG and _reg_num(insn, op.reg) == LR:
+        # Returns to ARM or Thumb according to bit 0 of lr ("interworking");
+        # RETURN_TO checks it matches what our caller passed in.
         fc.uses_ret = True
         fc.terminates = True
         return ['RETURN_TO(ctx->r[14]);']
-    raise UnsupportedInstruction(insn, 'bx to a register other than lr (M4)')
+    raise UnsupportedInstruction(insn, 'bx to a register other than lr (indirect jumps come later)')
+
+
+def _computed_jump(insn, fc, op):
+    """Thumb `mov pc, rX`: gcc's Thumb switch, jumping to an address loaded
+    from a table. Becomes a C switch over every instruction address in the
+    function; anything else is a jump we never recompiled."""
+    if op.type != ARM_OP_REG or _reg_num(insn, op.reg) == PC:
+        raise UnsupportedInstruction(insn, 'writes pc (computed branches come later)')
+    value = _read_reg(insn, op.reg)
+    # Thumb `mov pc` doesn't switch mode on ARMv6; bit 0 is ignored.
+    lines = [f'switch ({value} & ~1u) {{']
+    for addr in sorted(fc.code_addrs):
+        fc.labels.add(addr)
+        lines.append(f'case {_imm(addr)}: goto L_{addr:08x};')
+    lines += [f'default: recomp_bad_jump(ctx, {_imm(insn.address)}, {value});', '}']
+    fc.terminates = True
+    return lines
 
 
 def _jump_table(insn, fc):
@@ -349,7 +488,7 @@ def _jump_table(insn, fc):
     every code address from there to the end of the function.
     """
     _, rn_op, op2 = insn.operands
-    if (_sets_flags(insn) or rn_op.type != ARM_OP_REG or _reg_num(insn, rn_op.reg) != PC
+    if (_is_thumb(insn) or _sets_flags(insn) or rn_op.type != ARM_OP_REG or _reg_num(insn, rn_op.reg) != PC
             or op2.type != ARM_OP_REG or op2.shift.type != ARM_SFT_LSL or op2.shift.value != 2):
         raise UnsupportedInstruction(insn, 'writes pc (computed branches come later)')
     index = _read_reg(insn, op2.reg)
@@ -422,7 +561,8 @@ def _address(insn):
     # Bit 24 (P) of the encoding says pre/offset (1) or post-index (0), for
     # both the word/byte and halfword/signed-byte encodings. Don't trust
     # Capstone's post_index flag: it's always False for ldrh/strh/ldrsb/ldrsh.
-    post = not (int.from_bytes(insn.bytes, 'little') >> 24) & 1
+    # Thumb-1 loads/stores have no pre/post-index forms: always plain offset.
+    post = False if _is_thumb(insn) else not (_encoding(insn) >> 24) & 1
     if post != (len(ops) == 3):
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
 
@@ -432,15 +572,17 @@ def _address(insn):
     elif mem.mem.index:
         x, _ = _shift_imm(insn, _read_reg(insn, mem.mem.index), mem.shift.type, mem.shift.value)
         addr.offset = ('-' if mem.subtracted else '+', x)
-        addr.mode = 'pre' if insn.writeback else 'offset'
+        addr.mode = 'pre' if insn.writeback and not _is_thumb(insn) else 'offset'
     else:
         disp = mem.mem.disp
         addr.offset = None if disp == 0 else ('-' if disp < 0 else '+', _imm(abs(disp)))
-        addr.mode = 'pre' if insn.writeback else 'offset'
+        addr.mode = 'pre' if insn.writeback and not _is_thumb(insn) else 'offset'
         if rn == PC:
-            # pc-relative: pc reads as this instruction + 8, so the address
-            # is a constant we can compute now.
-            addr.const = (insn.address + 8 + disp) & 0xFFFFFFFF
+            # pc-relative: the address is a constant we can compute now.
+            # In Thumb, literal loads use pc (this instruction + 4) aligned
+            # down to a multiple of 4.
+            base = _pc(insn) & ~3 if _is_thumb(insn) else _pc(insn)
+            addr.const = (base + disp) & 0xFFFFFFFF
 
     if rn == PC and addr.mode != 'offset':
         raise UnsupportedInstruction(insn, 'pc as base with writeback is unpredictable')
@@ -543,6 +685,10 @@ def _block(insn, fc):
         rn, wback, ops = _reg_num(insn, ops[0].reg), insn.writeback, ops[1:]
     regs = sorted(_reg_num(insn, op.reg) for op in ops)
     n = len(regs)
+    if _is_thumb(insn) and insn.id not in (ARM_INS_PUSH, ARM_INS_POP):
+        # Thumb-1 ldmia/stmia have no W bit: they always write back, except
+        # an ldmia whose base is in the list (then the loaded value wins).
+        wback = not (load and rn in regs)
 
     if rn == PC:
         raise UnsupportedInstruction(insn, 'pc as the base register')
@@ -591,7 +737,11 @@ _HANDLERS = {
     ARM_INS_UXTB: _uxtb,
     ARM_INS_B: _b,
     ARM_INS_BL: _bl,
+    ARM_INS_BLX: _bl,
     ARM_INS_BX: _bx,
+    ARM_INS_MUL: _mul,
+    ARM_INS_MLA: _mul,
+    ARM_INS_ADR: _adr,
     **{op: _load for op in _LOADS},
     **{op: _store for op in _STORES},
     **{op: _block for op in _BLOCK},
@@ -626,6 +776,13 @@ def translate(insn, fc):
     return lines
 
 
+def _is_padding(insn):
+    """The no-ops assemblers use for alignment: Thumb `mov r8, r8`, ARM
+    `nop` and `mov r0, r0`."""
+    w = _encoding(insn)
+    return (w == 0x46c0 and insn.size == 2) or (insn.size == 4 and w in (0xe320f000, 0xe1a00000))
+
+
 def _data_entries(fn, start, end):
     """Comment-only body entries for data inside a function (literal pools)."""
     out = []
@@ -647,7 +804,12 @@ def translate_function(fn, insns, entries, program=None):
     body = []
     for i, insn in enumerate(insns):
         text = f'{insn.address:08x}: {insn.mnemonic} {insn.op_str}'.rstrip()
+        after_terminator = fc.terminates and i > 0
         body.append((insn.address, text, translate(insn, fc)))
+        if after_terminator and _is_padding(insn):
+            # Alignment padding after a return/branch (before a literal
+            # pool) is never executed; it doesn't make the code fall through.
+            fc.terminates = True
 
         next_addr = insns[i + 1].address if i + 1 < len(insns) else fn.end
         if next_addr != insn.address + insn.size or i + 1 == len(insns):

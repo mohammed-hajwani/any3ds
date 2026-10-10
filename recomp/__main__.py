@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .disasm import DisasmError, disassemble_arm
+from .disasm import DisasmError, disassemble
 from .elf_loader import LoadError, load_program
 from .emit_c import c_name, emit
 from .translate import UnsupportedInstruction, translate_function
@@ -28,14 +28,12 @@ def main(argv=None):
         entries = {fn.addr: fn for fn in program.functions}
         translated = []
         for fn in program.functions:
-            if fn.thumb:
-                raise LoadError(f'{fn.addr:08x} {fn.name}: Thumb code is not supported yet (M4)')
             if not fn.code_ranges:
-                raise LoadError(f'{fn.addr:08x} {fn.name}: contains no ARM code')
+                raise LoadError(f'{fn.addr:08x} {fn.name}: contains no code')
             # Only decode code; literal pools inside the function are data.
             insns = []
             for start, end in fn.code_ranges:
-                insns += disassemble_arm(fn.code[start - fn.addr:end - fn.addr], start)
+                insns += disassemble(fn.code[start - fn.addr:end - fn.addr], start, fn.thumb)
             translated.append(translate_function(fn, insns, entries, program))
 
         header = args.output.with_suffix('.h')

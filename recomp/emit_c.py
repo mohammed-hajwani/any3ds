@@ -47,9 +47,11 @@ def emit(functions, header_name, program=None, trace=False):
         c.append('}')
         c.append('')
 
+    # Addresses carry the Thumb bit (bit 0), like ELF symbols and like a
+    # real `bx` target.
     c.append('const RecompSym recomp_syms[] = {')
     for tf in functions:
-        c.append(f'    {{ "{tf.fn.name}", 0x{tf.fn.addr:08x}u, {c_name(tf.fn.addr)} }},')
+        c.append(f'    {{ "{tf.fn.name}", 0x{tf.fn.addr | int(tf.fn.thumb):08x}u, {c_name(tf.fn.addr)} }},')
     c.append('};')
     c.append('const size_t recomp_nsyms = sizeof recomp_syms / sizeof recomp_syms[0];')
     c.append('')

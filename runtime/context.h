@@ -121,6 +121,52 @@ static inline uint32_t sbc_flags(Ctx *ctx, uint32_t a, uint32_t b) { return addc
    shifter (set separately by the generated code); V is untouched. */
 static inline void set_nz(Ctx *ctx, uint32_t r) { ctx->n = r >> 31; ctx->z = r == 0; }
 
+/* ---- Register-specified shifts ----
+   `lsls r0, r1` / `add r0, r1, r2, lsl r3`: the amount comes from a
+   register at runtime. Only its bottom byte counts (so 256 shifts by 0),
+   and unlike C, shifting by 32 or more is well defined. An amount of 0
+   leaves both the value and C alone. With set_c, C gets the last bit
+   shifted out (only logical instructions with S want that). */
+
+static inline uint32_t shift_lsl(Ctx *ctx, uint32_t x, uint32_t amount, int set_c)
+{
+    uint32_t s = amount & 0xFF;
+    if (s == 0) return x;
+    if (set_c) ctx->c = s <= 32 ? (uint32_t)(((uint64_t)x << s) >> 32) & 1 : 0;
+    return s < 32 ? x << s : 0;
+}
+
+static inline uint32_t shift_lsr(Ctx *ctx, uint32_t x, uint32_t amount, int set_c)
+{
+    uint32_t s = amount & 0xFF;
+    if (s == 0) return x;
+    if (set_c) ctx->c = s <= 32 ? (x >> (s - 1)) & 1 : 0;
+    return s < 32 ? x >> s : 0;
+}
+
+static inline uint32_t shift_asr(Ctx *ctx, uint32_t x, uint32_t amount, int set_c)
+{
+    uint32_t s = amount & 0xFF;
+    if (s == 0) return x;
+    uint32_t sign = x >> 31;
+    if (s >= 32) {                          /* every bit becomes the sign bit */
+        if (set_c) ctx->c = sign;
+        return sign ? 0xFFFFFFFFu : 0;
+    }
+    if (set_c) ctx->c = (x >> (s - 1)) & 1;
+    return (uint32_t)((int32_t)x >> s);
+}
+
+static inline uint32_t shift_ror(Ctx *ctx, uint32_t x, uint32_t amount, int set_c)
+{
+    uint32_t s = amount & 0xFF;
+    if (s == 0) return x;
+    uint32_t r = s & 31;                    /* rotating by 32 is a full turn... */
+    uint32_t v = r ? (x >> r) | (x << (32 - r)) : x;
+    if (set_c) ctx->c = v >> 31;            /* ...but still sets C from bit 31 */
+    return v;
+}
+
 /* ---- Calls and returns ---- */
 
 /* Every recompiled guest function has this signature. */
@@ -130,9 +176,9 @@ typedef void (*GuestFn)(Ctx *ctx);
    with breaks the "host call stack mirrors guest call stack" assumption. */
 void recomp_bad_return(Ctx *ctx, uint32_t got, uint32_t want) __attribute__((noreturn));
 
-/* A jump-table index outside the table: the guest would jump somewhere
-   we never recompiled. */
-void recomp_bad_jump(Ctx *ctx, uint32_t from, uint32_t index) __attribute__((noreturn));
+/* A computed jump (switch table) to an index/address outside the targets
+   we recompiled for it. */
+void recomp_bad_jump(Ctx *ctx, uint32_t from, uint32_t value) __attribute__((noreturn));
 
 /* Used inside generated functions, which keep their entry lr in `ret`. */
 #define RETURN_TO(addr) do {                                    \
