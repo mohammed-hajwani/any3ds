@@ -65,6 +65,10 @@ def emit(functions, header_name, program=None, trace=False):
     c.append('}')
     c.append('')
 
+    entry = program.entry if program and program.entry is not None else 0
+    c.append(f'const uint32_t recomp_entry = 0x{entry:08x}u;  /* ELF entry point (0: none) */')
+    c.append('')
+
     # Entry address -> function, sorted, for indirect calls (recomp_call).
     c.append('static const struct { uint32_t addr; GuestFn fn; } by_addr[] = {')
     for tf in sorted(functions, key=lambda tf: tf.fn.addr | int(tf.fn.thumb)):

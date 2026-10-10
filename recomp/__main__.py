@@ -29,8 +29,8 @@ def _orphan_function(program, target, insn):
     region or the next function, whichever comes first."""
     region = program.code_region(target)
     if region is None:
-        raise LoadError(f'{insn.address:08x}: {insn.mnemonic} target {target:08x} '
-                        'is not inside any known function or code region')
+        where = f'{insn.address:08x}: {insn.mnemonic} target' if insn else 'entry point'
+        raise LoadError(f'{where} {target:08x} is not inside any known function or code region')
     _, end, thumb = region
     end = min([end] + [f.addr for f in program.functions if f.addr > target])
     code = program.read(target, end - target)
@@ -50,6 +50,13 @@ def discover_functions(program):
     """
     functions = list(program.functions)
     entries = {fn.addr: fn for fn in functions}
+    if program.entry is not None and (program.entry & ~1) not in entries:
+        # The program's entry point (e.g. libctru's crt0 `_start`) is often a
+        # plain label, not a function symbol.
+        fn = _orphan_function(program, program.entry & ~1, None)
+        fn.name = '_entry'
+        entries[fn.addr] = fn
+        functions.append(fn)
     decoded = {}
     queue = list(functions)
     while queue:

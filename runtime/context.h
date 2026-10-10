@@ -238,6 +238,9 @@ extern const size_t    recomp_nsyms;
 /* Find a recompiled function by guest symbol name; NULL if absent. */
 GuestFn recomp_lookup(const char *name);
 
+/* The program's entry point (ELF e_entry), with the Thumb bit; 0 if none. */
+extern const uint32_t recomp_entry;
+
 /* Find a recompiled function by its guest entry address, with bit 0 set
    for Thumb functions (as in a function pointer); NULL if there is none. */
 GuestFn recomp_find(uint32_t addr);

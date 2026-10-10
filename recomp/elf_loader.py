@@ -41,6 +41,7 @@ class Program:
     data_symbols: dict      # name -> guest address (linked executables only)
     data_ranges: list       # sorted [(start, end)] marked $d by the assembler
     code_regions: list = field(default_factory=list)  # sorted [(start, end, thumb)] marked $a/$t
+    entry: int = None       # ELF entry point (linked executables)
 
     def code_region(self, addr):
         """The assembler-marked code region containing addr, or None."""
@@ -127,6 +128,7 @@ def load_program(path):
             raise LoadError(f'{path}: no symbol table')
 
         relocatable = elf['e_type'] == 'ET_REL'
+        entry = elf['e_entry']
         if relocatable:
             # In an unlinked .o, branch/call targets are placeholders that the
             # linker patches using these relocations. We don't apply them.
@@ -210,4 +212,5 @@ def load_program(path):
             merged[-1].aliases.append(fn.name)
             continue
         merged.append(fn)
-    return Program(merged, segments, data_symbols, data_ranges, code_regions)
+    return Program(merged, segments, data_symbols, data_ranges, code_regions,
+                   None if relocatable else entry)

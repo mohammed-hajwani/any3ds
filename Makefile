@@ -355,5 +355,13 @@ test-m6: $(M6)/gen_hello.o $(M3)/hello_diff $(M6)/hello.dis
 	@echo '=== M6: newlib string/memory routines vs unicorn ==='
 	@timeout 300 ./$(M3)/hello_diff 100 $(M6_DIFF_ONLY)
 
+# M6b, first step: actually start the recompiled hello world and log its
+# system calls until the first one that needs real OS services. Not part of
+# `make test`: today it stops on purpose at svcConnectToPort("srv:").
+.PHONY: run-m6
+run-m6: tests/m6/run_hello.c $(M6)/gen_hello.c $(RUNTIME_DEP)
+	$(HOST_CC) $(HOST_FLAGS) $< $(M6)/gen_hello.c $(RUNTIME_SRC) -o $(M6)/run_hello
+	-./$(M6)/run_hello
+
 clean:
 	rm -rf out

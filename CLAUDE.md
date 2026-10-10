@@ -92,7 +92,10 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
   - **noreturn calls:** a call with nothing after it gets `recomp_no_return`.
   - **Loader fixes:** functions are clipped at the next symbol, and unlabelled code in `$a`/`$t` regions becomes functions.
   - **VFP RunFast mode:** FPSCR FZ+DN, which libctru sets on every thread, via `vmsr fpscr`. Half of all Unicorn runs use it.
-- **Next: M6b, the OS layer.** Implement the svcs and the IPC services hello.c needs (srv, apt, gsp, hid, …), then run it.
+- **M6b started: the recompiled hello world runs.** The ELF entry point (libctru crt0's `_start`, a plain label) now seeds function discovery and is exported as `recomp_entry`. `make run-m6` (`tests/m6/run_hello.c`) starts it with a stack and TLS block, answers the first kernel calls, and logs every svc:
+  - **Calls answered so far:** CreateAddressArbiter, GetResourceLimit and its limit/current values, CloseHandle, ControlMemory (a 30 MiB heap at 0x08000000 and a 32 MiB linear heap at 0x14000000), and handles for mutexes and events.
+  - **Where it stops today:** `svcConnectToPort("srv:")`, the service manager and the start of IPC. **Next:** an IPC layer (srv, then apt/gsp/hid/fs as hello.c needs them), probably reusing Azahar's HLE services.
+- Run everything with `make test`
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function
