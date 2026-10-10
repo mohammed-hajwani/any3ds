@@ -15,7 +15,7 @@
 typedef struct { uint32_t r, n, z, c, v; } State;
 
 typedef enum {
-    ADDS, ADCS, SUBS, SBCS, RSBS, CMP, CMN, ADDS_LSL1,
+    ADDS, ADCS, SUBS, SBCS, RSBS, CMP, CMN, ADDS_LSL1, ADC, SBC,
     TST, TEQ, ANDS_ROT, ANDS_SMALL, EORS_LSR1, MVNS_ASR1,
     MOVS_LSL, MOVS_LSR, MOVS_ASR, MOVS_ROR, MOVS_RRX,
 } Op;
@@ -31,6 +31,8 @@ static const Case cases[] = {
     { "cmp_",       CMP,        0 },
     { "cmn_",       CMN,        0 },
     { "adds_lsl1",  ADDS_LSL1,  0 },
+    { "adc_",       ADC,        0 },
+    { "sbc_",       SBC,        0 },
     { "tst_",       TST,        0 },
     { "teq_",       TEQ,        0 },
     { "ands_rot",   ANDS_ROT,   0 },
@@ -143,6 +145,8 @@ static State reference(const Case *tc, State in, uint32_t a, uint32_t b)
     case CMP:        s = ref_sub(in, a, b, 1); s.r = a; return s;
     case CMN:        s = ref_add(in, a, b, 0); s.r = a; return s;
     case ADDS_LSL1:  return ref_add(in, a, b << 1, 0);
+    case ADC:        s.r = ref_add(in, a, b, in.c).r; return s;     /* flags untouched */
+    case SBC:        s.r = ref_sub(in, a, b, in.c).r; return s;
     case TST:        s = logical(in, a & b, in.c); s.r = a; return s;
     case TEQ:        s = logical(in, a ^ b, in.c); s.r = a; return s;
     case ANDS_ROT:   return logical(in, a & 0xFF000000u, 1);

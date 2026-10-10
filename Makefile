@@ -28,17 +28,18 @@ REJECT      := sh tests/expect_reject.sh $(PYTHON)
 M0 := out/m0
 M1 := out/m1
 M2 := out/m2
+M3 := out/m3
 
 # devkitARM lives outside PATH unless the shell profile adds it.
 ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 test-m2 venv clean
+.PHONY: test test-m0 test-m1 test-m2 test-m3 venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1 test-m2
+test: test-m0 test-m1 test-m2 test-m3
 
 venv: $(VENV)/.installed
 
@@ -47,7 +48,7 @@ $(VENV)/.installed: requirements.txt
 	$(PYTHON) -m pip install -q -r requirements.txt
 	touch $@
 
-$(M0) $(M1) $(M2):
+$(M0) $(M1) $(M2) $(M3):
 	mkdir -p $@
 
 # ---------------------------------------------------------------- M0
@@ -136,6 +137,32 @@ test-m2: $(M2)/mem.dis $(M2)/addr.dis $(M2)/mem_harness $(M2)/addr_harness $(M2_
 	@$(REJECT) $(M2)/bad_ldr_pc.elf 'load into pc'
 	@$(REJECT) $(M2)/bad_ldm_wb.elf 'base register in the list is unpredictable'
 	@$(REJECT) $(M2)/bad_pool.elf 'runs into data'
+
+# ---------------------------------------------------------------- M3
+#
+# Every linked test program again, generated with --trace and run in
+# lockstep against Unicorn (a reference ARM CPU) by tests/m3/diff.c.
+
+M3_PROGS := m1/funcs m1/flags m2/mem m2/addr
+
+define m3_prog
+$(M3)/gen_$(notdir $(1)).c: out/$(1).elf $(RECOMP_DEP) | $(M3)
+	$$(PYTHON) -m recomp --trace $$< -o $$@
+
+$(M3)/$(notdir $(1))_diff: tests/m3/diff.c $(M3)/gen_$(notdir $(1)).c $$(RUNTIME_DEP)
+	$$(HOST_CC) $$(HOST_FLAGS) -DRECOMP_TRACING=1 $$< $(M3)/gen_$(notdir $(1)).c $$(RUNTIME_SRC) -lunicorn -o $$@
+endef
+$(foreach p,$(M3_PROGS),$(eval $(call m3_prog,$(p))))
+
+M3_DIFFS := $(foreach p,$(M3_PROGS),$(M3)/$(notdir $(p))_diff)
+
+test-m3: $(M3_DIFFS) out/m2/addr.elf $(RECOMP_DEP)
+	@for d in $(M3_DIFFS); do \
+	    echo "=== M3: $$(basename $$d _diff) vs unicorn ==="; \
+	    timeout 120 ./$$d || exit 1; \
+	done
+	@echo '=== M3: self-test (planted bug must be pinpointed) ==='
+	@sh tests/m3/selftest.sh $(PYTHON) $(HOST_CC) $(HOST_FLAGS)
 
 clean:
 	rm -rf out

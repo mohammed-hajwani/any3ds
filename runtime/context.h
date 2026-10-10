@@ -12,15 +12,71 @@ typedef struct {
     uint8_t *mem;          // base of the 4 GiB guest address space
 } Ctx;
 
-static inline uint32_t read32(Ctx *c, uint32_t a)  { uint32_t v; memcpy(&v, c->mem + a, 4); return v; }
-static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem + a, &v, 4); }
+/* ---- Tracing (M3 differential testing) ----
+   Code generated with `python -m recomp --trace` defines RECOMP_TRACING and
+   calls RECOMP_TRACE before every instruction; every memory write is
+   reported too. A test driver implements both hooks. Normal builds don't
+   pay anything. */
+#ifdef RECOMP_TRACING
+void recomp_trace(Ctx *ctx, uint32_t addr, const char *text);
+void recomp_trace_write(uint32_t addr, uint32_t size, uint32_t value);
+#define RECOMP_TRACE(addr, text) recomp_trace(ctx, (addr), (text))
+#define TRACE_WRITE(a, size, v)  recomp_trace_write((a), (size), (v))
+#else
+#define TRACE_WRITE(a, size, v)  ((void)0)
+#endif
 
-/* Narrow accesses. Loads zero-extend; ldrsb/ldrsh sign-extend at the call
-   site. memcpy also makes unaligned accesses work, as on the 3DS. */
-static inline uint32_t read16(Ctx *c, uint32_t a)  { uint16_t v; memcpy(&v, c->mem + a, 2); return v; }
+/* Guest memory accesses. memcpy makes unaligned accesses work, as on the
+   3DS. Loads zero-extend; ldrsb/ldrsh sign-extend at the call site.
+
+   Guest addresses are 32-bit, so a multi-byte access starting in the last
+   bytes of the address space wraps around to address 0. Without the slow
+   path, a 4-byte read at 0xFFFFFFFF would touch host memory past the end
+   of the 4 GiB mapping. (Found by the M3 differential test.) */
 static inline uint32_t read8(Ctx *c, uint32_t a)   { return c->mem[a]; }
-static inline void     write16(Ctx *c, uint32_t a, uint32_t v) { uint16_t h = (uint16_t)v; memcpy(c->mem + a, &h, 2); }
-static inline void     write8(Ctx *c, uint32_t a, uint32_t v)  { c->mem[a] = (uint8_t)v; }
+
+static inline uint32_t read_wrapped(Ctx *c, uint32_t a, int n)
+{
+    uint32_t v = 0;
+    for (int i = 0; i < n; i++)
+        v |= (uint32_t)c->mem[(uint32_t)(a + (uint32_t)i)] << (8 * i);
+    return v;
+}
+
+static inline void write_wrapped(Ctx *c, uint32_t a, uint32_t v, int n)
+{
+    for (int i = 0; i < n; i++)
+        c->mem[(uint32_t)(a + (uint32_t)i)] = (uint8_t)(v >> (8 * i));
+}
+
+static inline uint32_t read32(Ctx *c, uint32_t a)
+{
+    if (a > 0xFFFFFFFCu) return read_wrapped(c, a, 4);
+    uint32_t v; memcpy(&v, c->mem + a, 4); return v;
+}
+
+static inline uint32_t read16(Ctx *c, uint32_t a)
+{
+    if (a == 0xFFFFFFFFu) return read_wrapped(c, a, 2);
+    uint16_t v; memcpy(&v, c->mem + a, 2); return v;
+}
+
+static inline void write32(Ctx *c, uint32_t a, uint32_t v)
+{
+    TRACE_WRITE(a, 4, v);
+    if (a > 0xFFFFFFFCu) { write_wrapped(c, a, v, 4); return; }
+    memcpy(c->mem + a, &v, 4);
+}
+
+static inline void write16(Ctx *c, uint32_t a, uint32_t v)
+{
+    uint16_t h = (uint16_t)v;
+    TRACE_WRITE(a, 2, h);
+    if (a == 0xFFFFFFFFu) { write_wrapped(c, a, h, 2); return; }
+    memcpy(c->mem + a, &h, 2);
+}
+
+static inline void write8(Ctx *c, uint32_t a, uint32_t v)  { TRACE_WRITE(a, 1, v & 0xFFu); c->mem[a] = (uint8_t)v; }
 
 /* ---- Condition codes (ARM ARM, "Condition codes" table) ---- */
 
@@ -102,6 +158,10 @@ GuestFn recomp_lookup(const char *name);
 /* Copy the program's segments (code, .rodata, .data; zeroed .bss) into
    guest memory at their link addresses. Emitted with the generated code. */
 void recomp_load_image(uint8_t *mem);
+
+/* Where those segments live; the list ends with { 0, 0 }. */
+typedef struct { uint32_t addr, size; } RecompSegment;
+extern const RecompSegment recomp_segments[];
 
 /* Guest address of a data symbol (global variable); 0 if absent. */
 uint32_t recomp_data_lookup(const char *name);

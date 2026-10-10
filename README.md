@@ -4,7 +4,7 @@ A **static recompiler** for Nintendo 3DS code. It translates 32-bit ARM (ARMv6K)
 
 Why ahead of time? iOS doesn't allow JIT compilation, so 3DS emulators on iPhone fall back to slow interpreters. If the whole program is translated before it runs, nothing has to be generated at runtime.
 
-> **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls) and M2 (memory: loads/stores, literal pools, switch tables) are done. Development currently targets x86-64 Linux; iOS comes much later.
+> **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls), M2 (memory: loads/stores, literal pools, switch tables) and M3 (instruction-by-instruction differential testing against Unicorn) are done. Development currently targets x86-64 Linux; iOS comes much later.
 
 ## How it works
 
@@ -55,7 +55,7 @@ Everything builds inside **WSL2 Ubuntu 24.04** on Windows, or on native Linux.
    ```
 2. **Host tools**, inside Ubuntu:
    ```bash
-   sudo apt update && sudo apt install -y clang make python3-venv git
+   sudo apt update && sudo apt install -y clang make python3-venv git libunicorn-dev
    ```
 3. **devkitPro** (devkitARM and libctru): follow the Linux instructions at <https://devkitpro.org/wiki/Getting_Started>, then run:
    ```bash
@@ -110,8 +110,8 @@ dumps/  out/       gitignored: your own dumps and all generated code
 | M0 | Recompile one function | ✅ |
 | M1 | Branches, loops, flags, conditional execution, `bl`, push/pop | ✅ |
 | M2 | Loads/stores (`ldr/str/ldrb/ldrh`, `ldm/stm`), literal pools, switch tables | ✅ |
-| M3 | Differential testing against a reference CPU (Unicorn / Azahar) | next |
-| M4 | Thumb mode and ARM/Thumb interworking | |
+| M3 | Differential testing against a reference CPU (Unicorn), instruction by instruction | ✅ |
+| M4 | Thumb mode and ARM/Thumb interworking | next |
 | M5 | VFP floating point | |
 | M6 | Full libctru homebrew app, `SVC` → stub OS → Azahar HLE | |
 | later | Cycle counting, CRO relocation, indirect-jump table + interpreter fallback, Metal renderer, iOS shell app | |

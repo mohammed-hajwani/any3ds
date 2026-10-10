@@ -16,6 +16,8 @@ def main(argv=None):
     parser.add_argument('input', help='ARM ELF file (.o or linked .elf)')
     parser.add_argument('-o', '--output', required=True, type=Path,
                         help='C file to write; a matching .h is written next to it')
+    parser.add_argument('--trace', action='store_true',
+                        help='call RECOMP_TRACE before every instruction (for differential testing)')
     args = parser.parse_args(argv)
 
     try:
@@ -37,7 +39,7 @@ def main(argv=None):
             translated.append(translate_function(fn, insns, entries, program))
 
         header = args.output.with_suffix('.h')
-        c_src, h_src = emit(translated, header.name, program)
+        c_src, h_src = emit(translated, header.name, program, trace=args.trace)
     except (LoadError, DisasmError, UnsupportedInstruction) as e:
         # Nothing has been written yet, so a failed run leaves no stale output.
         print(f'recomp: error: {e}', file=sys.stderr)

@@ -55,6 +55,16 @@ FUNC cmn_
     bx lr
 END cmn_
 
+FUNC adc_                       @ no S: uses C but must leave NZCV alone
+    adc r0, r0, r1
+    bx lr
+END adc_
+
+FUNC sbc_
+    sbc r0, r0, r1
+    bx lr
+END sbc_
+
 FUNC adds_lsl1                  @ arithmetic ignores the shifter's carry-out
     adds r0, r0, r1, lsl #1
     bx lr

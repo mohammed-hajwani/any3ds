@@ -104,6 +104,15 @@ def _read_reg(insn, reg):
     return f'ctx->r[{n}]'
 
 
+def _sets_flags(insn):
+    """The S bit (bit 20) of a data-processing encoding.
+
+    Don't trust Capstone's update_flags: it is True for adc/sbc/rsc even
+    without S (they *read* the carry, they don't write the flags).
+    """
+    return bool((int.from_bytes(insn.bytes, 'little') >> 20) & 1)
+
+
 def _dest_reg(insn, op):
     if op.type != ARM_OP_REG:
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
@@ -250,7 +259,7 @@ def _binary(insn, fc):
     n = _read_reg(insn, rn_op.reg)
     m, carry = _operand2(insn, op2)
     expr = template.format(n=n, m=m) if template else None
-    setflags = insn.update_flags or not writes_rd
+    setflags = _sets_flags(insn) or not writes_rd
     return _emit_dp(rd, expr, kind, setflags, carry, n, m)
 
 
@@ -260,7 +269,7 @@ def _unary(insn, fc):
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
     rd = _dest_reg(insn, ops[0])
     m, carry = _operand2(insn, ops[1])
-    return _emit_dp(rd, _UNARY[insn.id].format(m=m), 'logic', insn.update_flags, carry)
+    return _emit_dp(rd, _UNARY[insn.id].format(m=m), 'logic', _sets_flags(insn), carry)
 
 
 def _shift_mnemonic(insn, fc):
@@ -281,7 +290,7 @@ def _shift_mnemonic(insn, fc):
         if ops[1].shift.type != _SHIFT_MNEMONICS[insn.id]:
             raise UnsupportedInstruction(insn, 'unexpected operand shape')
         m, carry = _shift_imm(insn, x, ops[1].shift.type, ops[1].shift.value)
-    return _emit_dp(rd, m, 'logic', insn.update_flags, carry)
+    return _emit_dp(rd, m, 'logic', _sets_flags(insn), carry)
 
 
 def _uxtb(insn, fc):
@@ -340,7 +349,7 @@ def _jump_table(insn, fc):
     every code address from there to the end of the function.
     """
     _, rn_op, op2 = insn.operands
-    if (insn.update_flags or rn_op.type != ARM_OP_REG or _reg_num(insn, rn_op.reg) != PC
+    if (_sets_flags(insn) or rn_op.type != ARM_OP_REG or _reg_num(insn, rn_op.reg) != PC
             or op2.type != ARM_OP_REG or op2.shift.type != ARM_SFT_LSL or op2.shift.value != 2):
         raise UnsupportedInstruction(insn, 'writes pc (computed branches come later)')
     index = _read_reg(insn, op2.reg)
