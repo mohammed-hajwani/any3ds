@@ -43,6 +43,7 @@ recomp/            Python recompiler
   __main__.py      CLI: python -m recomp <input.elf> -o out/gen.c
 runtime/
   context.h        CPU context struct + memory helpers
+hle/               the OS layer: kernel (threads, sync, IPC) + services (srv, APT, GSP, HID, FS)
 tests/
   m0/              milestone 0 test program + harness
 dumps/             (gitignored) user's own dumps
@@ -92,18 +93,31 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
   - **noreturn calls:** a call with nothing after it gets `recomp_no_return`.
   - **Loader fixes:** functions are clipped at the next symbol, and unlabelled code in `$a`/`$t` regions becomes functions.
   - **VFP RunFast mode:** FPSCR FZ+DN, which libctru sets on every thread, via `vmsr fpscr`. Half of all Unicorn runs use it.
-- **M6b started: the recompiled hello world runs.** The ELF entry point (libctru crt0's `_start`, a plain label) now seeds function discovery and is exported as `recomp_entry`. `make run-m6` (`tests/m6/run_hello.c`) starts it with a stack and TLS block, answers the first kernel calls, and logs every svc:
-  - **Calls answered so far:** CreateAddressArbiter, GetResourceLimit and its limit/current values, CloseHandle, ControlMemory (a 30 MiB heap at 0x08000000 and a 32 MiB linear heap at 0x14000000), and handles for mutexes and events.
-  - **First cut of IPC:** ConnectToPort and SendSyncRequest work through the command buffer at TLS + 0x80. `srv:` answers RegisterClient, EnableNotification and GetServiceHandle; other services get a bare success reply, and every request is logged.
-  - **Where it stops today:** with threads recorded but not run and waits returning at once, the sequence is:
-    1. srv:RegisterClient, then srv:GetServiceHandle("APT:S") before every APT call.
-    2. APT GetLockHandle (0x01) → Initialize (0x02) → CreateThread (the APT event thread at 0x001070a4) → Enable (0x03) → NotifyToWait (0x43).
-    3. GlanceParameter (0x0D) **in a loop**, waiting for the wakeup parameter that a real APT sends.
-
-    **Next:**
-    1. Threads (host threads or a cooperative scheduler).
-    2. Real APT replies: hand out the wakeup parameter.
-    3. Then GSP (shared memory, framebuffers), HID and FS. Azahar's HLE services are the likely source.
+- **M6b done: the recompiled hello world runs and draws "Hello from recompiled code!".** `make test-m6` runs it end to end: START is pressed at frame 10, it exits via svcExitProcess, and the top screen's last frame must match `tests/m6/hello_top.sha256`. `make run-m6` saves that frame to `out/m6/top.bmp`. The OS layer is `hle/`, our own HLE written from the 3dbrew docs (no Azahar code, so no GPL yet):
+  - **Kernel (`hle/kernel.c`, `svc.c`):**
+    - Threads: each guest thread gets its own host pthread (its own host stack for the recompiled C calls), but only one runs at a time. Switches happen only inside svcs: on a block, a yield, or when a higher-priority thread is woken. Runs are fully deterministic.
+    - Virtual clock: each svc costs 1 µs, and when every thread is blocked the clock jumps to the next deadline (sleep, timeout, or the 60 Hz vblank).
+    - Objects: events (oneshot/sticky/pulse), mutexes, semaphores, threads, address arbiters (libctru's LightLock/LightEvent), shared memory, and service sessions.
+    - Calls: WaitSynchronization1/N (any/all, timeouts), and QueryMemory over a map of what is in use.
+    - Failure reporting: no thread can run and nothing is scheduled → a deadlock report naming each thread and what it waits on (exit 4). A virtual-time limit catches hangs.
+  - **Services (`hle/srv.c`, `apt.c`, `gsp.c`, `hid.c`, `fs.c`):**
+    - srv: hands out sessions.
+    - APT: Enable queues the WAKEUP parameter that HOME menu would send.
+    - GSP: shared-memory interrupt queue, VBlank0/1 each frame, framebuffer latching.
+    - HID: shared-memory pad state each frame, from a `--hold FRAME:KEYS` script.
+    - FS: Initialize, and "no SD card".
+    - An unknown IPC command is a hard stop (`HLE_LENIENT=1` replies success instead, to explore). `HLE_TRACE=1` logs every svc.
+  - **Tests:**
+    - `tests/m6/threads.c` (kernel only, empty `__appInit`) checks locks, events, semaphores, sleeps, timeouts, priorities and wait-any/all against a golden `threads.expected`.
+    - `tests/m6/deadlock.c` checks the deadlock report.
+  - **Translator fixes found by running real code:**
+    - `uxtab`/`uxtah`/`sxtab`/`sxtah` (tested in `tests/real/extend.S`).
+    - Tail calls now honour a redirected lr: crt0 does `ldr lr, =exit; bx r3` to run main and then exit. After a tail call, `recomp_continue` carries on at the lr the callee returned to, instead of returning straight to our caller.
+  - **Next:**
+    1. Real file access (FS + RomFS/SD in `dumps/`).
+    2. GPU command lists (GX queue, then PICA200), which is where reusing Azahar starts to pay.
+    3. Audio (DSP).
+    4. Bigger homebrew as test cases.
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function

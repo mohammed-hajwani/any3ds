@@ -314,6 +314,23 @@ static inline void recomp_call(Ctx *ctx, uint32_t addr)
     fn(ctx);
 }
 
+/* After a tail call: the callee returned to `to`, the lr it was jumped to
+   with. Usually that is our own caller's return address `ret`, and we just
+   return. If the code had pointed lr elsewhere (crt0: `ldr lr, =exit;
+   bx r3` runs main, then exit), run the function at `to`, which returns to
+   the lr current at that point, and so on until control is back at `ret`.
+   An address that isn't a function start is a bad return. */
+static inline void recomp_continue(Ctx *ctx, uint32_t to, uint32_t ret)
+{
+    while (to != ret) {
+        GuestFn fn = recomp_find(to);
+        if (!fn)
+            recomp_bad_return(ctx, to, ret);
+        to = ctx->r[14];
+        fn(ctx);
+    }
+}
+
 /* Copy the program's segments (code, .rodata, .data; zeroed .bss) into
    guest memory at their link addresses. Emitted with the generated code. */
 void recomp_load_image(uint8_t *mem);

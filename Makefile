@@ -293,6 +293,9 @@ $(REAL)/real_arm.elf: tests/real/real.c | $(REAL)
 $(REAL)/real_thumb.elf: tests/real/real.c | $(REAL)
 	$(ARM_CC) $(THUMB_FLAGS) -O2 $(REAL_LDFLAGS) $< -lgcc -o $@
 
+$(REAL)/%.elf: tests/real/%.S | $(REAL)
+	$(ARM_CC) $(ARM_FLAGS) $(ARM_LDFLAGS) $< -o $@
+
 $(REAL)/%.dis: $(REAL)/%.elf
 	$(OBJDUMP) -d $< > $@
 
@@ -302,7 +305,7 @@ $(REAL)/gen_%.c: $(REAL)/%.elf $(RECOMP_DEP)
 $(REAL)/%_harness: tests/real/harness.c tests/real/real.c $(REAL)/gen_%.c $(RUNTIME_DEP)
 	$(HOST_CC) $(HOST_FLAGS) $< $(REAL)/gen_$*.c $(RUNTIME_SRC) -o $@
 
-REAL_PROGS := real/real_arm real/real_thumb
+REAL_PROGS := real/real_arm real/real_thumb real/extend
 $(foreach p,$(REAL_PROGS),$(eval $(call m3_prog,$(p))))
 REAL_DIFFS := $(foreach p,$(REAL_PROGS),$(M3)/$(notdir $(p))_diff)
 REAL_SKIP := isort,shape_total
@@ -320,10 +323,11 @@ test-real: $(REAL)/real_arm_harness $(REAL)/real_thumb_harness $(REAL_DIFFS) $(R
 # ---------------------------------------------------------------- M6
 #
 # The canonical libctru "hello world", built against the real libctru +
-# newlib exactly as 3DS homebrew is, then recompiled in full. Running it
-# needs the OS layer (svc + IPC services), which comes next; for now the
-# check is that every function recompiles, the C compiles, and newlib's
-# hand-optimised string/memory routines match Unicorn.
+# newlib exactly as 3DS homebrew is, then recompiled in full and run on
+# the HLE OS layer (hle/). Checks: every function recompiles and the C
+# compiles; newlib's hand-optimised string/memory routines match Unicorn;
+# the HLE kernel's threads and synchronisation (threads.c, against a golden
+# output) and its deadlock detection (deadlock.c).
 
 DEVKITPRO ?= /opt/devkitpro
 CTRU := $(DEVKITPRO)/libctru
@@ -335,33 +339,55 @@ M6_DIFF_ONLY := +strcmp,memcpy,memset,memmove,strlen,strchr
 $(M6):
 	mkdir -p $@
 
-$(M6)/hello.elf: tests/m6/hello.c | $(M6)
+# The OS layer (hle/): kernel + services, linked with each recompiled program.
+HLE_SRC := $(wildcard hle/*.c)
+HLE_DEP := $(HLE_SRC) $(wildcard hle/*.h)
+
+$(M6)/%.elf: tests/m6/%.c | $(M6)
 	$(ARM_CC) $(CTRU_FLAGS) -specs=3dsx.specs -L$(CTRU)/lib $< -lctru -lm -o $@
 
-$(M6)/hello.dis: $(M6)/hello.elf
+$(M6)/%.dis: $(M6)/%.elf
 	$(OBJDUMP) -d $< > $@
 
-$(M6)/gen_hello.c: $(M6)/hello.elf $(RECOMP_DEP)
-	$(PYTHON) -m recomp $< -o $@ > $(M6)/recomp.log
+$(M6)/gen_%.c: $(M6)/%.elf $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@ > $(M6)/recomp_$*.log
 
-$(M6)/gen_hello.o: $(M6)/gen_hello.c $(RUNTIME_DEP)
-	$(HOST_CC) $(HOST_FLAGS) -c $< -o $@
+$(M6)/run_%: tests/m6/runner.c $(M6)/gen_%.c $(RUNTIME_DEP) $(HLE_DEP)
+	$(HOST_CC) $(HOST_FLAGS) -Ihle -pthread $< $(M6)/gen_$*.c $(RUNTIME_SRC) $(HLE_SRC) -o $@
+
+.PRECIOUS: $(M6)/%.elf $(M6)/gen_%.c
 
 $(eval $(call m3_prog,m6/hello))
 
-test-m6: $(M6)/gen_hello.o $(M3)/hello_diff $(M6)/hello.dis
-	@echo "=== M6: libctru hello world: $$(grep -c '^  f_' $(M6)/recomp.log) functions recompiled," \
+test-m6: $(M6)/run_hello $(M6)/run_threads $(M6)/run_deadlock $(M3)/hello_diff $(M6)/hello.dis
+	@echo "=== M6: libctru hello world: $$(grep -c '^  f_' $(M6)/recomp_hello.log) functions recompiled," \
 	      "$$(wc -l < $(M6)/gen_hello.c) lines of C, compiled cleanly ==="
 	@echo '=== M6: newlib string/memory routines vs unicorn ==='
 	@timeout 300 ./$(M3)/hello_diff 100 $(M6_DIFF_ONLY)
+	@echo '=== M6: HLE kernel: threads and synchronisation (tests/m6/threads.c) ==='
+	@timeout 120 ./$(M6)/run_threads > $(M6)/threads.out 2> $(M6)/threads.log || { cat $(M6)/threads.log; exit 1; }
+	@diff -u tests/m6/threads.expected $(M6)/threads.out && echo "    output matches threads.expected"
+	@grep -q 'exited via svcExitProcess' $(M6)/threads.log \
+	  || { cat $(M6)/threads.log; echo "expected main -> exit -> svcExitProcess"; exit 1; }
+	@echo '=== M6: HLE kernel: deadlock detection (tests/m6/deadlock.c) ==='
+	@timeout 60 ./$(M6)/run_deadlock 2> $(M6)/deadlock.log; status=$$?; \
+	  if [ $$status -eq 4 ] && grep -q 'deadlock' $(M6)/deadlock.log; then echo "    deadlock reported"; \
+	  else cat $(M6)/deadlock.log; echo "expected a deadlock report (exit 4), got exit $$status"; exit 1; fi
+	@echo '=== M6: hello world end to end on the HLE (START pressed at frame 10) ==='
+	@timeout 120 ./$(M6)/run_hello --hold 10:8 --dump $(M6)/top.bmp > $(M6)/hello.out 2> $(M6)/hello.log \
+	  || { cat $(M6)/hello.log; echo "hello world did not exit cleanly"; exit 1; }
+	@for want in 'APT parameter: command 1 from applet 101' 'HID: frame 10, keys 00000008' \
+	             'exited via svcExitProcess (frame 11,'; do \
+	  grep -qF "$$want" $(M6)/hello.log || { cat $(M6)/hello.log; echo "missing from the log: $$want"; exit 1; }; \
+	done; echo "    WAKEUP delivered, START seen, exited via svcExitProcess"
+	@echo "$$(cat tests/m6/hello_top.sha256)  $(M6)/top.bmp" | sha256sum -c --quiet \
+	  && echo "    top screen matches the recorded frame (tests/m6/hello_top.sha256)"
 
-# M6b, first step: actually start the recompiled hello world and log its
-# system calls until the first one that needs real OS services. Not part of
-# `make test`: today it stops on purpose at svcConnectToPort("srv:").
+# Run the recompiled hello world: START is pressed at frame 10, and the
+# top screen is saved to out/m6/top.bmp. HLE_TRACE=1 logs every svc.
 .PHONY: run-m6
-run-m6: tests/m6/run_hello.c $(M6)/gen_hello.c $(RUNTIME_DEP)
-	$(HOST_CC) $(HOST_FLAGS) $< $(M6)/gen_hello.c $(RUNTIME_SRC) -o $(M6)/run_hello
-	-./$(M6)/run_hello
+run-m6: $(M6)/run_hello
+	./$(M6)/run_hello --hold 10:8 --dump $(M6)/top.bmp
 
 clean:
 	rm -rf out

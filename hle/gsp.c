@@ -1,0 +1,132 @@
+/* GSP (gsp::Gpu): the graphics service. For now only the parts that put a
+ * software-drawn framebuffer on screen; GPU command lists are not here.
+ *
+ * GSP shared memory (0x1000 bytes, mapped by the app):
+ *   + thread * 0x40           interrupt queue: u8 first, u8 count, u8 error,
+ *                             then (at +0xC) a ring of 0x34 event numbers
+ *   + 0x200 + thread * 0x80   framebuffer info, top screen (+0x40: bottom):
+ *                             u8 index, u8 update flag, then two entries of
+ *                             { active, left addr, right addr, stride,
+ *                               format, select, unused }
+ *   + 0x800 + thread * 0x200  GX command queue (not handled yet)
+ *
+ * Every vblank we latch a newly presented framebuffer (if the app set the
+ * update flag), push VBlank0/VBlank1 into the interrupt queue and signal
+ * the app's event. libctru's GSP thread then wakes gspWaitForVBlank. */
+#include <inttypes.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "service.h"
+
+#define EVENT_VBLANK0 2
+#define EVENT_VBLANK1 3
+#define QUEUE_LEN     0x34
+
+typedef struct { uint32_t addr, stride, format; } Screen;
+
+static KObj *shm, *interrupt_event;
+static uint32_t thread_index;
+static int lcd_black;
+static Screen screens[2];
+static uint8_t top_rgb[400 * 240 * 3];
+static int have_top_frame;
+
+int fb_to_rgb(const uint8_t *fb, uint32_t format, uint32_t stride, int width, uint8_t *rgb);
+int bmp_write(const char *path, const uint8_t *rgb, int width, int height);
+
+static void push_interrupt(uint8_t *queue, uint8_t event)
+{
+    uint8_t first = queue[0], count = queue[1];
+    if (count >= QUEUE_LEN) {
+        queue[2] = 1;               /* overflow: the app missed events */
+        return;
+    }
+    queue[0xC + (first + count) % QUEUE_LEN] = event;
+    queue[1] = count + 1;
+}
+
+/* The app's gspPresentBuffer wrote a new entry and set the update flag. */
+static void latch(uint8_t *base, int screen)
+{
+    uint8_t *header = base + 0x200 + thread_index * 0x80 + (uint32_t)screen * 0x40;
+    if (!header[1])
+        return;
+    uint32_t info[7];
+    memcpy(info, header + 4 + header[0] * 0x1C, sizeof info);
+    screens[screen] = (Screen){ info[1], info[3], info[4] & 7 };
+    header[1] = 0;
+}
+
+void gsp_vblank(void)
+{
+    uint8_t *base = shm ? kshm_ptr(shm) : NULL;
+    if (!base)
+        return;
+    latch(base, 0);
+    latch(base, 1);
+    Screen *top = &screens[0];
+    if (!lcd_black && top->addr)
+        have_top_frame |= fb_to_rgb(kernel_mem() + top->addr, top->format, top->stride, 400, top_rgb);
+    uint8_t *queue = base + thread_index * 0x40;
+    push_interrupt(queue, EVENT_VBLANK0);
+    push_interrupt(queue, EVENT_VBLANK1);
+    kevent_signal(interrupt_event);
+}
+
+int gsp_dump_top(const char *path)
+{
+    if (!have_top_frame) {
+        fprintf(stderr, "hle: no top-screen frame was ever shown, nothing to dump\n");
+        return 0;
+    }
+    if (!bmp_write(path, top_rgb, 400, 240)) {
+        perror(path);
+        return 0;
+    }
+    fprintf(stderr, "hle: top screen (last frame shown) saved to %s\n", path);
+    return 1;
+}
+
+void gsp_handle(uint32_t *cmd)
+{
+    switch (cmd[0] >> 16) {
+    case 0x13: {    /* RegisterInterruptRelayQueue(flags, event) -> thread index, shared memory */
+        interrupt_event = handle_get(cmd[3]);
+        if (!interrupt_event || interrupt_event->type != KO_EVENT) {
+            fprintf(stderr, "hle: GSP RegisterInterruptRelayQueue with a bad event handle\n");
+            ipc_reply(cmd, RES_INVALID_HANDLE);
+            return;
+        }
+        if (!shm) {
+            shm = kobj_new(KO_SHMEM, "GSP shared mem");
+            shm->shm.size = 0x1000;
+        }
+        kernel_start_vblank();
+        cmd[0] = ipc_header(0x13, 2, 2);
+        cmd[1] = RES_OK;            /* not 0x2A07: the HOME menu registered first and set up the LCDs */
+        cmd[2] = thread_index;
+        cmd[3] = IPC_COPY_HANDLES(1);
+        cmd[4] = handle_new(shm);
+        return;
+    }
+    case 0x0B:      /* SetLcdForceBlack(flag) */
+        lcd_black = cmd[1] & 1;
+        ipc_reply(cmd, RES_OK);
+        return;
+    case 0x01:      /* WriteHWRegs: LCD/GPU registers, no GPU here yet */
+    case 0x02:      /* WriteHWRegsWithMask */
+    case 0x08:      /* FlushDataCache: host memory is coherent */
+    case 0x09:      /* InvalidateDataCache */
+    case 0x14:      /* UnregisterInterruptRelayQueue */
+    case 0x16:      /* AcquireRight */
+    case 0x17:      /* ReleaseRight */
+    case 0x19:      /* SaveVramSysArea */
+    case 0x1A:      /* RestoreVramSysArea */
+    case 0x1C:      /* SetLedForceOff */
+        ipc_reply(cmd, RES_OK);
+        return;
+    default:
+        ipc_unhandled("gsp::Gpu", cmd);
+    }
+}

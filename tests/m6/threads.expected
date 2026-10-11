@@ -1,0 +1,12 @@
+threads test
+1 lightlock: counter = 2000
+2 lightevent: mw
+3 semaphore: 10 20 30 40 50
+4 sleeps: 123
+5 timeout: result 09401bfe, waited >= 2ms: yes
+6 priorities: HML
+7 wait any: result 00000000, index 1
+7 wait all, one signalled: result 09401bfe
+7 wait all, both signalled: result 00000000
+8 mutex: mT
+done

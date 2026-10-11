@@ -4,7 +4,7 @@ A **static recompiler** for Nintendo 3DS code. It translates 32-bit ARM (ARMv6K)
 
 Why ahead of time? iOS doesn't allow JIT compilation, so 3DS emulators on iPhone fall back to slow interpreters. If the whole program is translated before it runs, nothing has to be generated at runtime.
 
-> **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls), M2 (memory: loads/stores, literal pools, switch tables), M3 (instruction-by-instruction differential testing against Unicorn), M4 (Thumb + ARM/Thumb interworking), M5 (VFP floating point) and M6a (recompiling a real libctru homebrew app in full) are done. Development currently targets x86-64 Linux; iOS comes much later.
+> **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls), M2 (memory: loads/stores, literal pools, switch tables), M3 (instruction-by-instruction differential testing against Unicorn), M4 (Thumb + ARM/Thumb interworking), M5 (VFP floating point) and M6a (recompiling a real libctru homebrew app in full) are done. In M6b the recompiled libctru hello world **runs** on our own minimal OS layer (threads, APT, GSP, HID) and prints to its screen. Development currently targets x86-64 Linux; iOS comes much later.
 
 ## How it works
 
@@ -36,7 +36,7 @@ L_00100054:
 - **An unsupported instruction is a hard error** naming its address and mnemonic. Nothing is ever skipped silently.
 - Optimisation is clang's job. Generated code should stay readable.
 
-The long-term plan is to route OS calls (`SVC`) to high-level emulation borrowed from [Azahar](https://github.com/azahar-emu/azahar), replacing only its CPU backend with our precompiled code. See [CLAUDE.md](CLAUDE.md) for the full design and roadmap.
+OS calls (`SVC`) go to `hle/`, a small high-level emulation of the 3DS kernel and services written from the public [3dbrew](https://www.3dbrew.org) docs: threads and synchronisation, IPC, and just enough of APT, GSP, HID and FS for a homebrew app to run. The long-term plan is to reuse [Azahar](https://github.com/azahar-emu/azahar)'s services and GPU code for the heavier parts. See [CLAUDE.md](CLAUDE.md) for the full design and roadmap.
 
 ## Legal rules (read before contributing)
 
@@ -76,6 +76,8 @@ When the WSL distro runs as root, you can run the tests straight from Windows:
 wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc "make test"
 ```
 
+`make run-m6` runs the recompiled hello world, presses START at frame 10 and saves its top screen to `out/m6/top.bmp`.
+
 ## Repo layout
 
 ```
@@ -88,9 +90,16 @@ recomp/            Python recompiler
 runtime/
   context.h        CPU context, flag/condition helpers, memory access
   runtime.c        guest memory (4 GiB mmap), error handlers
+hle/               the OS layer: high-level emulation of the 3DS kernel and services
+  kernel.c         kernel objects, handles, threads + scheduler, virtual clock
+  svc.c            svc number -> kernel call; memory map
+  ipc.c            IPC: ports, sessions, request dispatch
+  srv.c apt.c gsp.c hid.c fs.c   one file per service
+  framebuffer.c    3DS framebuffer -> upright .bmp
 tests/
-  m0/              one function + barrel-shifter coverage
-  m1/              branches/flags/calls, differential vs native, flag model
+  m0/ ... m5/      one directory per milestone
+  real/            -O2 code + libgcc, extends
+  m6/              libctru programs run on the HLE: hello world, threads, deadlock
   expect_reject.sh asserts the recompiler refuses bad input
 dumps/  out/       gitignored: your own dumps and all generated code
 ```
@@ -101,6 +110,7 @@ dumps/  out/       gitignored: your own dumps and all generated code
 - **Differential tests:** the same C source is compiled for ARM and recompiled, and also compiled natively for the host. The harness compares results over edge-case and random inputs.
 - **Hand-written assembly** covers corners C rarely reaches, such as flag semantics, `lsr #32` and `rrx`, checked against an independent reference model.
 - **Negative tests** make sure unsupported code is rejected rather than miscompiled.
+- **Whole programs:** real libctru programs run on the HLE and are checked by their output (a golden debug log, or a hash of the frame on screen).
 - Harnesses build with `-Wall -Wextra -Werror` and ASan/UBSan.
 
 ## Roadmap
@@ -115,7 +125,8 @@ dumps/  out/       gitignored: your own dumps and all generated code
 | M5 | VFP floating point (VFPv2, hard-float ABI, exact ARM NaN rules) | ✅ |
 | — | Real-code readiness: -O2 + libgcc, indirect calls, tail calls, function discovery | ✅ |
 | M6a | Recompile a real libctru homebrew app in full (303 functions, RunFast VFP, atomics, svc hook) | ✅ |
-| M6b | OS layer: svc + IPC services, then run the app (started: runs through srv + APT IPC to `svcCreateThread`) | in progress |
+| M6b | OS layer: kernel (threads, sync, scheduler), IPC, APT/GSP/HID/FS; the hello world runs and draws its text | ✅ |
+| M7 | More of the OS (files, GPU command lists, audio), then bigger homebrew | next |
 | later | Cycle counting, CRO relocation, indirect-jump table + interpreter fallback, Metal renderer, iOS shell app | |
 
 ## Contributing

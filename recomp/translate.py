@@ -29,7 +29,7 @@ from capstone.arm import (
     ARM_INS_REV, ARM_INS_REV16, ARM_INS_REVSH, ARM_INS_RSB, ARM_INS_RSC, ARM_INS_SBC, ARM_INS_SEL,
     ARM_INS_SMLAL, ARM_INS_STREX, ARM_INS_STREXB, ARM_INS_STREXH, ARM_INS_SVC, ARM_INS_UADD8, ARM_INS_UDF,
     ARM_INS_SMULL, ARM_INS_STM, ARM_INS_STRD, ARM_INS_SXTB, ARM_INS_SXTH, ARM_INS_UMLAL, ARM_INS_UMULL,
-    ARM_INS_UXTH, ARM_INS_STMDA, ARM_INS_STMDB,
+    ARM_INS_UXTH, ARM_INS_STMDA, ARM_INS_STMDB, ARM_INS_UXTAB, ARM_INS_UXTAH, ARM_INS_SXTAB, ARM_INS_SXTAH,
     ARM_INS_STMIB, ARM_INS_STR, ARM_INS_STRB, ARM_INS_STRH, ARM_INS_SUB,
     ARM_INS_TEQ, ARM_INS_TST, ARM_INS_UXTB,
     ARM_INS_VABS, ARM_INS_VADD, ARM_INS_VCMP, ARM_INS_VCMPE, ARM_INS_VCVT,
@@ -419,18 +419,33 @@ _EXTENDS = {
     ARM_INS_SXTH: '(uint32_t)(int32_t)(int16_t){x}',
 }
 
+# The extend-and-add forms: rd = rn + extend(rm).
+_EXTEND_ADDS = {
+    ARM_INS_UXTAB: ARM_INS_UXTB,
+    ARM_INS_UXTAH: ARM_INS_UXTH,
+    ARM_INS_SXTAB: ARM_INS_SXTB,
+    ARM_INS_SXTAH: ARM_INS_SXTH,
+}
+
 
 def _extend(insn, fc):
     """uxtb/uxth/sxtb/sxth: zero/sign-extend the low byte or halfword, after
-    an optional rotation by 8/16/24 (ARM only)."""
+    an optional rotation by 8/16/24 (ARM only). uxtab/uxtah/sxtab/sxtah
+    then add the result to another register (rn = pc would be the plain
+    form's encoding, so it never happens)."""
     ops = insn.operands
-    if len(ops) != 2 or ops[1].type != ARM_OP_REG:
+    adds = insn.id in _EXTEND_ADDS
+    if len(ops) != (3 if adds else 2) or any(op.type != ARM_OP_REG for op in ops):
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
     rd = _dest_reg(insn, ops[0])
-    x, _ = _shift_imm(insn, _read_reg(insn, ops[1].reg), ops[1].shift.type, ops[1].shift.value)
-    if x != _read_reg(insn, ops[1].reg):
+    src = ops[-1]
+    x, _ = _shift_imm(insn, _read_reg(insn, src.reg), src.shift.type, src.shift.value)
+    if x != _read_reg(insn, src.reg):
         x = f'({x})'
-    return [f'ctx->r[{rd}] = {_EXTENDS[insn.id].format(x=x)};']
+    value = _EXTENDS[_EXTEND_ADDS.get(insn.id, insn.id)].format(x=x)
+    if adds:
+        value = f'{_read_reg(insn, ops[1].reg)} + ({value})'
+    return [f'ctx->r[{rd}] = {value};']
 
 
 _REVERSES = {
@@ -505,20 +520,30 @@ def direct_branch_target(insn):
     return None
 
 
+def _tail_call(fc, call):
+    """A tail call jumps to another function, which then returns to whatever
+    lr holds at the jump. Usually that is our own caller (lr untouched), so
+    in C it's a call followed by `return`. But code may point lr elsewhere
+    first: crt0 does `ldr lr, =exit; bx r3` to run main and then exit. So
+    recomp_continue carries on at that address (one more function) until
+    control is back at our caller's return address."""
+    fc.uses_ret = True
+    return ['{', '    uint32_t to = ctx->r[14];', f'    {call}', '    recomp_continue(ctx, to, ret);', '}', 'return;']
+
+
 def _b(insn, fc):
     target = _branch_target(insn)
     fc.terminates = True
     if fc.start <= target < fc.end:
         fc.labels.add(target)
         return [f'goto L_{target:08x};']
-    # A tail call: jump to another function, which then returns straight to
-    # our caller (lr is untouched). In C: call it, then return.
+    # A tail call: jump to another function (see _tail_call).
     callee = fc.entries.get(target)
     if callee is None:
         raise UnsupportedInstruction(insn, f'branch to {target:08x}, which is not a known function')
     if callee.thumb != _is_thumb(insn):
         raise UnsupportedInstruction(insn, f'branch to {callee.name} would need a mode switch')
-    return [f'{c_name(target)}(ctx);  /* tail call: {callee.name} */', 'return;']
+    return _tail_call(fc, f'{c_name(target)}(ctx);  /* tail call: {callee.name} */')
 
 
 def _bl(insn, fc):
@@ -560,9 +585,9 @@ def _bx(insn, fc):
         return ['RETURN_TO(ctx->r[14]);']
     if op.type == ARM_OP_REG and _reg_num(insn, op.reg) != PC:
         # An indirect tail call (e.g. through a function pointer): look the
-        # target up, call it, and return to our caller.
+        # target up and call it (see _tail_call).
         fc.terminates = True
-        return [f'recomp_call(ctx, {_read_reg(insn, op.reg)});  /* indirect tail call */', 'return;']
+        return _tail_call(fc, f'recomp_call(ctx, {_read_reg(insn, op.reg)});  /* indirect tail call */')
     raise UnsupportedInstruction(insn, 'bx pc')
 
 
@@ -1156,7 +1181,7 @@ _HANDLERS = {
     **{op: _binary for op in _BINARY},
     **{op: _unary for op in _UNARY},
     **{op: _shift_mnemonic for op in _SHIFT_MNEMONICS},
-    **{op: _extend for op in _EXTENDS},
+    **{op: _extend for op in (*_EXTENDS, *_EXTEND_ADDS)},
     **{op: _reverse for op in _REVERSES},
     **{op: _long_mul for op in _LONG_MUL},
     ARM_INS_CLZ: _clz,
