@@ -645,6 +645,7 @@ void hle_run(uint8_t *guest_mem, const HleConfig *cfg)
     config = *cfg;
     hle_trace = getenv("HLE_TRACE") != NULL;
     recomp_svc_handler = hle_svc;
+    config_mem_init(mem);
 
     pthread_mutex_lock(&big_lock);
     KThread *main_thread = thread_new(cfg->entry, 0x30);

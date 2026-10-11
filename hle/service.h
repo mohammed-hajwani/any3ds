@@ -17,7 +17,7 @@
 
 typedef struct Service {
     const char *name;
-    void (*handle)(uint32_t *cmd);
+    void (*handle)(KObj *session, uint32_t *cmd);   /* session: per-session state in session->data */
 } Service;
 
 static inline uint32_t ipc_header(uint32_t id, uint32_t normal, uint32_t translate)
@@ -42,13 +42,20 @@ uint32_t ipc_static_buffer(int index, uint32_t *size);
 
 KObj *port_connect(const char *name);       /* svcConnectToPort; NULL if unknown */
 KObj *service_connect(const char *name);    /* srv:GetServiceHandle; NULL if unknown */
+int   service_known(const char *name);      /* srv:IsServiceRegistered */
 void  ipc_request(KObj *session);           /* svcSendSyncRequest */
 
 /* The services. */
-void srv_handle(uint32_t *cmd);
-void apt_handle(uint32_t *cmd);
-void gsp_handle(uint32_t *cmd);
-void hid_handle(uint32_t *cmd);
-void fs_handle(uint32_t *cmd);
+void srv_handle(KObj *session, uint32_t *cmd);
+void apt_handle(KObj *session, uint32_t *cmd);
+void gsp_handle(KObj *session, uint32_t *cmd);
+void hid_handle(KObj *session, uint32_t *cmd);
+void fs_handle(KObj *session, uint32_t *cmd);
+void cfg_handle(KObj *session, uint32_t *cmd);
+void fs_file_handle(KObj *session, uint32_t *cmd);     /* an open file (FSFILE_*) */
+void fs_dir_handle(KObj *session, uint32_t *cmd);      /* an open directory (FSDIR_*) */
+
+/* Make a session to an object served by a service (an open file, ...). */
+KObj *session_new(const Service *service, void *data);
 
 #endif

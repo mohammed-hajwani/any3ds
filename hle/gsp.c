@@ -15,6 +15,7 @@
  * the app's event. libctru's GSP thread then wakes gspWaitForVBlank. */
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "service.h"
@@ -29,8 +30,13 @@ static KObj *shm, *interrupt_event;
 static uint32_t thread_index;
 static int lcd_black;
 static Screen screens[2];
-static uint8_t top_rgb[400 * 240 * 3];
-static int have_top_frame;
+/* The last frame both screens showed, as the console looks: the 400x240
+   top screen above the 320x240 bottom one, centred. */
+#define FRAME_W 400
+#define FRAME_H 480
+static uint8_t frame_rgb[FRAME_W * FRAME_H * 3];
+static uint8_t screen_rgb[400 * 240 * 3];
+static int have_frame;
 
 int fb_to_rgb(const uint8_t *fb, uint32_t format, uint32_t stride, int width, uint8_t *rgb);
 int bmp_write(const char *path, const uint8_t *rgb, int width, int height);
@@ -65,31 +71,59 @@ void gsp_vblank(void)
         return;
     latch(base, 0);
     latch(base, 1);
-    Screen *top = &screens[0];
-    if (!lcd_black && top->addr)
-        have_top_frame |= fb_to_rgb(kernel_mem() + top->addr, top->format, top->stride, 400, top_rgb);
+    if (!lcd_black)
+        for (int s = 0; s < 2; s++) {
+            int width = s ? 320 : 400;
+            if (!screens[s].addr || !fb_to_rgb(kernel_mem() + screens[s].addr, screens[s].format,
+                                               screens[s].stride, width, screen_rgb))
+                continue;
+            for (int y = 0; y < 240; y++)
+                memcpy(frame_rgb + ((size_t)(y + 240 * s) * FRAME_W + (s ? 40 : 0)) * 3,
+                       screen_rgb + (size_t)y * (size_t)width * 3, (size_t)width * 3);
+            have_frame = 1;
+        }
     uint8_t *queue = base + thread_index * 0x40;
     push_interrupt(queue, EVENT_VBLANK0);
     push_interrupt(queue, EVENT_VBLANK1);
     kevent_signal(interrupt_event);
 }
 
-int gsp_dump_top(const char *path)
+int gsp_dump_screens(const char *path)
 {
-    if (!have_top_frame) {
-        fprintf(stderr, "hle: no top-screen frame was ever shown, nothing to dump\n");
+    if (!have_frame) {
+        fprintf(stderr, "hle: no frame was ever shown, nothing to dump\n");
         return 0;
     }
-    if (!bmp_write(path, top_rgb, 400, 240)) {
+    if (!bmp_write(path, frame_rgb, FRAME_W, FRAME_H)) {
         perror(path);
         return 0;
     }
-    fprintf(stderr, "hle: top screen (last frame shown) saved to %s\n", path);
+    fprintf(stderr, "hle: both screens (last frame shown) saved to %s\n", path);
     return 1;
 }
 
-void gsp_handle(uint32_t *cmd)
+/* The GX command queue (shared memory + 0x800 + thread * 0x200): u8 first,
+   u8 count, then 15 slots of 8 words from word 8. Word 0's low byte is
+   the command. Running them needs the GPU, which isn't here yet; say
+   which ones the app asked for. */
+static void gx_queue_report(void)
 {
+    static const char *names[] = { "RequestDma", "ProcessCommandList", "MemoryFill",
+                                   "DisplayTransfer", "TextureCopy", "FlushCacheRegions" };
+    uint8_t *q = kshm_ptr(shm) + 0x800 + thread_index * 0x200;
+    fprintf(stderr, "hle: GSP GX commands need the GPU (not implemented):");
+    for (int i = 0; i < q[1]; i++) {
+        uint32_t id;
+        memcpy(&id, q + 0x20 * (1 + (q[0] + i) % 15), 4);
+        id &= 0xFF;
+        fprintf(stderr, " %s", id < 6 ? names[id] : "?");
+    }
+    fprintf(stderr, "\n");
+}
+
+void gsp_handle(KObj *session, uint32_t *cmd)
+{
+    (void)session;
     switch (cmd[0] >> 16) {
     case 0x13: {    /* RegisterInterruptRelayQueue(flags, event) -> thread index, shared memory */
         interrupt_event = handle_get(cmd[3]);
@@ -126,6 +160,9 @@ void gsp_handle(uint32_t *cmd)
     case 0x1C:      /* SetLedForceOff */
         ipc_reply(cmd, RES_OK);
         return;
+    case 0x0C:      /* TriggerCmdReqQueue: run the GX commands queued in shared memory */
+        gx_queue_report();
+        exit(3);
     default:
         ipc_unhandled("gsp::Gpu", cmd);
     }

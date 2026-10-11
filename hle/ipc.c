@@ -14,30 +14,42 @@ static const Service services[] = {
     { "hid:USER", hid_handle },
     { "hid:SPVR", hid_handle },
     { "fs:USER",  fs_handle },
+    { "cfg:u",    cfg_handle },
+    { "cfg:s",    cfg_handle },
+    { "cfg:i",    cfg_handle },
 };
 
 static const Service srv_port = { "srv:", srv_handle };
 
-static KObj *session_new(const Service *s)
+KObj *session_new(const Service *s, void *data)
 {
     KObj *o = kobj_new(KO_SESSION, s->name);
     o->service = s;
+    o->data = data;
     return o;
 }
 
 KObj *port_connect(const char *name)
 {
     if (strcmp(name, srv_port.name) == 0)
-        return session_new(&srv_port);
+        return session_new(&srv_port, NULL);
     fprintf(stderr, "hle: ConnectToPort(\"%s\"): no such port\n", name);
     return NULL;
+}
+
+int service_known(const char *name)
+{
+    for (size_t i = 0; i < sizeof services / sizeof services[0]; i++)
+        if (strcmp(name, services[i].name) == 0)
+            return 1;
+    return 0;
 }
 
 KObj *service_connect(const char *name)
 {
     for (size_t i = 0; i < sizeof services / sizeof services[0]; i++)
         if (strcmp(name, services[i].name) == 0)
-            return session_new(&services[i]);
+            return session_new(&services[i], NULL);
     return NULL;
 }
 
@@ -100,5 +112,5 @@ void ipc_request(KObj *session)
 {
     uint32_t *cmd = command_buffer();
     log_first_use(session->service->name, cmd[0]);
-    session->service->handle(cmd);
+    session->service->handle(session, cmd);
 }

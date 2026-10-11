@@ -47,6 +47,7 @@ typedef struct KObj {
     KType type;
     char name[16];
     struct KObj *next_all;          /* every object ever made, so none leaks */
+    void *data;                     /* a session's own state (an open file, ...) */
     union {
         struct { int reset, signaled; } ev;
         struct { struct KThread *owner; int count; } mtx;
@@ -119,8 +120,15 @@ void gsp_vblank(void);
 void hid_vblank(uint32_t frame);
 
 /* For the runner: scripted input (from `frame` on, hold `keys`; HID's
-   KEY_* bits) and saving the last top-screen frame as a .bmp. */
+   KEY_* bits), and saving the last frame shown as a .bmp (top screen
+   above bottom screen, 400x480). */
 void hid_hold_keys(uint32_t frame, uint32_t keys);
-int  gsp_dump_top(const char *path);
+void hid_touch(uint32_t frame, int down, uint32_t x, uint32_t y);
+int  gsp_dump_screens(const char *path);
+void fs_set_sdmc(const char *dir);          /* back the SD card with a host folder */
+int  fs_set_romfs(const char *path);        /* the app's RomFS: an image or a .3dsx */
+
+/* Fill the kernel config page and the shared page (config_mem.c). */
+void config_mem_init(uint8_t *mem);
 
 #endif

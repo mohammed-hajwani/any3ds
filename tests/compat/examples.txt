@@ -1,0 +1,75 @@
+# The compatibility corpus: devkitPro's 3ds-examples (public domain),
+# installed by the 3ds-dev group at /opt/devkitpro/examples/3ds.
+# tests/compat/sweep.py builds, recompiles and runs each one on hle/.
+#
+# Columns: path  category  expected-outcome  [runner options...]
+#   category:  what the example needs: console, framebuffer, gpu, audio,
+#              camera, network, applet, nfc, qtm, mvd, portlib, library
+#   expected:  the outcome it must reach (or beat) in `make compat`; one of
+#              build-failed recomp-failed c-failed stops runs   (? = unknown)
+#   options:   passed to the runner, in the example's build folder
+#              (default: START at frame 60, then B at frame 80; KEY_A = 1, KEY_B = 2,
+#              KEY_START = 8, KEY_DRIGHT = 0x10, KEY_DLEFT = 0x20)
+
+app_launch                           applet       runs
+audio/filters                        audio        runs
+audio/mic                            audio        runs
+audio/modplug-decoding               portlib      build-failed
+audio/ogg-vorbis-decoding            portlib      build-failed
+audio/opus-decoding                  portlib      build-failed
+audio/streaming                      audio        runs
+camera/image                         camera       runs
+camera/video                         camera       runs
+get_system_language                  console      runs
+graphics/bitmap/24bit-color          framebuffer  build-failed
+graphics/gpu/2d_shapes               gpu          stops
+graphics/gpu/both_screens            gpu          stops
+graphics/gpu/composite_scene         gpu          stops
+graphics/gpu/cubemap                 gpu          stops
+graphics/gpu/fragment_light          gpu          stops
+graphics/gpu/geoshader               gpu          stops
+graphics/gpu/gpusprites              gpu          stops
+graphics/gpu/immediate               gpu          stops
+graphics/gpu/lenny                   gpu          stops
+graphics/gpu/loop_subdivision        gpu          stops
+graphics/gpu/mipmap_fog              gpu          stops
+graphics/gpu/multiple_buf            gpu          stops
+graphics/gpu/normal_mapping          gpu          stops
+graphics/gpu/particles               gpu          stops
+graphics/gpu/proctex                 gpu          stops
+graphics/gpu/simple_tri              gpu          stops
+graphics/gpu/stereoscopic_2d         gpu          stops
+graphics/gpu/textured_cube           gpu          stops
+graphics/gpu/toon_shading            gpu          stops
+graphics/gpu/wide_mode_3d            gpu          stops
+graphics/printing/both-screen-text   console      runs
+graphics/printing/colored-text       console      runs
+graphics/printing/custom-font        gpu          stops
+graphics/printing/hello-world        console      runs
+graphics/printing/multiple-windows-text console      runs
+graphics/printing/system-font        gpu          stops
+graphics/printing/wide-console       console      runs
+input/read-controls                  console      runs          --hold 20:1 --hold 30:0 --hold 40:40 --hold 50:0 --hold 60:8
+input/software-keyboard              applet       runs
+input/touch-screen                   console      runs          --touch 20:100,120 --touch 40:up --hold 60:8
+libapplet_launch                     applet       runs
+mii_selector                         applet       runs
+mvd                                  mvd          build-failed
+network/3dslink-demo                 network      runs
+network/boss                         network      runs
+network/http                         network      runs
+network/http_post                    network      runs
+network/sockets                      network      runs
+network/sslc                         network      runs
+network/uds                          network      runs
+nfc                                  nfc          runs
+physics/box2d                        portlib      build-failed
+qtm/eye_position                     qtm          build-failed
+qtm/lenny_qtm_movement_naive         qtm          stops
+romfs                                console      runs
+sdmc                                 framebuffer  runs          --sdmc . --hold 60:2
+templates/application                console      runs
+templates/library                    library      build-failed
+threads/event                        console      runs
+threads/thread-basic                 console      runs
+time/rtc                             console      runs

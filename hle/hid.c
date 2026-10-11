@@ -1,47 +1,79 @@
 /* HID (hid:USER): buttons, circle pad, touch screen, motion sensors.
  *
- * The app maps HID shared memory and reads it in hidScanInput. The pad
- * section (32-bit words):
+ * The app maps HID shared memory and reads it in hidScanInput. Each input
+ * has a section of 32-bit words laid out the same way:
  *   [0..1] tick of the latest update   [2..3] tick of the one before
  *   [4]    index (0-7) of the latest entry
- *   [10 + 4*i ..] entry i: held keys, newly pressed, newly released, circle pad
- * libctru ignores the section while both ticks are equal, so each update
- * writes a new tick. Touch (word 42), accelerometer (66) and gyro (86)
- * stay zero, which reads as "no data".
+ *   then a ring of 8 entries
+ * libctru ignores a section while both ticks are equal, so each update
+ * writes a new tick.
+ *   pad    at word 0:  entries at word 10, 4 words each:
+ *                      held keys, newly pressed, newly released, circle pad
+ *   touch  at word 42: entries at word 50, 2 words each:
+ *                      x | y << 16, touching (0/1)
+ * Accelerometer (66) and gyro (86) stay zero, which reads as "no data".
  *
- * Input comes from a script (hid_hold_keys): from a given frame on, hold
- * a given set of keys. */
+ * Input comes from a script: from a given frame on, hold these keys
+ * (hid_hold_keys) / touch here or nowhere (hid_touch). */
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "service.h"
 
 #define MAX_SCRIPT 32
+#define PAD_SECTION   0
+#define TOUCH_SECTION 42
+
+typedef struct { uint32_t frame, value, down; } Step;
+typedef struct { Step steps[MAX_SCRIPT]; int n; } Script;
 
 static KObj *shm, *pad_event;
-static struct { uint32_t frame, keys; } script[MAX_SCRIPT];
-static int nscript;
-static uint32_t last_keys;
+static Script keys_script, touch_script;
+static uint32_t last_keys, last_touch[2];
+
+static void script_add(Script *s, uint32_t frame, uint32_t value, uint32_t down)
+{
+    if (s->n < MAX_SCRIPT)
+        s->steps[s->n++] = (Step){ frame, value, down };
+}
+
+/* The step in force at `frame`: the latest one that has started. */
+static const Step *script_at(const Script *s, uint32_t frame)
+{
+    const Step *at = NULL;
+    for (int i = 0; i < s->n; i++)
+        if (s->steps[i].frame <= frame && (!at || s->steps[i].frame >= at->frame))
+            at = &s->steps[i];
+    return at;
+}
 
 void hid_hold_keys(uint32_t frame, uint32_t keys)
 {
-    if (nscript == MAX_SCRIPT)
-        return;
-    script[nscript].frame = frame;
-    script[nscript].keys = keys;
-    nscript++;
+    script_add(&keys_script, frame, keys, 1);
 }
 
-static uint32_t keys_at(uint32_t frame)
+void hid_touch(uint32_t frame, int down, uint32_t x, uint32_t y)
 {
-    uint32_t keys = 0, from = 0;
-    for (int i = 0; i < nscript; i++)
-        if (script[i].frame <= frame && script[i].frame >= from) {
-            from = script[i].frame;
-            keys = script[i].keys;
-        }
-    return keys;
+    script_add(&touch_script, frame, x | y << 16, (uint32_t)down);
+}
+
+/* Publish a new entry in the section at word `section`, whose ring of
+   entries starts at word `entries`. */
+static void section_push(uint8_t *base, uint32_t section, uint32_t entries, const uint32_t *entry, uint32_t words)
+{
+    uint32_t w[5];
+    memcpy(w, base + section * 4, sizeof w);
+    uint32_t index = (w[4] + 1) & 7;
+    memcpy(base + (entries + words * index) * 4, entry, words * 4);
+    uint64_t now = kernel_now();
+    w[2] = w[0];                    /* previous tick */
+    w[3] = w[1];
+    w[0] = (uint32_t)now;
+    w[1] = (uint32_t)(now >> 32);
+    w[4] = index;
+    memcpy(base + section * 4, w, sizeof w);
 }
 
 void hid_vblank(uint32_t frame)
@@ -49,27 +81,30 @@ void hid_vblank(uint32_t frame)
     uint8_t *base = shm ? kshm_ptr(shm) : NULL;
     if (!base)
         return;
-    uint32_t w[10];
-    memcpy(w, base, sizeof w);
-    uint32_t keys = keys_at(frame), index = (w[4] + 1) & 7;
-    uint32_t entry[4] = { keys, keys & ~last_keys, last_keys & ~keys, 0 };
+
+    const Step *k = script_at(&keys_script, frame);
+    uint32_t keys = k ? k->value : 0;
+    uint32_t pad[4] = { keys, keys & ~last_keys, last_keys & ~keys, 0 };
     if (keys != last_keys)
         fprintf(stderr, "    -> HID: frame %" PRIu32 ", keys %08" PRIx32 "\n", frame, keys);
     last_keys = keys;
-    memcpy(base + (10 + 4 * index) * 4, entry, sizeof entry);
-    uint64_t now = kernel_now();
-    w[2] = w[0];                    /* previous tick */
-    w[3] = w[1];
-    w[0] = (uint32_t)now;
-    w[1] = (uint32_t)(now >> 32);
-    w[4] = index;
-    w[7] = keys;                    /* raw current state */
-    memcpy(base, w, sizeof w);
+    section_push(base, PAD_SECTION, PAD_SECTION + 10, pad, 4);
+    memcpy(base + 7 * 4, &keys, 4);     /* raw current pad state */
+
+    const Step *t = script_at(&touch_script, frame);
+    uint32_t touch[2] = { t && t->down ? t->value : 0, t ? t->down : 0 };
+    if (touch[0] != last_touch[0] || touch[1] != last_touch[1])
+        fprintf(stderr, "    -> HID: frame %" PRIu32 ", touch %s (%" PRIu32 ", %" PRIu32 ")\n", frame,
+                touch[1] ? "down" : "up", touch[0] & 0xFFFF, touch[0] >> 16);
+    memcpy(last_touch, touch, sizeof touch);
+    section_push(base, TOUCH_SECTION, TOUCH_SECTION + 8, touch, 2);
+
     kevent_signal(pad_event);
 }
 
-void hid_handle(uint32_t *cmd)
+void hid_handle(KObj *session, uint32_t *cmd)
 {
+    (void)session;
     switch (cmd[0] >> 16) {
     case 0x0A: {    /* GetIPCHandles -> shared memory, pad0, pad1, accel, gyro, debug pad events */
         static const char *names[5] = { "HID pad0", "HID pad1", "HID accel", "HID gyro", "HID debugpad" };

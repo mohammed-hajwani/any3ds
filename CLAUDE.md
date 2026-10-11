@@ -45,6 +45,7 @@ runtime/
   context.h        CPU context struct + memory helpers
 hle/               the OS layer: kernel (threads, sync, IPC) + services (srv, APT, GSP, HID, FS)
 tests/
+  compat/          the compatibility sweep over devkitPro's 3ds-examples (make compat)
   m0/              milestone 0 test program + harness
 dumps/             (gitignored) user's own dumps
 out/               (gitignored) generated code
@@ -93,7 +94,7 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
   - **noreturn calls:** a call with nothing after it gets `recomp_no_return`.
   - **Loader fixes:** functions are clipped at the next symbol, and unlabelled code in `$a`/`$t` regions becomes functions.
   - **VFP RunFast mode:** FPSCR FZ+DN, which libctru sets on every thread, via `vmsr fpscr`. Half of all Unicorn runs use it.
-- **M6b done: the recompiled hello world runs and draws "Hello from recompiled code!".** `make test-m6` runs it end to end: START is pressed at frame 10, it exits via svcExitProcess, and the top screen's last frame must match `tests/m6/hello_top.sha256`. `make run-m6` saves that frame to `out/m6/top.bmp`. The OS layer is `hle/`, our own HLE written from the 3dbrew docs (no Azahar code, so no GPL yet):
+- **M6b done: the recompiled hello world runs and draws "Hello from recompiled code!".** `make test-m6` runs it end to end: START is pressed at frame 10, it exits via svcExitProcess, and the last frame (both screens) must match `tests/m6/hello_frame.sha256`. `make run-m6` saves that frame to `out/m6/frame.bmp`. The OS layer is `hle/`, our own HLE written from the 3dbrew docs (no Azahar code, so no GPL yet):
   - **Kernel (`hle/kernel.c`, `svc.c`):**
     - Threads: each guest thread gets its own host pthread (its own host stack for the recompiled C calls), but only one runs at a time. Switches happen only inside svcs: on a block, a yield, or when a higher-priority thread is woken. Runs are fully deterministic.
     - Virtual clock: each svc costs 1 µs, and when every thread is blocked the clock jumps to the next deadline (sleep, timeout, or the 60 Hz vblank).
@@ -118,6 +119,28 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
     2. GPU command lists (GX queue, then PICA200), which is where reusing Azahar starts to pay.
     3. Audio (DSP).
     4. Bigger homebrew as test cases.
+- **M7 done: compatibility sweep over devkitPro's 3ds-examples.** The 62 public-domain examples installed with `3ds-dev` (`/opt/devkitpro/examples/3ds`) are the test corpus.
+  - **The sweep:** `make compat` (`tests/compat/sweep.py`) copies each one into `out/compat/`, builds it, recompiles it, runs it on the HLE with scripted input, classifies the outcome and writes `docs/compat.md`. Expected outcomes are in `tests/compat/examples.txt`, last-frame hashes in `tests/compat/hashes.txt`; after looking at the frames, `--record` updates both. `make test` runs a quick subset of 4.
+  - **Result:** 31 run to a clean exit with the right screens. The other 31:
+    - 20 stop at the GPU: citro3d/citro2d's first GX command is MemoryFill, then ProcessCommandList, which needs a PICA200.
+    - 3 need the system font, which is firmware data we never ship.
+    - 8 don't build: missing portlibs or ImageMagick, a missing video file, a library template, and one example that is out of date with libctru.
+    - 0 fail to recompile or compile.
+  - **Translator fixes the corpus found** (each tested against Unicorn in `tests/real/dsp.S` or `tests/m5/vfp.S`):
+    - Instructions: smulxy/smlaxy/smulwy/smlawy, usat/ssat, and fldmx/fstmx (the pre-UAL VFP block forms, which move one extra word).
+    - Fall-through into the next function (libgcc's `__aeabi_dsub` runs on into `__adddf3`): a tail call.
+    - Old-style control flow: `mov pc, lr`, and any `ldm` that loads pc (APCS `ldmdb fp, {fp, sp, pc}`).
+    - **Bug:** jump tables with *negative* indices (newlib's `_vfprintf_r` loads signed offsets with ldrsh) jumped to the default.
+    - Coprocessors the 3DS doesn't have (iWMMXt) and VFP d16-d31 now compile to `recomp_undefined`: a trap, exactly as the ARM11 would raise an Undefined Instruction.
+    - Labels are emitted as `L_x: ;` (a label can end a block).
+  - **HLE additions:**
+    - The kernel config page and shared page (0x1FF80000 / 0x1FF81000): firmware version, memory layout, and the time reference behind `osGetTime`. The clock starts at 2026-01-01, so runs stay deterministic.
+    - QueryMemory over a region map, and CreateMemoryBlock.
+    - FS: the SD card is a host folder (`--sdmc DIR`), and the app's RomFS is served from its `.3dsx` (`--romfs`). Covers files, directories and UTF-16 paths.
+    - `cfg:u` (language, region, model), HID touch (`--touch`), and srv IsServiceRegistered.
+    - The frame dump is both screens (top above bottom, 400x480).
+    - GSP command 0x0C (TriggerCmdReqQueue) reports which GX commands an app wanted.
+  - **Next:** the GPU. That's GX (MemoryFill, DisplayTransfer, TextureCopy, then command lists) and a PICA200. It's the decision point for reusing Azahar's video core, which would make the project GPLv2.
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function

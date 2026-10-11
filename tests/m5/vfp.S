@@ -139,3 +139,16 @@ FUNC cond_vmov
     vmovgt.f32 s0, s1
     vmovle.f64 d2, d3
 END cond_vmov
+
+@ ---- fldmx / fstmx: the pre-UAL "unknown format" block transfers ----
+@ Like vldm/vstm of doubles, but they move one extra word (a format word,
+@ 2n + 1 words in all), so writeback steps by 8n + 4. libgcc's C++
+@ unwinder saves and restores the VFP registers with them.
+FUNC vfp_block_x
+    sub r0, sp, #256
+    fstmiax r0, {d0-d3}         @ d0-d3 at r0, then the format word
+    fldmiax r0!, {d4-d7}        @ reload them into d4-d7; r0 += 36
+    fstmdbx r0!, {d0-d1}        @ r0 -= 20; d0, d1 at the new r0
+    fldmdbx r0!, {d8}           @ r0 -= 12; d8 from the new r0
+    mov r1, r0
+END vfp_block_x

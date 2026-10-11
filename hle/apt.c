@@ -7,6 +7,7 @@
  * that parameter; here Enable queues it straight away. */
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "service.h"
 
@@ -50,8 +51,9 @@ static void parameter(uint32_t *cmd, int receive)
         param.pending = 0;
 }
 
-void apt_handle(uint32_t *cmd)
+void apt_handle(KObj *session, uint32_t *cmd)
 {
+    (void)session;
     switch (cmd[0] >> 16) {
     case 0x01:      /* GetLockHandle(flags) -> applet attributes, power state, lock mutex */
         if (!lock_mutex)
@@ -108,6 +110,9 @@ void apt_handle(uint32_t *cmd)
         cmd[1] = RES_OK;
         cmd[2] = RES_OK;
         return;
+    case 0x44:      /* GetSharedFont: the system font lives in the console's firmware */
+        fprintf(stderr, "hle: APT GetSharedFont: the system font is firmware data, which we don't have\n");
+        exit(3);
     case 0x102:     /* CheckNew3DS -> 0: an original 3DS (no C-stick/ZL/ZR, 268 MHz) */
         cmd[0] = ipc_header(0x102, 2, 0);
         cmd[1] = RES_OK;

@@ -30,6 +30,11 @@ from capstone.arm import (
     ARM_INS_SMLAL, ARM_INS_STREX, ARM_INS_STREXB, ARM_INS_STREXH, ARM_INS_SVC, ARM_INS_UADD8, ARM_INS_UDF,
     ARM_INS_SMULL, ARM_INS_STM, ARM_INS_STRD, ARM_INS_SXTB, ARM_INS_SXTH, ARM_INS_UMLAL, ARM_INS_UMULL,
     ARM_INS_UXTH, ARM_INS_STMDA, ARM_INS_STMDB, ARM_INS_UXTAB, ARM_INS_UXTAH, ARM_INS_SXTAB, ARM_INS_SXTAH,
+    ARM_INS_SMULBB, ARM_INS_SMULBT, ARM_INS_SMULTB, ARM_INS_SMULTT, ARM_INS_SMULWB, ARM_INS_SMULWT,
+    ARM_INS_SMLABB, ARM_INS_SMLABT, ARM_INS_SMLATB, ARM_INS_SMLATT, ARM_INS_SMLAWB, ARM_INS_SMLAWT,
+    ARM_INS_USAT, ARM_INS_SSAT, ARM_INS_LDC, ARM_INS_LDCL, ARM_INS_STC, ARM_INS_STCL, ARM_INS_CDP,
+    ARM_INS_MCRR, ARM_INS_MRRC, ARM_INS_LDC2, ARM_INS_LDC2L, ARM_INS_STC2, ARM_INS_STC2L, ARM_INS_CDP2,
+    ARM_INS_MCR2, ARM_INS_MRC2, ARM_INS_MCRR2, ARM_INS_MRRC2, ARM_INS_FLDMIAX, ARM_INS_FLDMDBX, ARM_INS_FSTMIAX, ARM_INS_FSTMDBX,
     ARM_INS_STMIB, ARM_INS_STR, ARM_INS_STRB, ARM_INS_STRH, ARM_INS_SUB,
     ARM_INS_TEQ, ARM_INS_TST, ARM_INS_UXTB,
     ARM_INS_VABS, ARM_INS_VADD, ARM_INS_VCMP, ARM_INS_VCMPE, ARM_INS_VCVT,
@@ -343,6 +348,15 @@ def _unary(insn, fc):
     if _is_thumb(insn) and insn.id == ARM_INS_MOV and ops[0].type == ARM_OP_REG \
             and _reg_num(insn, ops[0].reg) == PC:
         return _computed_jump(insn, fc, ops[1])
+    if not _is_thumb(insn) and insn.id == ARM_INS_MOV and ops[0].type == ARM_OP_REG \
+            and _reg_num(insn, ops[0].reg) == PC and ops[1].type == ARM_OP_REG \
+            and _reg_num(insn, ops[1].reg) == LR and ops[1].shift.value == 0 and not _sets_flags(insn):
+        # `mov pc, lr`: the return from before bx existed. Unlike bx it never
+        # switches to Thumb (bit 0 of lr would be unpredictable), so a
+        # Thumb return address here is reported as a bad return.
+        fc.uses_ret = True
+        fc.terminates = True
+        return ['RETURN_TO(ctx->r[14] & ~1u);']
     rd = _dest_reg(insn, ops[0])
     setflags = _sets_flags(insn)
     m, carry = _pick_carry(*_operand2(insn, ops[1]), setflags)
@@ -480,6 +494,59 @@ _LONG_MUL = {   # id: (signed, accumulate)
 }
 
 
+# ARMv5TE signed halfword multiplies: (multiply kind, first half, second half,
+# accumulate). B = bottom halfword, T = top; W = the whole first operand.
+_HALF_MULS = {
+    ARM_INS_SMULBB: ('16', 'B', 'B', False), ARM_INS_SMULBT: ('16', 'B', 'T', False),
+    ARM_INS_SMULTB: ('16', 'T', 'B', False), ARM_INS_SMULTT: ('16', 'T', 'T', False),
+    ARM_INS_SMLABB: ('16', 'B', 'B', True), ARM_INS_SMLABT: ('16', 'B', 'T', True),
+    ARM_INS_SMLATB: ('16', 'T', 'B', True), ARM_INS_SMLATT: ('16', 'T', 'T', True),
+    ARM_INS_SMULWB: ('W', None, 'B', False), ARM_INS_SMULWT: ('W', None, 'T', False),
+    ARM_INS_SMLAWB: ('W', None, 'B', True), ARM_INS_SMLAWT: ('W', None, 'T', True),
+}
+
+
+def _half(x, which):
+    return f'(int32_t)(int16_t){x}' if which == 'B' else f'(int32_t)(int16_t)({x} >> 16)'
+
+
+def _half_mul(insn, fc):
+    """smulxy/smlaxy: signed 16 x 16 multiply of the chosen halves (+ ra).
+    smulwy/smlawy: signed 32 x 16 multiply keeping bits 47..16 (+ ra).
+    The accumulating forms set the sticky Q flag on signed overflow; Q isn't
+    modelled (nothing we recompile can read it: mrs is a hard error)."""
+    kind, xh, yh, acc = _HALF_MULS[insn.id]
+    ops = insn.operands
+    if len(ops) != (4 if acc else 3) or any(op.type != ARM_OP_REG for op in ops):
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    if any(_reg_num(insn, op.reg) == PC for op in ops):
+        raise UnsupportedInstruction(insn, 'pc as a multiply operand is unpredictable')
+    rd = _dest_reg(insn, ops[0])
+    n, m = _read_reg(insn, ops[1].reg), _read_reg(insn, ops[2].reg)
+    if kind == '16':
+        expr = f'(uint32_t)({_half(n, xh)} * {_half(m, yh)})'
+    else:
+        expr = f'(uint32_t)(int32_t)(((int64_t)(int32_t){n} * {_half(m, yh)}) >> 16)'
+    if acc:
+        expr += f' + {_read_reg(insn, ops[3].reg)}'
+    return [f'ctx->r[{rd}] = {expr};']
+
+
+def _saturate(insn, fc):
+    """usat rd, #n, rm{, lsl/asr #k}: clamp the (shifted) signed value to
+    0 .. 2^n - 1; ssat: to -2^(n-1) .. 2^(n-1) - 1. The sticky Q flag they
+    set when clamping isn't modelled (nothing we recompile can read it)."""
+    ops = insn.operands
+    if len(ops) != 3 or ops[0].type != ARM_OP_REG or ops[1].type != ARM_OP_IMM or ops[2].type != ARM_OP_REG:
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    if _reg_num(insn, ops[2].reg) == PC:
+        raise UnsupportedInstruction(insn, 'pc as an operand is unpredictable')
+    rd = _dest_reg(insn, ops[0])
+    x, _ = _shift_imm(insn, _read_reg(insn, ops[2].reg), ops[2].shift.type, ops[2].shift.value)
+    helper = 'arm_usat' if insn.id == ARM_INS_USAT else 'arm_ssat'
+    return [f'ctx->r[{rd}] = {helper}({x}, {ops[1].imm});']
+
+
 def _long_mul(insn, fc):
     """umull/smull/umlal/smlal: 32 x 32 -> 64-bit product into rdlo:rdhi
     (plus the 64-bit value already there, for the accumulating forms).
@@ -612,8 +679,8 @@ def _jump_table(insn, fc):
     """gcc's switch dispatch: `add pc, pc, rX, lsl #2`.
 
     pc reads as this instruction + 8, so this jumps to addr + 8 + 4*rX,
-    into a row of branches/returns that follows. Becomes a C switch over
-    every code address from there to the end of the function.
+    usually into a row of branches/returns that follows. Becomes a C switch
+    over every code address in the function.
     """
     _, rn_op, op2 = insn.operands
     if (_is_thumb(insn) or _sets_flags(insn) or rn_op.type != ARM_OP_REG or _reg_num(insn, rn_op.reg) != PC
@@ -621,12 +688,14 @@ def _jump_table(insn, fc):
         raise UnsupportedInstruction(insn, 'writes pc (computed branches come later)')
     index = _read_reg(insn, op2.reg)
     base = insn.address + 8
-    lines = [f'switch ({index}) {{']
-    for k in range((fc.end - base) // 4):
-        target = base + 4 * k
-        if target in fc.code_addrs:         # data words in range fall to default
+    # The index is signed: tables of signed offsets (newlib's _vfprintf_r
+    # loads them with ldrsh) jump backwards too. So every instruction of the
+    # function is a possible target; data words fall to the default.
+    lines = [f'switch ((int32_t){index}) {{']
+    for target in sorted(fc.code_addrs):
+        if (target - base) % 4 == 0:
             fc.labels.add(target)
-            lines.append(f'case {k}: goto L_{target:08x};')
+            lines.append(f'case {(target - base) // 4}: goto L_{target:08x};')
     lines += [f'default: recomp_bad_jump(ctx, {_imm(insn.address)}, {index});', '}']
     fc.terminates = True
     return lines
@@ -853,9 +922,10 @@ def _block(insn, fc):
         raise UnsupportedInstruction(insn, 'writeback with the base register in the list is unpredictable')
     if PC in regs and not load and _is_thumb(insn):
         raise UnsupportedInstruction(insn, 'storing pc')
+    # Loading pc is a jump to the loaded address. In practice it's a return
+    # (pop {.., pc}; old APCS epilogues like `ldmdb fp, {fp, sp, pc}`), and
+    # RETURN_TO reports it if it isn't one.
     is_return = load and PC in regs
-    if is_return and not (rn == SP and wback and mode == 'ia'):
-        raise UnsupportedInstruction(insn, 'load into pc (indirect jumps come later)')
 
     start = {'ia': 0, 'ib': 4, 'da': -4 * n + 4, 'db': -4 * n}[mode]
     lines = ['{', f'    uint32_t b = ctx->r[{rn}];']
@@ -886,12 +956,15 @@ def _block(insn, fc):
 # moved around as raw bits; all arithmetic goes through runtime/vfp.h,
 # which implements ARM's NaN and conversion rules exactly.
 
-def _vreg(insn, op):
-    """('s', n) or ('d', n) for a VFP register operand."""
+def _vreg(insn, op, allow_d32=False):
+    """('s', n) or ('d', n) for a VFP register operand. VFPv2 (the 3DS) has
+    only d0-d15; d16-d31 are a VFPv3-D32 feature."""
     if op.type != ARM_OP_REG:
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
     name = insn.reg_name(op.reg)
     if name[0] in 'sd' and name[1:].isdigit():
+        if name[0] == 'd' and int(name[1:]) >= 16 and not allow_d32:
+            raise UnsupportedInstruction(insn, f'{name} does not exist on VFPv2 (the 3DS has d0-d15)')
         return name[0], int(name[1:])
     raise UnsupportedInstruction(insn, f'expected a VFP register, got {name}')
 
@@ -1067,11 +1140,20 @@ _VFP_BLOCK = {      # id: (load?, decrement-before?)
     ARM_INS_VLDMIA: (True, False), ARM_INS_VLDMDB: (True, True),
     ARM_INS_VSTMIA: (False, False), ARM_INS_VSTMDB: (False, True),
     ARM_INS_VPOP: (True, False), ARM_INS_VPUSH: (False, True),
+    # The pre-UAL "X" forms: doubles plus one extra (format) word.
+    ARM_INS_FLDMIAX: (True, False), ARM_INS_FLDMDBX: (True, True),
+    ARM_INS_FSTMIAX: (False, False), ARM_INS_FSTMDBX: (False, True),
 }
+_VFP_BLOCK_X = (ARM_INS_FLDMIAX, ARM_INS_FLDMDBX, ARM_INS_FSTMIAX, ARM_INS_FSTMDBX)
 
 
 def _vfp_block(insn, fc):
-    """vldm/vstm (ia, db) and vpush (= vstmdb sp!) / vpop (= vldmia sp!)."""
+    """vldm/vstm (ia, db) and vpush (= vstmdb sp!) / vpop (= vldmia sp!).
+
+    fldmx/fstmx (ia, db) transfer 2n + 1 words: the doubles, then one more
+    word whose content is implementation-defined. We neither load nor store
+    that word (nothing reads it back except another fldmx); only the address
+    arithmetic counts it."""
     load, decrement = _VFP_BLOCK[insn.id]
     ops = list(insn.operands)
     if insn.id in (ARM_INS_VPUSH, ARM_INS_VPOP):
@@ -1081,12 +1163,19 @@ def _vfp_block(insn, fc):
         wback = bool((_encoding(insn) >> 21) & 1)       # the W bit
     if rn == PC:
         raise UnsupportedInstruction(insn, 'pc as the base register')
-    regs = [_vreg(insn, op) for op in ops]
+    regs = [_vreg(insn, op, allow_d32=True) for op in ops]
     k = regs[0][0]
+    if k == 'd' and any(n >= 16 for _, n in regs):
+        # d16-d31 only exist on VFPv3-D32; the 3DS's VFPv2 has d0-d15, so
+        # this is an undefined instruction there (libgcc's unwinder carries
+        # such a helper for other CPUs; it never runs on a 3DS).
+        fc.terminates = True
+        text = f'{insn.mnemonic} {insn.op_str}'
+        return [f'recomp_undefined(ctx, {_imm(insn.address)}, "{text}");  /* d16-d31: not on VFPv2 */']
     if any(rk != k for rk, _ in regs):
         raise UnsupportedInstruction(insn, 'mixed single/double registers')
     size = 4 if k == 's' else 8
-    total = size * len(regs)
+    total = size * len(regs) + (4 if insn.id in _VFP_BLOCK_X else 0)
     start = -total if decrement else 0
 
     lines = ['{', f'    uint32_t b = ctx->r[{rn}];']
@@ -1104,11 +1193,31 @@ def _vfp_block(insn, fc):
 
 # ---------------------------------------------------------------- system (M6)
 
+# The 3DS's ARM11 has coprocessors 10/11 (VFP), 14 (debug) and 15 (system
+# control). Anything addressed to another one raises an Undefined
+# Instruction exception on real hardware.
+_PRESENT_COPROCESSORS = (10, 11, 14, 15)
+
+
+def _absent_coprocessor(insn, fc):
+    """An instruction for a coprocessor the 3DS doesn't have (libgcc's
+    unwinder carries iWMMXt save/restore helpers that never run there):
+    on hardware it would trap, so it recompiles to a trap."""
+    coproc = (_encoding(insn) >> 8) & 0xF
+    if coproc in _PRESENT_COPROCESSORS:
+        raise UnsupportedInstruction(insn, f'coprocessor p{coproc} operation')
+    fc.terminates = True
+    text = f'{insn.mnemonic} {insn.op_str}'.replace('"', "'")
+    return [f'recomp_undefined(ctx, {_imm(insn.address)}, "{text}");  /* no coprocessor p{coproc} on a 3DS */']
+
+
 def _coproc(insn, fc):
     """mrc/mcr p15: decoded from the encoding fields, and only the
     operations user-mode 3DS code actually performs are accepted."""
     w = _encoding(insn)
     coproc, opc1, crn, rt = (w >> 8) & 0xF, (w >> 21) & 7, (w >> 16) & 0xF, (w >> 12) & 0xF
+    if coproc not in _PRESENT_COPROCESSORS:
+        return _absent_coprocessor(insn, fc)
     opc2, crm, is_read = (w >> 5) & 7, w & 0xF, (w >> 20) & 1
     if coproc == 15 and opc1 == 0 and is_read and (crn, crm, opc2) == (13, 0, 3) and rt != PC:
         # TPIDRURO: the thread-local storage pointer (libctru keeps each
@@ -1184,6 +1293,9 @@ _HANDLERS = {
     **{op: _extend for op in (*_EXTENDS, *_EXTEND_ADDS)},
     **{op: _reverse for op in _REVERSES},
     **{op: _long_mul for op in _LONG_MUL},
+    **{op: _half_mul for op in _HALF_MULS},
+    ARM_INS_USAT: _saturate,
+    ARM_INS_SSAT: _saturate,
     ARM_INS_CLZ: _clz,
     ARM_INS_LDRD: _ldrd_strd,
     ARM_INS_STRD: _ldrd_strd,
@@ -1200,6 +1312,10 @@ _HANDLERS = {
     ARM_INS_NOP: _nop,
     ARM_INS_MRC: _coproc,
     ARM_INS_MCR: _coproc,
+    **{op: _absent_coprocessor for op in (ARM_INS_LDC, ARM_INS_LDCL, ARM_INS_STC, ARM_INS_STCL,
+                                          ARM_INS_CDP, ARM_INS_MCRR, ARM_INS_MRRC, ARM_INS_LDC2, ARM_INS_LDC2L,
+                                          ARM_INS_STC2, ARM_INS_STC2L, ARM_INS_CDP2, ARM_INS_MCR2, ARM_INS_MRC2,
+                                          ARM_INS_MCRR2, ARM_INS_MRRC2)},
     **{op: _exclusive for op in (*_EXCL_LOADS, *_EXCL_STORES)},
     ARM_INS_CLREX: _clrex,
     ARM_INS_SVC: _svc,
@@ -1292,10 +1408,17 @@ def translate_function(fn, insns, entries, program=None):
                 # stop loudly rather than run into whatever follows.
                 body[-1][2].append(f'recomp_no_return(ctx, {_imm(insn.address)});')
                 fc.terminates = True
+            end = insn.address + insn.size
+            follower = entries.get(end) if end == fn.end and not fc.terminates else None
+            if follower is not None and follower.thumb == fn.thumb:
+                # The code runs straight on into the next function, on purpose:
+                # libgcc's __aeabi_dsub flips a sign and falls into __adddf3.
+                # Same as a tail call to it.
+                body[-1][2].extend(_tail_call(fc, f'{c_name(end)}(ctx);  /* falls through into {follower.name} */'))
+                fc.terminates = True
             if not fc.terminates:
                 # Without this check, the C function would quietly stop here
                 # while the guest CPU would run on into whatever comes next.
-                end = insn.address + insn.size
                 where = 'falls off its end' if end == fn.end else f'runs into data at {end:08x}'
                 raise UnsupportedInstruction(insn, f'{fn.name} {where} without returning')
             body += _data_entries(fn, insn.address + insn.size, next_addr)

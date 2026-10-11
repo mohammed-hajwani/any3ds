@@ -39,7 +39,7 @@ def emit(functions, header_name, program=None, trace=False):
             c.append('    const uint32_t ret = ctx->r[14];  /* return address we were called with */')
         for addr, comment, lines in tf.body:
             if addr in tf.labels:
-                c.append(f'L_{addr:08x}:')
+                c.append(f'L_{addr:08x}: ;')
             c.append(f'    /* {comment} */')
             if trace and lines:
                 c.append(f'    RECOMP_TRACE(0x{addr:08x}u, {_c_string(comment.split(": ", 1)[1])});')

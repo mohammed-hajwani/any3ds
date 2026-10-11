@@ -38,11 +38,11 @@ ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-m6 venv clean
+.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-m6 test-compat-quick venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-m6
+test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-m6 test-compat-quick
 
 venv: $(VENV)/.installed
 
@@ -305,7 +305,7 @@ $(REAL)/gen_%.c: $(REAL)/%.elf $(RECOMP_DEP)
 $(REAL)/%_harness: tests/real/harness.c tests/real/real.c $(REAL)/gen_%.c $(RUNTIME_DEP)
 	$(HOST_CC) $(HOST_FLAGS) $< $(REAL)/gen_$*.c $(RUNTIME_SRC) -o $@
 
-REAL_PROGS := real/real_arm real/real_thumb real/extend
+REAL_PROGS := real/real_arm real/real_thumb real/extend real/dsp
 $(foreach p,$(REAL_PROGS),$(eval $(call m3_prog,$(p))))
 REAL_DIFFS := $(foreach p,$(REAL_PROGS),$(M3)/$(notdir $(p))_diff)
 REAL_SKIP := isort,shape_total
@@ -374,20 +374,41 @@ test-m6: $(M6)/run_hello $(M6)/run_threads $(M6)/run_deadlock $(M3)/hello_diff $
 	  if [ $$status -eq 4 ] && grep -q 'deadlock' $(M6)/deadlock.log; then echo "    deadlock reported"; \
 	  else cat $(M6)/deadlock.log; echo "expected a deadlock report (exit 4), got exit $$status"; exit 1; fi
 	@echo '=== M6: hello world end to end on the HLE (START pressed at frame 10) ==='
-	@timeout 120 ./$(M6)/run_hello --hold 10:8 --dump $(M6)/top.bmp > $(M6)/hello.out 2> $(M6)/hello.log \
+	@timeout 120 ./$(M6)/run_hello --hold 10:8 --dump $(M6)/frame.bmp > $(M6)/hello.out 2> $(M6)/hello.log \
 	  || { cat $(M6)/hello.log; echo "hello world did not exit cleanly"; exit 1; }
 	@for want in 'APT parameter: command 1 from applet 101' 'HID: frame 10, keys 00000008' \
 	             'exited via svcExitProcess (frame 11,'; do \
 	  grep -qF "$$want" $(M6)/hello.log || { cat $(M6)/hello.log; echo "missing from the log: $$want"; exit 1; }; \
 	done; echo "    WAKEUP delivered, START seen, exited via svcExitProcess"
-	@echo "$$(cat tests/m6/hello_top.sha256)  $(M6)/top.bmp" | sha256sum -c --quiet \
-	  && echo "    top screen matches the recorded frame (tests/m6/hello_top.sha256)"
+	@echo "$$(cat tests/m6/hello_frame.sha256)  $(M6)/frame.bmp" | sha256sum -c --quiet \
+	  && echo "    the screens match the recorded frame (tests/m6/hello_frame.sha256)"
 
-# Run the recompiled hello world: START is pressed at frame 10, and the
-# top screen is saved to out/m6/top.bmp. HLE_TRACE=1 logs every svc.
+# Run the recompiled hello world: START is pressed at frame 10, and both
+# screens are saved to out/m6/frame.bmp. HLE_TRACE=1 logs every svc.
 .PHONY: run-m6
 run-m6: $(M6)/run_hello
-	./$(M6)/run_hello --hold 10:8 --dump $(M6)/top.bmp
+	./$(M6)/run_hello --hold 10:8 --dump $(M6)/frame.bmp
+
+# ---------------------------------------------------------------- compat
+#
+# The compatibility sweep (slow, so only a quick subset is part of `make
+# test`): every example in tests/compat/examples.txt (devkitPro's
+# public-domain 3ds-examples) is built, recompiled and run on the HLE; the
+# outcome table goes to docs/compat.md. Fails if an example falls behind
+# its expected outcome or its frame changes (tests/compat/hashes.txt).
+# COMPAT_ARGS="--only gpu --keep-build" narrows a run; --record makes the
+# current outcomes and frames the expected ones (look at the frames first).
+COMPAT_ENV := HOST_CC='$(HOST_CC)' HOST_FLAGS='$(HOST_FLAGS)' PYTHON=$(PYTHON)
+COMPAT_QUICK := --only printing/colored-text --only input/read-controls --only romfs --only threads/thread-basic
+
+.PHONY: test-compat-quick
+test-compat-quick: $(VENV)/.installed
+	@echo '=== compat (quick): 4 devkitPro examples built, recompiled and run on the HLE ==='
+	@$(COMPAT_ENV) $(PYTHON) tests/compat/sweep.py $(COMPAT_QUICK)
+
+.PHONY: compat
+compat: $(VENV)/.installed
+	$(COMPAT_ENV) $(PYTHON) tests/compat/sweep.py $(COMPAT_ARGS)
 
 clean:
 	rm -rf out

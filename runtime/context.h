@@ -256,6 +256,10 @@ static inline void recomp_svc(Ctx *ctx, uint32_t number) { recomp_svc_handler(ct
 /* `udf`: a deliberate trap (e.g. __builtin_trap()); the guest wanted to crash. */
 void recomp_udf(Ctx *ctx, uint32_t addr) __attribute__((noreturn));
 
+/* An instruction that raises an Undefined Instruction exception on the
+   3DS's ARM11 (e.g. one for a coprocessor it doesn't have) was executed. */
+void recomp_undefined(Ctx *ctx, uint32_t addr, const char *text) __attribute__((noreturn));
+
 /* A call the compiler treated as never returning (nothing follows it) did return. */
 void recomp_no_return(Ctx *ctx, uint32_t addr) __attribute__((noreturn));
 
@@ -299,6 +303,20 @@ static inline uint32_t arm_sel(Ctx *ctx, uint32_t a, uint32_t b)
     for (int i = 0; i < 4; i++)
         r |= (((ctx->ge >> i) & 1) ? a : b) & (0xFFu << (8 * i));
     return r;
+}
+
+/* usat / ssat: clamp a signed value to n bits, unsigned (0 .. 2^n - 1) or
+   signed (-2^(n-1) .. 2^(n-1) - 1). */
+static inline uint32_t arm_usat(uint32_t x, uint32_t n)
+{
+    int64_t v = (int32_t)x, max = ((int64_t)1 << n) - 1;
+    return (uint32_t)(v < 0 ? 0 : v > max ? max : v);
+}
+
+static inline uint32_t arm_ssat(uint32_t x, uint32_t n)
+{
+    int64_t v = (int32_t)x, max = ((int64_t)1 << (n - 1)) - 1, min = -max - 1;
+    return (uint32_t)(int32_t)(v < min ? min : v > max ? max : v);
 }
 
 /* An indirect call/jump to an address no recompiled function starts at. */

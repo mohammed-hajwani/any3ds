@@ -66,6 +66,13 @@ void recomp_udf(Ctx *ctx, uint32_t addr)
     abort();
 }
 
+void recomp_undefined(Ctx *ctx, uint32_t addr, const char *text)
+{
+    fprintf(stderr, "recomp: guest executed `%s` at 0x%08" PRIx32 ", an undefined instruction on the 3DS's ARM11"
+            " (lr = 0x%08" PRIx32 ")\n", text, addr, ctx->r[14]);
+    abort();
+}
+
 void recomp_bad_call(Ctx *ctx, uint32_t addr)
 {
     fprintf(stderr,

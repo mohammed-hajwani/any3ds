@@ -19,7 +19,8 @@ static const char *svc_name(uint32_t n)
     case 0x13: return "CreateMutex";          case 0x14: return "ReleaseMutex";
     case 0x15: return "CreateSemaphore";      case 0x16: return "ReleaseSemaphore";
     case 0x17: return "CreateEvent";          case 0x18: return "SignalEvent";
-    case 0x19: return "ClearEvent";           case 0x1F: return "MapMemoryBlock";
+    case 0x19: return "ClearEvent";           case 0x1E: return "CreateMemoryBlock";
+    case 0x1F: return "MapMemoryBlock";
     case 0x20: return "UnmapMemoryBlock";     case 0x21: return "CreateAddressArbiter";
     case 0x22: return "ArbitrateAddress";     case 0x23: return "CloseHandle";
     case 0x24: return "WaitSynchronization1"; case 0x25: return "WaitSynchronizationN";
@@ -263,6 +264,19 @@ void hle_svc(Ctx *ctx, uint32_t n)
         GET_OR_FAIL(e, ctx->r[0], KO_EVENT);
         e->ev.signaled = 0;
         ctx->r[0] = RES_OK;
+        break;
+    }
+    case 0x1E: {    /* CreateMemoryBlock(&handle, addr, size, my perm, other perm): r0 other perm, r1 addr,
+                       r2 size, r3 my perm. Memory the app shares out of its own space, e.g. for sockets. */
+        if (!ctx->r[1]) {
+            fprintf(stderr, "hle: CreateMemoryBlock with a kernel-chosen address is not implemented\n");
+            exit(3);
+        }
+        KObj *m = kobj_new(KO_SHMEM, "app memory block");
+        m->shm.addr = ctx->r[1];
+        m->shm.size = ctx->r[2];
+        ctx->r[0] = RES_OK;
+        ctx->r[1] = handle_new(m);
         break;
     }
     case 0x1F: {    /* MapMemoryBlock(handle, addr, my perm, other perm) */
