@@ -1,0 +1,9 @@
+; Passes position and colour straight through (for the rasteriser tests).
+.out outpos position
+.out outclr color
+
+.proc main
+    mov outpos, v0
+    mov outclr, v1
+    end
+.end

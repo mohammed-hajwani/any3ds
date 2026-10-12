@@ -161,6 +161,82 @@ static void test_texture_copy(void)
     CHECK(mem[out + 64] == 0xEE, "copies exactly `size` bytes");
 }
 
+/* ---- the shader interpreter, on a program assembled by picasso ---- */
+
+/* Load a .shbin (DVLB): program code + operand descriptors from the DVLP,
+   the first DVLE's entry point and constants (as libctru's shbin.c reads
+   them). */
+static int load_shbin(const char *path, ShaderUnit *u, uint32_t *entry, uint16_t *bools, uint8_t ints[4][4])
+{
+    static uint32_t file[16384];
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    size_t n = fread(file, 1, sizeof file, f);
+    fclose(f);
+    if (n < 16 || memcmp(file, "DVLB", 4) != 0)
+        return 0;
+    uint32_t ndvle = file[1];
+    const uint32_t *dvlp = &file[2 + ndvle];
+    memset(u, 0, sizeof *u);
+    for (uint32_t i = 0; i < dvlp[3] && i < 4096; i++)
+        u->code[i] = dvlp[dvlp[2] / 4 + i];
+    for (uint32_t i = 0; i < dvlp[5] && i < 128; i++)
+        u->opdesc[i] = dvlp[dvlp[4] / 4 + 2 * i];
+    const uint32_t *dvle = &file[file[2] / 4];
+    *entry = dvle[2];
+    const uint32_t *consts = &dvle[dvle[6] / 4];
+    for (uint32_t i = 0; i < dvle[7]; i++) {
+        const uint32_t *c = &consts[5 * i];         /* u16 type, u16 id, u32 data[4] */
+        uint32_t type = c[0] & 0xFFFF, id = c[0] >> 16;
+        if (type == 0 && (c[1] & 1))
+            *bools |= (uint16_t)(1u << id);
+        else if (type == 1 && id < 4)
+            memcpy(ints[id], &c[1], 4);
+        else if (type == 2 && (id & 0xFF) < 96)
+            u->uniform[id & 0xFF] = (Vec4){ f24_to_f32(c[1]), f24_to_f32(c[2]), f24_to_f32(c[3]), f24_to_f32(c[4]) };
+    }
+    return 1;
+}
+
+static int vec_is(Vec4 v, float x, float y, float z, float w)
+{
+    return v.x == x && v.y == y && v.z == z && v.w == w;
+}
+
+#define CHECK_VEC(v, X, Y, Z, W, what)     CHECK(vec_is(v, X, Y, Z, W), "%s: got (%g, %g, %g, %g), want (%g, %g, %g, %g)", what,           (double)(v).x, (double)(v).y, (double)(v).z, (double)(v).w, (double)(X), (double)(Y), (double)(Z), (double)(W))
+
+static void test_shader(const char *shbin)
+{
+    static ShaderUnit unit;
+    uint32_t entry = 0;
+    uint16_t bools = 0;
+    uint8_t ints[4][4] = { { 0 } };
+    if (!load_shbin(shbin, &unit, &entry, &bools, ints)) {
+        CHECK(0, "can't load %s", shbin);
+        return;
+    }
+    ShaderRegs s;
+    memset(&s, 0, sizeof s);
+    s.v[0] = (Vec4){ 1, 2, 3, 4 };
+    s.v[1] = (Vec4){ 0.5f, -1, 2, 8 };
+    s.v[2] = (Vec4){ 10, 20, 30, 40 };
+    s.v[3] = (Vec4){ 2, 1, 0, 0 };
+    shader_exec(&unit, entry, bools, ints, &s);
+    CHECK_VEC(s.o[0], 1.5f, 1, 5, 12, "add");
+    CHECK_VEC(s.o[1], 2, 1, -3, 1, "mul by a constant");
+    CHECK_VEC(s.o[2], 4.5f, 36.5f, 12.5f, 2, "dp3, dp4, dph, rcp");
+    CHECK_VEC(s.o[3], 10.5f, 18, 36, 72, "mad");
+    CHECK_VEC(s.o[4], -4, -3, -2, -1, "negated swizzle -v0.wzyx");
+    CHECK_VEC(s.o[5], 1, 2, 2, 4, "max/min under write masks");
+    CHECK_VEC(s.o[6], 120, 121, 122, 123, "relative addressing c[a0.x]");
+    CHECK_VEC(s.o[7], 2, -1, 3, 7, "cmp + ifc/else, loop count, call + ifu");
+    CHECK_VEC(s.o[8], 2, -3, 0.25f, 1, "flr, rsq, sge");
+    CHECK_VEC(s.o[9], 8, 4, 0, 0, "ex2, lg2, slt, no negative zero");
+    CHECK(!signbit(s.o[9].w), "the zero is +0");
+    CHECK_VEC(s.o[10], 3, 1, 0, 0, "breakc leaves the loop");
+}
+
 /* ---- command lists ---- */
 static uint32_t cl_words[256], cl_n;
 
@@ -241,7 +317,108 @@ static void test_command_lists(void)
     CHECK(pica.reg[0x042] != 0xDEAD, "nothing runs after FINALIZE");
 }
 
-int main(void)
+/* ---- the rasteriser, through a real command list ---- */
+
+static uint32_t f24(float f) { return f32_to_f24(f); }
+
+/* Configure a 16x16 RGBA8 render target, the passthrough shader (v0 =
+   position, v1 = colour), immediate-mode triangles, additive blending. */
+static void raster_setup(const ShaderUnit *pass, uint32_t entry, int with_depth)
+{
+    pica.vsh = *pass;
+    const uint32_t vsh = REG_VSH_BASE;
+    cl_cmd(vsh + SH_INPUTBUFFER_CONFIG, 0xF, 0, (uint32_t[]){ 0xA0000001 }, 1);
+    cl_cmd(vsh + SH_ENTRYPOINT, 0xF, 0, (uint32_t[]){ 0x7FFF0000 | entry }, 1);
+    cl_cmd(vsh + SH_ATTRIBUTES_PERMUTATION_LOW, 0xF, 0, (uint32_t[]){ 0x10 }, 1);
+    cl_cmd(vsh + SH_OUTMAP_MASK, 0xF, 0, (uint32_t[]){ 0x3 }, 1);
+    cl_cmd(REG_SH_OUTMAP_TOTAL, 0xF, 0, (uint32_t[]){ 2 }, 1);
+    cl_cmd(REG_SH_OUTMAP_O0, 0xF, 1, (uint32_t[]){ 0x03020100, 0x0B0A0908 }, 2);
+    cl_cmd(REG_VSH_NUM_ATTR, 0xF, 0, (uint32_t[]){ 1 }, 1);
+    cl_cmd(REG_PRIMITIVE_CONFIG, 0xF, 0, (uint32_t[]){ 0x0001 }, 1);           /* triangles */
+    cl_cmd(REG_VIEWPORT_WIDTH, 0xF, 0, (uint32_t[]){ f24(8) }, 1);               /* width / 2 */
+    cl_cmd(REG_VIEWPORT_HEIGHT, 0xF, 0, (uint32_t[]){ f24(8) }, 1);
+    cl_cmd(REG_VIEWPORT_XY, 0xF, 0, (uint32_t[]){ 0 }, 1);
+    cl_cmd(REG_DEPTHMAP_ENABLE, 0xF, 0, (uint32_t[]){ 1 }, 1);
+    cl_cmd(REG_DEPTHMAP_SCALE, 0xF, 0, (uint32_t[]){ f24(-1) }, 1);             /* depth = -z/w */
+    cl_cmd(REG_DEPTHMAP_OFFSET, 0xF, 0, (uint32_t[]){ 0 }, 1);
+    cl_cmd(REG_COLORBUFFER_LOC, 0xF, 0, (uint32_t[]){ 0x20600000 >> 3 }, 1);     /* virtual 0x14600000 */
+    cl_cmd(REG_DEPTHBUFFER_LOC, 0xF, 0, (uint32_t[]){ 0x20700000 >> 3 }, 1);
+    cl_cmd(REG_COLORBUFFER_FORMAT, 0xF, 0, (uint32_t[]){ 2 }, 1);               /* RGBA8 */
+    cl_cmd(REG_DEPTHBUFFER_FORMAT, 0xF, 0, (uint32_t[]){ 2 }, 1);               /* 24-bit */
+    cl_cmd(REG_FRAMEBUFFER_DIM, 0xF, 0, (uint32_t[]){ 16 | 15 << 12 | 1u << 24 }, 1);
+    cl_cmd(REG_COLORBUFFER_READ, 0xF, 1, (uint32_t[]){ 0xF, 0xF, with_depth ? 2u : 0u, with_depth ? 2u : 0u }, 4);
+    cl_cmd(0x0C0, 0xF, 1, (uint32_t[]){ 0, 0, 0, 0, 0 }, 5);                     /* stage 0: primary colour */
+    for (uint32_t base = 0x0C8; base <= 0x0F8; base += base == 0x0D8 ? 0x18 : 8)
+        cl_cmd(base, 0xF, 1, (uint32_t[]){ 0x000F000F, 0, 0, 0, 0 }, 5);         /* the rest: previous */
+    cl_cmd(REG_COLOR_OPERATION, 0xF, 0, (uint32_t[]){ 0x00E40100 }, 1);          /* blend */
+    cl_cmd(REG_BLEND_FUNC, 0xF, 0, (uint32_t[]){ 1u << 16 | 1u << 20 | 1u << 24 }, 1);   /* src + dst */
+    cl_cmd(REG_DEPTH_COLOR_MASK, 0xF, 0, (uint32_t[]){ (with_depth ? 0x1041u | 4u << 4 : 0u) | 0xF00 }, 1);
+    cl_cmd(REG_FIXEDATTRIB_INDEX, 0xF, 0, (uint32_t[]){ 0xF }, 1);               /* immediate mode */
+}
+
+static void raster_vertex(float x, float y, float z, float r, float g, float b, float a)
+{
+    uint32_t w[3];
+    pack_f24x4(x, y, z, 1.0f, w);
+    cl_cmd(REG_FIXEDATTRIB_DATA0, 0xF, 1, w, 3);
+    pack_f24x4(r, g, b, a, w);
+    cl_cmd(REG_FIXEDATTRIB_DATA0, 0xF, 1, w, 3);
+}
+
+static Rgba fb_pixel(uint32_t x, uint32_t y)        /* y from the bottom, as the GPU counts */
+{
+    return color_decode(mem + 0x14600000 + 4 * tile_index(x, 15 - y, 16), PIXEL_RGBA8);
+}
+
+static void test_raster(const char *shbin)
+{
+    static ShaderUnit pass;
+    uint32_t entry = 0;
+    uint16_t bools = 0;
+    uint8_t ints[4][4];
+    if (!load_shbin(shbin, &pass, &entry, &bools, ints)) {
+        CHECK(0, "can't load %s", shbin);
+        return;
+    }
+
+    /* Two triangles sharing the square's diagonal, which runs through pixel
+       centres: with additive blending, a pixel drawn twice would show. */
+    memset(mem + 0x14600000, 0, 16 * 16 * 4);
+    raster_setup(&pass, entry, 0);
+    float q = 64.0f / 255;
+    raster_vertex(-0.5f, -0.5f, -0.5f, q, 0, 0, 1);
+    raster_vertex(0.5f, -0.5f, -0.5f, q, 0, 0, 1);
+    raster_vertex(0.5f, 0.5f, -0.5f, q, 0, 0, 1);
+    raster_vertex(-0.5f, -0.5f, -0.5f, q, 0, 0, 1);
+    raster_vertex(0.5f, 0.5f, -0.5f, q, 0, 0, 1);
+    raster_vertex(-0.5f, 0.5f, -0.5f, q, 0, 0, 1);
+    cl_run();
+    int once = 0, twice = 0, outside = 0;
+    for (uint32_t y = 0; y < 16; y++)
+        for (uint32_t x = 0; x < 16; x++) {
+            int r = fb_pixel(x, y).r, inside = x >= 4 && x < 12 && y >= 4 && y < 12;
+            once += inside && r == 64;
+            twice += r > 64;
+            outside += !inside && r != 0;
+        }
+    CHECK(once == 64 && twice == 0 && outside == 0,
+          "square = 8x8 pixels, each drawn once: %d once, %d twice, %d outside", once, twice, outside);
+
+    /* Depth: one triangle with z varying across it; the 24-bit depth at a
+       pixel is the screen-space interpolation of -z. */
+    memset(mem + 0x14700000, 0xFF, 16 * 16 * 4);
+    raster_setup(&pass, entry, 1);
+    raster_vertex(-1, -1, -0.2f, 1, 1, 1, 1);
+    raster_vertex(1, -1, -0.6f, 1, 1, 1, 1);
+    raster_vertex(-1, 1, -0.2f, 1, 1, 1, 1);
+    cl_run();
+    uint32_t d = 0;
+    memcpy(&d, mem + 0x14700000 + 3 * tile_index(4, 15 - 3, 16), 3);   /* pixel (4, 3): centre x = 4.5 */
+    float want = 0.2f + 0.4f * (4.5f / 16);                                 /* z changes along x only */
+    CHECK(fabsf((float)d / 0xFFFFFF - want) < 1e-3f, "depth at (4, 3) = %f, want %f", (double)d / 0xFFFFFF, (double)want);
+}
+
+int main(int argc, char **argv)
 {
     mem = guest_mem_alloc();
     gpu_init(mem);
@@ -252,6 +429,8 @@ int main(void)
     test_display_transfer();
     test_texture_copy();
     test_command_lists();
+    test_shader(argc > 1 ? argv[1] : "out/gpu/shader_test.shbin");
+    test_raster(argc > 2 ? argv[2] : "out/gpu/passthrough.shbin");
     guest_mem_free(mem);
     printf("%s: %d checks, %d failed\n", failures ? "FAIL" : "PASS", checks, failures);
     return failures != 0;

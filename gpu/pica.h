@@ -78,9 +78,22 @@ typedef struct {
 
     uint32_t lighting_lut[24][256];
     uint32_t fog_lut[128];
+    uint32_t proctex_lut[8][256];   /* noise, RGB map, alpha map, colour, colour difference */
+    uint32_t gas_lut[16];
 } Pica;
 
 extern Pica pica;
+
+/* A shader unit's registers while it runs one vertex (shader.c). */
+typedef struct {
+    Vec4 v[16], o[16], r[16];       /* inputs, outputs, temporaries */
+    int32_t a0x, a0y, aL;           /* address registers */
+    int cmpx, cmpy;                 /* condition flags set by CMP */
+} ShaderRegs;
+
+/* Run a unit's program from word `entry` until END. bools: b0-b15;
+   ints: i0-i3 as (x, y, z, w) bytes. */
+void shader_exec(const ShaderUnit *unit, uint32_t entry, uint16_t bools, const uint8_t ints[4][4], ShaderRegs *s);
 extern const char *const pica_reg_names[PICA_REGS];
 
 /* Run a command list (virtual address, size in bytes). */

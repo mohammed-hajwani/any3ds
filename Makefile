@@ -326,6 +326,7 @@ test-real: $(REAL)/real_arm_harness $(REAL)/real_thumb_harness $(REAL_DIFFS) $(R
 # Its unit tests check pieces against exact expected values: float24,
 # tiling, pixel formats, the GX fills and copies.
 
+DEVKITPRO ?= /opt/devkitpro
 GPU_SRC := $(wildcard gpu/*.c)
 GPU_DEP := $(GPU_SRC) $(wildcard gpu/*.h)
 
@@ -335,9 +336,13 @@ out/gpu:
 out/gpu/test_gpu: tests/gpu/test_gpu.c $(GPU_DEP) $(RUNTIME_DEP) | out/gpu
 	$(HOST_CC) $(HOST_FLAGS) -Igpu $< $(GPU_SRC) $(RUNTIME_SRC) -lm -o $@
 
-test-gpu: out/gpu/test_gpu
+# Shaders for the tests, assembled by devkitPro's picasso (real encodings).
+out/gpu/%.shbin: tests/gpu/%.v.pica | out/gpu
+	$(DEVKITPRO)/tools/bin/picasso -o $@ $<
+
+test-gpu: out/gpu/test_gpu out/gpu/shader_test.shbin out/gpu/passthrough.shbin
 	@echo '=== GPU: unit tests (tests/gpu/test_gpu.c) ==='
-	@./out/gpu/test_gpu
+	@./out/gpu/test_gpu out/gpu/shader_test.shbin out/gpu/passthrough.shbin
 
 # ---------------------------------------------------------------- M6
 #
@@ -348,7 +353,6 @@ test-gpu: out/gpu/test_gpu
 # the HLE kernel's threads and synchronisation (threads.c, against a golden
 # output) and its deadlock detection (deadlock.c).
 
-DEVKITPRO ?= /opt/devkitpro
 CTRU := $(DEVKITPRO)/libctru
 CTRU_FLAGS := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -O2 -mword-relocations \
               -ffunction-sections -I$(CTRU)/include

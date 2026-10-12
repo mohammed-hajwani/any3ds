@@ -134,8 +134,12 @@ static int reg_write(uint32_t id, uint32_t value, uint32_t mask)
         pica.reg[REG_FOG_LUT_INDEX] = (index + 1) & 0x7F;
         return NEXT;
     }
-    if (id >= REG_PROCTEX_LUT_DATA0 && id < REG_PROCTEX_LUT_DATA0 + 8)
-        gpu_fatal("procedural texture look-up tables are not implemented yet");
+    if (id >= REG_PROCTEX_LUT_DATA0 && id < REG_PROCTEX_LUT_DATA0 + 8) {
+        uint32_t index = pica.reg[REG_PROCTEX_LUT], table = index >> 8 & 7, entry = index & 0xFF;
+        pica.proctex_lut[table][entry] = value;
+        pica.reg[REG_PROCTEX_LUT] = (index & ~0xFFu) | ((entry + 1) & 0xFF);
+        return NEXT;
+    }
 
     switch (id) {
     case REG_FINALIZE:
@@ -161,8 +165,12 @@ static int reg_write(uint32_t id, uint32_t value, uint32_t mask)
         if (value & 1)
             pica_restart_primitive();
         return NEXT;
-    case REG_GAS_LUT_DATA:
-        gpu_fatal("gas rendering is not implemented yet");
+    case REG_GAS_LUT_DATA: {
+        uint32_t index = pica.reg[REG_GAS_LUT_INDEX] & 0xF;
+        pica.gas_lut[index] = value;
+        pica.reg[REG_GAS_LUT_INDEX] = (index + 1) & 0xF;
+        return NEXT;
+    }
     default:
         /* Configuration, read at draw time; and triggers with nothing to do
            here (cache flush/invalidate, post-vertex cache clear). */
