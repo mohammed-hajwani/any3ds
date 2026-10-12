@@ -52,6 +52,9 @@ uint32_t tile_index(uint32_t x, uint32_t y, uint32_t width);
 float    f24_to_f32(uint32_t v);
 uint32_t f32_to_f24(float f);               /* truncates, as libctru's f32tof24 does */
 
+/* Run a PICA command list: a stream of GPU register writes (regs.c). */
+void pica_run_command_list(uint32_t addr, uint32_t size);
+
 /* ---- GX commands (the 2D engines) ---- */
 
 /* Fill [start, end) with `value`; control bits 8-9 pick 16/24/32-bit

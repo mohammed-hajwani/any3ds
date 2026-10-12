@@ -7,6 +7,7 @@
 
 #include "context.h"
 #include "gpu.h"
+#include "pica.h"
 
 static int failures, checks;
 
@@ -160,6 +161,86 @@ static void test_texture_copy(void)
     CHECK(mem[out + 64] == 0xEE, "copies exactly `size` bytes");
 }
 
+/* ---- command lists ---- */
+static uint32_t cl_words[256], cl_n;
+
+static void cl_cmd(uint32_t id, uint32_t mask, int consecutive, const uint32_t *params, uint32_t count)
+{
+    cl_words[cl_n++] = params[0];
+    cl_words[cl_n++] = id | mask << 16 | (count - 1) << 20 | (uint32_t)consecutive << 31;
+    for (uint32_t i = 1; i < count; i++)
+        cl_words[cl_n++] = params[i];
+    if (cl_n & 1)
+        cl_words[cl_n++] = 0;       /* pad to 8 bytes */
+}
+
+static void cl_run(void)
+{
+    const uint32_t at = 0x14500000;
+    memcpy(mem + at, cl_words, cl_n * 4);
+    pica_run_command_list(at, cl_n * 4);
+    cl_n = 0;
+}
+
+/* libctru's float24 vec4 packing: x, y, z, w as 24-bit fields (x lowest),
+   sent as three words, highest first. */
+static void pack_f24x4(float x, float y, float z, float w, uint32_t out[3])
+{
+    uint8_t b[12];
+    uint32_t v[4] = { f32_to_f24(x), f32_to_f24(y), f32_to_f24(z), f32_to_f24(w) };
+    for (int i = 0; i < 4; i++)
+        memcpy(b + 3 * i, &v[i], 3);
+    uint32_t packed[3];
+    memcpy(packed, b, 12);
+    out[0] = packed[2];
+    out[1] = packed[1];
+    out[2] = packed[0];
+}
+
+static void test_command_lists(void)
+{
+    /* A plain write, then a masked write that only touches byte 1. */
+    cl_cmd(0x041, 0xF, 0, (uint32_t[]){ 0x11223344 }, 1);
+    cl_cmd(0x041, 0x2, 0, (uint32_t[]){ 0xAABBCCDD }, 1);
+    /* Consecutive mode: three registers in one command. */
+    cl_cmd(0x0C0, 0xF, 1, (uint32_t[]){ 1, 2, 3 }, 3);
+    /* Non-consecutive: shader code words all go to the code FIFO. */
+    cl_cmd(REG_VSH_BASE + SH_CODETRANSFER_INDEX, 0xF, 0, (uint32_t[]){ 10 }, 1);
+    cl_cmd(REG_VSH_BASE + SH_CODETRANSFER_DATA, 0xF, 0, (uint32_t[]){ 0xA, 0xB, 0xC }, 3);
+    /* Float uniforms: c5 and c6 in float32 mode (each sent w, z, y, x; the
+       index advances by itself), then c7 in float24 mode. */
+    cl_cmd(REG_VSH_BASE + SH_FLOATUNIFORM_INDEX, 0xF, 0, (uint32_t[]){ 0x80000005 }, 1);
+    float f[8] = { 4.0f, 3.0f, 2.0f, 1.0f, 8.0f, 7.0f, 6.0f, 5.0f };
+    uint32_t fw[8];
+    memcpy(fw, f, sizeof fw);
+    cl_cmd(REG_VSH_BASE + SH_FLOATUNIFORM_DATA, 0xF, 0, fw, 8);
+    uint32_t f24[3];
+    cl_cmd(REG_VSH_BASE + SH_FLOATUNIFORM_INDEX, 0xF, 0, (uint32_t[]){ 7 }, 1);
+    pack_f24x4(-1.5f, 0.25f, 8.0f, 100.0f, f24);
+    cl_cmd(REG_VSH_BASE + SH_FLOATUNIFORM_DATA, 0xF, 0, f24, 3);
+    /* A fixed attribute. */
+    cl_cmd(REG_FIXEDATTRIB_INDEX, 0xF, 0, (uint32_t[]){ 3 }, 1);
+    pack_f24x4(0.5f, 0.75f, -2.0f, 1.0f, f24);
+    cl_cmd(REG_FIXEDATTRIB_DATA0, 0xF, 1, f24, 3);
+    /* FINALIZE ends the list: the write after it must not happen. */
+    cl_cmd(REG_FINALIZE, 0xF, 0, (uint32_t[]){ 0x12345678 }, 1);
+    cl_cmd(0x042, 0xF, 0, (uint32_t[]){ 0xDEAD }, 1);
+    cl_run();
+
+    CHECK(pica.reg[0x041] == 0x1122CC44, "masked write keeps the other bytes: %08x", pica.reg[0x041]);
+    CHECK(pica.reg[0x0C0] == 1 && pica.reg[0x0C1] == 2 && pica.reg[0x0C2] == 3, "consecutive writes");
+    CHECK(pica.vsh.code[10] == 0xA && pica.vsh.code[11] == 0xB && pica.vsh.code[12] == 0xC, "shader code FIFO");
+    Vec4 c5 = pica.vsh.uniform[5], c6 = pica.vsh.uniform[6], c7 = pica.vsh.uniform[7], a3 = pica.fixed_attrib[3];
+    CHECK(c5.x == 1.0f && c5.y == 2.0f && c5.z == 3.0f && c5.w == 4.0f, "float32 uniform: %g %g %g %g",
+          c5.x, c5.y, c5.z, c5.w);
+    CHECK(c6.x == 5.0f && c6.w == 8.0f, "float32 uniform, index advanced: %g %g %g %g", c6.x, c6.y, c6.z, c6.w);
+    CHECK(c7.x == -1.5f && c7.y == 0.25f && c7.z == 8.0f && c7.w == 100.0f, "float24 uniform: %g %g %g %g",
+          c7.x, c7.y, c7.z, c7.w);
+    CHECK(a3.x == 0.5f && a3.y == 0.75f && a3.z == -2.0f && a3.w == 1.0f, "fixed attribute 3: %g %g %g %g",
+          a3.x, a3.y, a3.z, a3.w);
+    CHECK(pica.reg[0x042] != 0xDEAD, "nothing runs after FINALIZE");
+}
+
 int main(void)
 {
     mem = guest_mem_alloc();
@@ -170,6 +251,7 @@ int main(void)
     test_memory_fill();
     test_display_transfer();
     test_texture_copy();
+    test_command_lists();
     guest_mem_free(mem);
     printf("%s: %d checks, %d failed\n", failures ? "FAIL" : "PASS", checks, failures);
     return failures != 0;

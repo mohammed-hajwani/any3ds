@@ -146,8 +146,9 @@ static void run_gx_queue(void)
         case 5:     /* FlushCacheRegions: host memory is coherent */
             break;
         case 1:     /* ProcessCommandList(address, size, flags) */
-            gpu_fatal("GX ProcessCommandList (%" PRIu32 " bytes at %08" PRIx32 "): PICA command lists are not "
-                      "implemented yet", c[2], c[1]);
+            pica_run_command_list(c[1], c[2]);
+            push_interrupt(interrupts, EVENT_P3D);
+            break;
         default:
             gpu_fatal("GX command %" PRIu32, c[0] & 0xFF);
         }
