@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "pica.h"
+#include "texture.h"
 
 /* Vertex attributes by output semantic (SH_OUTMAP_Oi): position x/y/z/w,
    normal quaternion, colour r/g/b/a, texcoord0 u/v, texcoord1 u/v,
@@ -228,6 +229,17 @@ static void get_target(Target *t)
 
 typedef struct { int r, g, b, a; } Color;     /* 0..255 */
 
+/* What the colour combiners can read for one fragment: the interpolated
+   vertex colour and texture coordinates (with their screen-space
+   derivatives, for mipmapping); textures are sampled when first used. */
+typedef struct {
+    Color primary;
+    float tc[3][2], tc0w;
+    float d[3][4];                  /* per coordinate set: du/dx, dv/dx, du/dy, dv/dy */
+    Color tex[3];
+    int sampled;                    /* bit i: tex[i] is valid */
+} Frag;
+
 static const uint32_t tev_base[6] = { 0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8 };
 
 static Color unpack_color(uint32_t v)
@@ -237,17 +249,41 @@ static Color unpack_color(uint32_t v)
 
 static int clamp255(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
 
-static Color tev_source(uint32_t src, Color primary, Color prev, Color buffer, Color constant, int stage)
+/* Sample texture unit `unit` for this fragment (once). */
+static Color frag_texture(Frag *f, int unit)
+{
+    if (f->sampled >> unit & 1)
+        return f->tex[unit];
+    uint32_t config = pica.reg[REG_TEXUNIT_CONFIG];
+    if (!(config >> unit & 1))
+        gpu_fatal("a colour combiner reads texture %d, which is disabled", unit);
+    TexUnit t;
+    tex_unit_read(unit, &t);
+    /* Unit 2 can use texture coordinates 2 or 1. */
+    int set = unit == 2 && (config >> 13 & 1) ? 1 : unit;
+    const float *d = f->d[set];
+    float sx = hypotf(d[0] * (float)t.width, d[1] * (float)t.height);
+    float sy = hypotf(d[2] * (float)t.width, d[3] * (float)t.height);
+    float scale = fmaxf(sx, sy), lod = scale > 0 ? log2f(scale) : -100.0f;
+    Rgba c = tex_sample(&t, f->tc[set][0], f->tc[set][1], f->tc0w, lod);
+    f->tex[unit] = (Color){ c.r, c.g, c.b, c.a };
+    f->sampled |= 1 << unit;
+    return f->tex[unit];
+}
+
+static Color tev_source(uint32_t src, Frag *f, Color prev, Color buffer, Color constant, int stage)
 {
     switch (src) {
-    case 0:  return primary;
+    case 0:  return f->primary;
     case 13: return buffer;
     case 14: return constant;
     case 15: return stage ? prev : (Color){ 0, 0, 0, 0 };
     case 1:
     case 2:  gpu_fatal("colour combiner %d uses fragment lighting (source %" PRIu32 "): not implemented yet", stage, src);
-    case 3: case 4: case 5: case 6:
-        gpu_fatal("colour combiner %d uses texture %" PRIu32 ": textures are not implemented yet", stage, src - 3);
+    case 3: case 4: case 5:
+        return frag_texture(f, (int)src - 3);
+    case 6:
+        gpu_fatal("colour combiner %d uses texture 3, the procedural texture unit: not implemented yet", stage);
     default: gpu_fatal("colour combiner %d source %" PRIu32, stage, src);
     }
 }
@@ -299,7 +335,7 @@ static int sources_used(uint32_t mode)
     return mode == 0 ? 1 : (mode == 4 || mode == 8 || mode == 9) ? 3 : 2;
 }
 
-static Color run_combiners(Color primary)
+static Color run_combiners(Frag *f)
 {
     Color prev = { 0, 0, 0, 0 }, buffer = unpack_color(pica.reg[REG_TEXENV_BUFFER_COLOR]);
     uint32_t update = pica.reg[REG_TEXENV_UPDATE_BUFFER];
@@ -316,12 +352,12 @@ static Color run_combiners(Color primary)
         int rgb[3][3], alpha[3];
         for (int k = 0; k < 3; k++) {
             if (k < nr) {
-                in[k] = tev_source(source >> (4 * k) & 0xF, primary, prev, buffer, constant, i);
+                in[k] = tev_source(source >> (4 * k) & 0xF, f, prev, buffer, constant, i);
                 for (int ch = 0; ch < 3; ch++)
                     rgb[k][ch] = rgb_operand(in[k], operand >> (4 * k) & 0xF, ch);
             }
             if (k < na)
-                alpha[k] = alpha_operand(tev_source(source >> (16 + 4 * k) & 0xF, primary, prev, buffer, constant, i),
+                alpha[k] = alpha_operand(tev_source(source >> (16 + 4 * k) & 0xF, f, prev, buffer, constant, i),
                                          operand >> (12 + 4 * k) & 7);
         }
         if (rgb_mode == 6 || rgb_mode == 7) {       /* dot3: 4 * sum((a - 0.5)(b - 0.5)) */
@@ -452,12 +488,12 @@ static uint32_t stencil_op(uint32_t op, uint32_t old, uint32_t ref)
 }
 
 /* One fragment at render-target pixel (x, y) (y measured from the bottom). */
-static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Color primary)
+static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Frag *f)
 {
     /* Memory rows go top to bottom; the window's y = 0 is the bottom row. */
     uint32_t idx = tile_index(x, t->height - 1 - y, t->width);
 
-    Color c = run_combiners(primary);
+    Color c = run_combiners(f);
 
     uint32_t at = pica.reg[REG_ALPHA_TEST];
     if ((at & 1) && !test(at >> 4 & 7, (uint32_t)c.a, at >> 8 & 0xFF))
@@ -563,6 +599,19 @@ static int top_left(float ax, float ay, float bx, float by)
     return (ay == by && bx < ax) || by < ay;
 }
 
+/* The attributes at window position (px, py), perspective-correct:
+   interpolate a/w and 1/w linearly, then divide. */
+static void interpolate(const WinVertex *v0, const WinVertex *v1, const WinVertex *v2, float area,
+                        float px, float py, float out[NSEM])
+{
+    float b0 = edge(v1->x, v1->y, v2->x, v2->y, px, py) / area;
+    float b1 = edge(v2->x, v2->y, v0->x, v0->y, px, py) / area;
+    float b2 = 1.0f - b0 - b1;
+    float inv_w = b0 * v0->inv_w + b1 * v1->inv_w + b2 * v2->inv_w;
+    for (int k = 0; k < NSEM; k++)
+        out[k] = (b0 * v0->a[k] + b1 * v1->a[k] + b2 * v2->a[k]) / inv_w;
+}
+
 static void raster_triangle(const Target *t, const WinVertex *v0, const WinVertex *v1, const WinVertex *v2)
 {
     float area = edge(v0->x, v0->y, v1->x, v1->y, v2->x, v2->y);
@@ -607,15 +656,31 @@ static void raster_triangle(const Target *t, const WinVertex *v0, const WinVerte
                 continue;
             float b0 = w0 / area, b1 = w1 / area, b2 = w2 / area;
             float z = b0 * v0->z + b1 * v1->z + b2 * v2->z;            /* depth: linear in screen space */
-            float inv_w = b0 * v0->inv_w + b1 * v1->inv_w + b2 * v2->inv_w;
+            float a[NSEM], ax[NSEM], ay[NSEM];
+            interpolate(v0, v1, v2, area, px, py, a);
+            interpolate(v0, v1, v2, area, px + 1, py, ax);         /* neighbours: texture derivatives */
+            interpolate(v0, v1, v2, area, px, py + 1, ay);
+            Frag f;
             float col[4];
             for (int ch = 0; ch < 4; ch++) {
-                float a = (b0 * v0->a[SEM_COLOR + ch] + b1 * v1->a[SEM_COLOR + ch] + b2 * v2->a[SEM_COLOR + ch]) / inv_w;
-                col[ch] = a < 0 ? 0 : a > 1 ? 1 : a;
+                float c = a[SEM_COLOR + ch];
+                col[ch] = c < 0 ? 0 : c > 1 ? 1 : c;
             }
-            Color primary = { (int)lroundf(col[0] * 255), (int)lroundf(col[1] * 255),
-                              (int)lroundf(col[2] * 255), (int)lroundf(col[3] * 255) };
-            fragment(t, (uint32_t)x, (uint32_t)y, z, primary);
+            f.primary = (Color){ (int)lroundf(col[0] * 255), (int)lroundf(col[1] * 255),
+                                 (int)lroundf(col[2] * 255), (int)lroundf(col[3] * 255) };
+            static const int sems[3] = { SEM_TC0, SEM_TC1, SEM_TC2 };
+            for (int k = 0; k < 3; k++) {
+                int s = sems[k];
+                f.tc[k][0] = a[s];
+                f.tc[k][1] = a[s + 1];
+                f.d[k][0] = ax[s] - a[s];
+                f.d[k][1] = ax[s + 1] - a[s + 1];
+                f.d[k][2] = ay[s] - a[s];
+                f.d[k][3] = ay[s + 1] - a[s + 1];
+            }
+            f.tc0w = a[SEM_TC0W];
+            f.sampled = 0;
+            fragment(t, (uint32_t)x, (uint32_t)y, z, &f);
         }
 }
 

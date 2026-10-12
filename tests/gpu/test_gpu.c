@@ -8,6 +8,7 @@
 #include "context.h"
 #include "gpu.h"
 #include "pica.h"
+#include "texture.h"
 
 static int failures, checks;
 
@@ -418,6 +419,111 @@ static void test_raster(const char *shbin)
     CHECK(fabsf((float)d / 0xFFFFFF - want) < 1e-3f, "depth at (4, 3) = %f, want %f", (double)d / 0xFFFFFF, (double)want);
 }
 
+/* ---- textures ---- */
+
+static int rgba_is(Rgba c, int r, int g, int b, int a)
+{
+    return c.r == r && c.g == g && c.b == b && c.a == a;
+}
+
+#define CHECK_RGBA(c, R, G, B, A, what)     CHECK(rgba_is(c, R, G, B, A), "%s: got (%d, %d, %d, %d), want (%d, %d, %d, %d)", what,           (c).r, (c).g, (c).b, (c).a, R, G, B, A)
+
+static void test_texture_formats(void)
+{
+    uint8_t buf[64 * 4];
+    /* Texel (1, 0) is index 1 in Morton order; (0, 1) is index 2. */
+    memset(buf, 0, sizeof buf);
+    buf[4 * 1 + 0] = 0x44; buf[4 * 1 + 1] = 0x33; buf[4 * 1 + 2] = 0x22; buf[4 * 1 + 3] = 0x11;
+    CHECK_RGBA(tex_decode(buf, 0, 8, 1, 0), 0x11, 0x22, 0x33, 0x44, "RGBA8 stored A, B, G, R");
+    memset(buf, 0, sizeof buf);
+    buf[2 * 2 + 0] = 0x80; buf[2 * 2 + 1] = 0xC0;                         /* IA8: A, then I */
+    CHECK_RGBA(tex_decode(buf, 5, 8, 0, 1), 0xC0, 0xC0, 0xC0, 0x80, "IA8");
+    CHECK_RGBA(tex_decode(buf, 6, 8, 0, 1), 0xC0, 0x80, 0, 255, "HILO8: red = high byte");
+    memset(buf, 0, sizeof buf);
+    buf[2] = 0x7F;
+    CHECK_RGBA(tex_decode(buf, 7, 8, 0, 1), 0x7F, 0x7F, 0x7F, 255, "I8");
+    CHECK_RGBA(tex_decode(buf, 8, 8, 0, 1), 0, 0, 0, 0x7F, "A8");
+    buf[1] = 0xA5;                                                        /* IA44: I high, A low */
+    CHECK_RGBA(tex_decode(buf, 9, 8, 1, 0), 0xAA, 0xAA, 0xAA, 0x55, "IA44");
+    memset(buf, 0, sizeof buf);
+    buf[0] = 0x3C;                                                        /* texels 0 (low) and 1 (high) */
+    CHECK_RGBA(tex_decode(buf, 10, 8, 0, 0), 0xCC, 0xCC, 0xCC, 255, "I4, even texel = low nibble");
+    CHECK_RGBA(tex_decode(buf, 11, 8, 1, 0), 0, 0, 0, 0x33, "A4, odd texel = high nibble");
+}
+
+static void test_etc1(void)
+{
+    /* Individual mode, side by side: colours (A,5,3) and (1,2,3) as 4-bit,
+       tables 1 and 0. */
+    uint64_t b = 0;
+    b |= (uint64_t)0xA << 60 | (uint64_t)0x1 << 56 | (uint64_t)0x5 << 52 | (uint64_t)0x2 << 48;
+    b |= (uint64_t)0x3 << 44 | (uint64_t)0x3 << 40 | (uint64_t)1 << 37 | (uint64_t)0 << 34;
+    b |= (uint64_t)1 << 29 | (uint64_t)1 << 13;                         /* pixel (3, 1): index 13 = -large */
+    CHECK_RGBA(etc1_pixel(b, 0, 0), 0xAA + 5, 0x55 + 5, 0x33 + 5, 255, "ETC1 individual, +small modifier");
+    CHECK_RGBA(etc1_pixel(b, 3, 1), 0x11 - 8, 0x22 - 8, 0x33 - 8, 255, "ETC1 second subblock, -large modifier");
+    /* Differential mode, stacked (flip): R1 = 16, dR = -1, B1 = 31; table 7
+       for the bottom half. */
+    b = (uint64_t)16 << 59 | (uint64_t)7 << 56 | (uint64_t)31 << 43 | (uint64_t)7 << 34 | (uint64_t)1 << 33 | 1ull << 32;
+    CHECK_RGBA(etc1_pixel(b, 1, 3), 15 * 8 + 3 + 47, 47, 255, 255, "ETC1 differential + flip");
+    CHECK_RGBA(etc1_pixel(b, 1, 0), 16 * 8 + 4 + 2, 2, 255, 255, "ETC1 differential, first subblock");
+
+    /* An 8x8 ETC1A4 texture: four 16-byte blocks in Z order. Block 3 (the
+       bottom-right 4x4 in memory) is solid (17, 34, 51) + 2 with alpha 0x9. */
+    uint8_t tex[64];
+    memset(tex, 0, sizeof tex);
+    uint64_t alpha = 0x9999999999999999ull, solid = (uint64_t)1 << 60 | (uint64_t)2 << 52 | (uint64_t)3 << 44;
+    memcpy(tex + 48, &alpha, 8);
+    memcpy(tex + 56, &solid, 8);
+    CHECK_RGBA(tex_decode(tex, 13, 8, 5, 6), 17 + 2, 34 + 2, 51 + 2, 0x99, "ETC1A4 block 3 at (5, 6)");
+}
+
+static void test_texture_sampling(void)
+{
+    /* An 8x8 RGBA8 texture where texel (x, y) (y = 0 at the bottom) has
+       red = 32x, green = 32y. */
+    const uint32_t at = 0x14800000;
+    for (uint32_t y = 0; y < 8; y++)
+        for (uint32_t x = 0; x < 8; x++)
+            color_encode(mem + at + 4 * tile_index(x, 7 - y, 8), PIXEL_RGBA8, (Rgba){ (uint8_t)(32 * x), (uint8_t)(32 * y), 0, 255 });
+    TexUnit t = { .addr = { 0x20800000 }, .width = 8, .height = 8, .format = 0, .border = 0xFF0000FF };
+    float c3 = 3.5f / 8, c6 = 6.5f / 8;
+    t.param = 2u << 12 | 2u << 8;                                           /* repeat, nearest */
+    CHECK_RGBA(tex_sample(&t, c3, c6, 0, -10), 96, 192, 0, 255, "nearest texel (3, 6); t = 0 is the bottom");
+    CHECK_RGBA(tex_sample(&t, 1 + c3, c6 - 2, 0, -10), 96, 192, 0, 255, "repeat");
+    t.param = 3u << 12 | 3u << 8;                                           /* mirrored repeat */
+    CHECK_RGBA(tex_sample(&t, -c3, c6, 0, -10), 96, 192, 0, 255, "mirrored repeat");
+    t.param = 0;                                                            /* clamp to edge */
+    CHECK_RGBA(tex_sample(&t, 5, c6, 0, -10), 224, 192, 0, 255, "clamp to edge");
+    t.param = 1u << 12 | 1u << 8;                                           /* clamp to border */
+    CHECK_RGBA(tex_sample(&t, 5, c6, 0, -10), 255, 0, 0, 255, "clamp to border uses the border colour");
+    t.param = 1u << 1;                                                      /* linear magnification */
+    CHECK_RGBA(tex_sample(&t, 4.0f / 8, c6, 0, -10), 112, 192, 0, 255, "linear: halfway between x = 3 and 4");
+
+    /* Mipmaps: 16x16 level 0 all red, 8x8 level 1 all green right after it. */
+    const uint32_t mip = 0x14810000;
+    for (uint32_t i = 0; i < 256; i++)
+        color_encode(mem + mip + 4 * i, PIXEL_RGBA8, (Rgba){ 255, 0, 0, 255 });
+    for (uint32_t i = 0; i < 64; i++)
+        color_encode(mem + mip + 1024 + 4 * i, PIXEL_RGBA8, (Rgba){ 0, 255, 0, 255 });
+    TexUnit m = { .addr = { 0x20810000 }, .width = 16, .height = 16, .format = 0, .lod = 1u << 16 };
+    CHECK_RGBA(tex_sample(&m, 0.5f, 0.5f, 0, 0.3f), 255, 0, 0, 255, "lod 0.3 picks level 0");
+    CHECK_RGBA(tex_sample(&m, 0.5f, 0.5f, 0, 0.8f), 0, 255, 0, 255, "lod 0.8 picks level 1");
+    CHECK_RGBA(tex_sample(&m, 0.5f, 0.5f, 0, 5.0f), 0, 255, 0, 255, "lod clamped to the max level");
+
+    /* Cube map: six 8x8 faces, each one solid colour (face i: red = 40i). */
+    TexUnit cube = { .width = 8, .height = 8, .format = 0, .type = 1 };
+    for (uint32_t f = 0; f < 6; f++) {
+        uint32_t face = 0x14820000 + 256 * f;
+        for (uint32_t i = 0; i < 64; i++)
+            color_encode(mem + face + 4 * i, PIXEL_RGBA8, (Rgba){ (uint8_t)(40 * f), 0, 0, 255 });
+        cube.addr[f] = face - 0x14000000 + 0x20000000;
+    }
+    CHECK(tex_sample(&cube, 1, 0.1f, 0.2f, -10).r == 0, "+X face");
+    CHECK(tex_sample(&cube, -1, 0.1f, 0.2f, -10).r == 40, "-X face");
+    CHECK(tex_sample(&cube, 0.1f, -1, 0.2f, -10).r == 120, "-Y face");
+    CHECK(tex_sample(&cube, 0.1f, 0.2f, 1, -10).r == 160, "+Z face");
+}
+
 int main(int argc, char **argv)
 {
     mem = guest_mem_alloc();
@@ -429,6 +535,9 @@ int main(int argc, char **argv)
     test_display_transfer();
     test_texture_copy();
     test_command_lists();
+    test_texture_formats();
+    test_etc1();
+    test_texture_sampling();
     test_shader(argc > 1 ? argv[1] : "out/gpu/shader_test.shbin");
     test_raster(argc > 2 ? argv[2] : "out/gpu/passthrough.shbin");
     guest_mem_free(mem);
