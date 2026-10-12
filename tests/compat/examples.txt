@@ -26,22 +26,22 @@ graphics/gpu/2d_shapes               gpu          runs
 graphics/gpu/both_screens            gpu          runs
 graphics/gpu/composite_scene         gpu          stops
 graphics/gpu/cubemap                 gpu          runs
-graphics/gpu/fragment_light          gpu          stops
+graphics/gpu/fragment_light          gpu          runs
 graphics/gpu/geoshader               gpu          stops
 graphics/gpu/gpusprites              gpu          runs
 graphics/gpu/immediate               gpu          runs
-graphics/gpu/lenny                   gpu          stops
+graphics/gpu/lenny                   gpu          runs
 graphics/gpu/loop_subdivision        gpu          stops
 graphics/gpu/mipmap_fog              gpu          runs
 graphics/gpu/multiple_buf            gpu          runs
-graphics/gpu/normal_mapping          gpu          stops
+graphics/gpu/normal_mapping          gpu          runs
 graphics/gpu/particles               gpu          stops
 graphics/gpu/proctex                 gpu          stops
 graphics/gpu/simple_tri              gpu          runs
 graphics/gpu/stereoscopic_2d         gpu          runs
 graphics/gpu/textured_cube           gpu          runs
-graphics/gpu/toon_shading            gpu          stops
-graphics/gpu/wide_mode_3d            gpu          stops
+graphics/gpu/toon_shading            gpu          runs
+graphics/gpu/wide_mode_3d            gpu          runs
 graphics/printing/both-screen-text   console      runs
 graphics/printing/colored-text       console      runs
 graphics/printing/custom-font        gpu          stops
@@ -65,7 +65,7 @@ network/uds                          network      runs
 nfc                                  nfc          runs
 physics/box2d                        portlib      build-failed
 qtm/eye_position                     qtm          build-failed
-qtm/lenny_qtm_movement_naive         qtm          stops
+qtm/lenny_qtm_movement_naive         qtm          runs
 romfs                                console      runs
 sdmc                                 framebuffer  runs          --sdmc . --hold 60:2
 templates/application                console      runs

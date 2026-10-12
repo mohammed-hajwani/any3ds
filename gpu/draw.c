@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "pica.h"
+#include "lighting.h"
 #include "texture.h"
 
 /* Vertex attributes by output semantic (SH_OUTMAP_Oi): position x/y/z/w,
@@ -238,6 +239,9 @@ typedef struct {
     float d[3][4];                  /* per coordinate set: du/dx, dv/dx, du/dy, dv/dy */
     Color tex[3];
     int sampled;                    /* bit i: tex[i] is valid */
+    float quat[4], view[3];         /* for fragment lighting */
+    Color light[2];                 /* fragment primary / secondary colour */
+    int lit;
 } Frag;
 
 static const uint32_t tev_base[6] = { 0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8 };
@@ -271,6 +275,27 @@ static Color frag_texture(Frag *f, int unit)
     return f->tex[unit];
 }
 
+/* Fragment lighting's primary (0) or secondary (1) colour. */
+static Color frag_light(Frag *f, int which)
+{
+    if (!f->lit) {
+        if (!(pica.reg[REG_LIGHTING_ENABLE0] & 1))
+            gpu_fatal("a colour combiner reads fragment lighting, which is disabled");
+        uint32_t c0 = pica.reg[0x1C3];
+        Rgba bump, p, s;
+        int bumped = (c0 >> 28 & 3) != 0;
+        if (bumped) {
+            Color t = frag_texture(f, (int)(c0 >> 22 & 3));
+            bump = (Rgba){ (uint8_t)t.r, (uint8_t)t.g, (uint8_t)t.b, (uint8_t)t.a };
+        }
+        lighting_compute(f->quat, f->view, bumped ? &bump : NULL, &p, &s);
+        f->light[0] = (Color){ p.r, p.g, p.b, p.a };
+        f->light[1] = (Color){ s.r, s.g, s.b, s.a };
+        f->lit = 1;
+    }
+    return f->light[which];
+}
+
 /* Texture 3: the procedural texture, on texture coordinates 0, 1 or 2. */
 static Color frag_proctex(Frag *f)
 {
@@ -292,7 +317,7 @@ static Color tev_source(uint32_t src, Frag *f, Color prev, Color buffer, Color c
     case 14: return constant;
     case 15: return stage ? prev : (Color){ 0, 0, 0, 0 };
     case 1:
-    case 2:  gpu_fatal("colour combiner %d uses fragment lighting (source %" PRIu32 "): not implemented yet", stage, src);
+    case 2:  return frag_light(f, (int)src - 1);
     case 3: case 4: case 5:
         return frag_texture(f, (int)src - 3);
     case 6:
@@ -613,8 +638,6 @@ write_stencil:
 
 static void check_unsupported(void)
 {
-    if (pica.reg[REG_LIGHTING_ENABLE0] & 1)
-        gpu_fatal("fragment lighting is not implemented yet");
     uint32_t fog = pica.reg[REG_TEXENV_UPDATE_BUFFER] & 7;
     if (fog && fog != 5)
         gpu_fatal("%s is not implemented yet", fog == 7 ? "gas" : "fog/gas mode");
@@ -718,6 +741,11 @@ static void raster_triangle(const Target *t, const WinVertex *v0, const WinVerte
             }
             f.tc0w = a[SEM_TC0W];
             f.sampled = 0;
+            for (int k = 0; k < 4; k++)
+                f.quat[k] = a[SEM_QUAT + k];
+            for (int k = 0; k < 3; k++)
+                f.view[k] = a[SEM_VIEW + k];
+            f.lit = 0;
             fragment(t, (uint32_t)x, (uint32_t)y, z, &f);
         }
 }
