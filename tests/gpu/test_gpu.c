@@ -496,6 +496,7 @@ static void test_texture_sampling(void)
     CHECK_RGBA(tex_sample(&t, 5, c6, 0, -10), 224, 192, 0, 255, "clamp to edge");
     t.param = 1u << 12 | 1u << 8;                                           /* clamp to border */
     CHECK_RGBA(tex_sample(&t, 5, c6, 0, -10), 255, 0, 0, 255, "clamp to border uses the border colour");
+    CHECK_RGBA(tex_sample(&t, c3, c6, 0, -10), 96, 192, 0, 255, "clamp to border: inside, the texel itself");
     t.param = 1u << 1;                                                      /* linear magnification */
     CHECK_RGBA(tex_sample(&t, 4.0f / 8, c6, 0, -10), 112, 192, 0, 255, "linear: halfway between x = 3 and 4");
 

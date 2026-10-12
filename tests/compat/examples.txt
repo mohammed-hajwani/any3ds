@@ -22,13 +22,13 @@ camera/image                         camera       runs
 camera/video                         camera       runs
 get_system_language                  console      runs
 graphics/bitmap/24bit-color          framebuffer  build-failed
-graphics/gpu/2d_shapes               gpu          stops
+graphics/gpu/2d_shapes               gpu          runs
 graphics/gpu/both_screens            gpu          runs
 graphics/gpu/composite_scene         gpu          stops
 graphics/gpu/cubemap                 gpu          runs
 graphics/gpu/fragment_light          gpu          stops
 graphics/gpu/geoshader               gpu          stops
-graphics/gpu/gpusprites              gpu          stops
+graphics/gpu/gpusprites              gpu          runs
 graphics/gpu/immediate               gpu          runs
 graphics/gpu/lenny                   gpu          stops
 graphics/gpu/loop_subdivision        gpu          stops
@@ -38,7 +38,7 @@ graphics/gpu/normal_mapping          gpu          stops
 graphics/gpu/particles               gpu          stops
 graphics/gpu/proctex                 gpu          stops
 graphics/gpu/simple_tri              gpu          runs
-graphics/gpu/stereoscopic_2d         gpu          stops
+graphics/gpu/stereoscopic_2d         gpu          runs
 graphics/gpu/textured_cube           gpu          runs
 graphics/gpu/toon_shading            gpu          stops
 graphics/gpu/wide_mode_3d            gpu          stops

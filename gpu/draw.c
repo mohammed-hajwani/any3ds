@@ -271,6 +271,19 @@ static Color frag_texture(Frag *f, int unit)
     return f->tex[unit];
 }
 
+/* Texture 3: the procedural texture, on texture coordinates 0, 1 or 2. */
+static Color frag_proctex(Frag *f)
+{
+    uint32_t config = pica.reg[REG_TEXUNIT_CONFIG];
+    if (!(config >> 10 & 1))
+        gpu_fatal("a colour combiner reads the procedural texture, which is disabled");
+    uint32_t set = config >> 8 & 3;
+    if (set > 2)
+        gpu_fatal("procedural texture coordinates %" PRIu32, set);
+    Rgba c = proctex_sample(f->tc[set][0], f->tc[set][1]);
+    return (Color){ c.r, c.g, c.b, c.a };
+}
+
 static Color tev_source(uint32_t src, Frag *f, Color prev, Color buffer, Color constant, int stage)
 {
     switch (src) {
@@ -283,7 +296,7 @@ static Color tev_source(uint32_t src, Frag *f, Color prev, Color buffer, Color c
     case 3: case 4: case 5:
         return frag_texture(f, (int)src - 3);
     case 6:
-        gpu_fatal("colour combiner %d uses texture 3, the procedural texture unit: not implemented yet", stage);
+        return frag_proctex(f);
     default: gpu_fatal("colour combiner %d source %" PRIu32, stage, src);
     }
 }

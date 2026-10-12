@@ -151,7 +151,10 @@ static int wrap(int c, int size, uint32_t mode, int *border)
 {
     switch (mode) {
     case 0:  return c < 0 ? 0 : c >= size ? size - 1 : c;                  /* clamp to edge */
-    case 1:  if (c < 0 || c >= size) *border = 1; return 0;                /* clamp to border */
+    case 1:                                                                /* clamp to border */
+        if (c < 0 || c >= size)
+            *border = 1;
+        return c;
     case 2:  return ((c % size) + size) % size;                            /* repeat */
     case 3: {                                                              /* mirrored repeat */
         int period = 2 * size, m = ((c % period) + period) % period;
@@ -262,4 +265,92 @@ Rgba tex_sample(const TexUnit *t, float u, float v, float w, float lod)
                     (uint8_t)lroundf(c.b + (d.b - c.b) * f), (uint8_t)lroundf(c.a + (d.a - c.a) * f) };
     }
     return c;
+}
+
+/* ---- texture unit 3: procedural textures ----
+ * (3dbrew: GPU/Procedural_Texture_Generation and the PROCTEX registers.)
+ * The coordinates (u, v) are wrapped per direction, turned into one value
+ * g by a base-shape function (u, u^2, (u + v) / 2, sqrt(u^2 + v^2), ...),
+ * mapped through a 128-entry table F, and F(g) picks a colour from the
+ * colour table. With "separate alpha", alpha is its own F(g) directly.
+ * The noise module and the coordinate shifts are not publicly documented,
+ * so a texture that enables them stops by name rather than guessing. */
+
+static float proctex_wrap(float c, uint32_t mode)
+{
+    switch (mode) {
+    case 0:  return c > 1 ? 0 : fabsf(c);                       /* clamp to zero */
+    case 1:  return fminf(fabsf(c), 1);                         /* clamp to edge */
+    case 2:  return fabsf(c) - floorf(fabsf(c));                /* symmetrical repeat */
+    case 3: {                                                   /* mirrored repeat */
+        float m = fmodf(fabsf(c), 2);
+        return m <= 1 ? m : 2 - m;
+    }
+    default: gpu_fatal("procedural texture clamp mode %" PRIu32 " is not implemented", mode);
+    }
+}
+
+static float proctex_shape(uint32_t fn, float u, float v)
+{
+    switch (fn) {
+    case 0:  return u;
+    case 1:  return u * u;
+    case 2:  return v;
+    case 3:  return v * v;
+    case 4:  return (u + v) / 2;
+    case 5:  return (u * u + v * v) / 2;
+    case 6:  return sqrtf(u * u + v * v);
+    case 7:  return fminf(u, v);
+    case 8:  return fmaxf(u, v);
+    default: gpu_fatal("procedural texture base shape %" PRIu32 " is not implemented", fn);
+    }
+}
+
+/* A 128-entry mapping table: 12-bit value + 12-bit signed difference to
+   the next entry, interpolated. Returns 0..1. */
+static float proctex_map(const uint32_t *table, float g)
+{
+    float x = fminf(fmaxf(g, 0), 1) * 128;
+    int i = x >= 127 ? 127 : (int)x;
+    float frac = x - (float)i;
+    uint32_t e = table[i];
+    int value = (int)(e & 0xFFF), diff = (int)((e >> 12 & 0xFFF) << 20) >> 20;
+    float f = ((float)value + (float)diff * frac) / 4096;
+    return fminf(fmaxf(f, 0), 1);
+}
+
+Rgba proctex_sample(float u, float v)
+{
+    uint32_t p0 = pica.reg[0x0A8], p4 = pica.reg[0x0AC], p5 = pica.reg[0x0AD];
+    if (p0 >> 15 & 1)
+        gpu_fatal("procedural texture noise is not implemented (not publicly documented)");
+    if (p0 >> 16 & 0xF)
+        gpu_fatal("procedural texture coordinate shift is not implemented (not publicly documented)");
+    u = proctex_wrap(u, p0 & 7);
+    v = proctex_wrap(v, p0 >> 3 & 7);
+    float g_rgb = proctex_shape(p0 >> 6 & 0xF, u, v);
+    float f_rgb = proctex_map(pica.proctex_lut[2], g_rgb);
+
+    /* The colour table: `width` entries from the base-level offset;
+       linear filtering adds the (halved) difference table. */
+    uint32_t width = p4 >> 11 & 0xFF, offset = p5 & 0xFF, filter = p4 & 7;
+    if (!width)
+        width = 1;
+    float x = f_rgb * (float)(width - 1);
+    uint32_t i = (uint32_t)x;
+    float frac = x - (float)i;
+    uint32_t c = pica.proctex_lut[4][(offset + i) & 0xFF], d = pica.proctex_lut[5][(offset + i) & 0xFF];
+    uint8_t out[4];
+    for (int k = 0; k < 4; k++) {
+        float base = (float)(c >> (8 * k) & 0xFF);
+        float diff = (float)(int8_t)(d >> (8 * k) & 0xFF) * 2;
+        float val = (filter & 1) ? base + diff * frac : base;
+        out[k] = (uint8_t)fminf(fmaxf(lroundf(val), 0), 255);
+    }
+    Rgba col = { out[0], out[1], out[2], out[3] };
+    if (p0 >> 14 & 1) {                 /* separate alpha: its own shape and mapping */
+        float g_a = proctex_shape(p0 >> 10 & 0xF, u, v);
+        col.a = (uint8_t)lroundf(proctex_map(pica.proctex_lut[3], g_a) * 255);
+    }
+    return col;
 }

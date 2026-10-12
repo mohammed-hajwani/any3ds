@@ -27,4 +27,7 @@ Rgba etc1_pixel(uint64_t block, uint32_t x, uint32_t y);
 
 uint32_t tex_level_size(uint32_t format, uint32_t width, uint32_t height);
 
+/* Texture unit 3, the procedural texture, at (u, v). */
+Rgba proctex_sample(float u, float v);
+
 #endif
