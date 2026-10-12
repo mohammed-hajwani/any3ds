@@ -32,7 +32,7 @@ graphics/gpu/gpusprites              gpu          runs
 graphics/gpu/immediate               gpu          runs
 graphics/gpu/lenny                   gpu          stops
 graphics/gpu/loop_subdivision        gpu          stops
-graphics/gpu/mipmap_fog              gpu          stops
+graphics/gpu/mipmap_fog              gpu          runs
 graphics/gpu/multiple_buf            gpu          runs
 graphics/gpu/normal_mapping          gpu          stops
 graphics/gpu/particles               gpu          stops

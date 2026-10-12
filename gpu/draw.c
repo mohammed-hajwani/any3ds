@@ -500,6 +500,29 @@ static uint32_t stencil_op(uint32_t op, uint32_t old, uint32_t ref)
     }
 }
 
+/* Fog: a 128-entry table indexed by the fragment's depth (or 1 - depth
+   with the "Z flip" bit) gives how much of the colour survives; the rest
+   is the fog colour. Each entry: an 11-bit value (bits 13-23) and a signed
+   13-bit difference to the next entry (bits 0-12), both in 1/2048ths. */
+static Color apply_fog(Color c, float depth)
+{
+    float d = depth < 0 ? 0 : depth > 1 ? 1 : depth;
+    if (pica.reg[REG_TEXENV_UPDATE_BUFFER] >> 16 & 1)
+        d = 1 - d;
+    float x = d * 128;
+    int i = x >= 127 ? 127 : (int)x;
+    uint32_t e = pica.fog_lut[i];
+    float value = (float)(e >> 13 & 0x7FF) / 2048, diff = (float)((int32_t)(e << 19) >> 19) / 2048;
+    float k = value + diff * (x - (float)i);
+    k = k < 0 ? 0 : k > 1 ? 1 : k;
+    uint32_t fc = pica.reg[REG_FOG_COLOR];
+    int fr = (int)(fc & 0xFF), fg = (int)(fc >> 8 & 0xFF), fb = (int)(fc >> 16 & 0xFF);
+    c.r = (int)lroundf((float)c.r * k + (float)fr * (1 - k));
+    c.g = (int)lroundf((float)c.g * k + (float)fg * (1 - k));
+    c.b = (int)lroundf((float)c.b * k + (float)fb * (1 - k));
+    return c;
+}
+
 /* One fragment at render-target pixel (x, y) (y measured from the bottom). */
 static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Frag *f)
 {
@@ -507,6 +530,8 @@ static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Frag 
     uint32_t idx = tile_index(x, t->height - 1 - y, t->width);
 
     Color c = run_combiners(f);
+    if ((pica.reg[REG_TEXENV_UPDATE_BUFFER] & 7) == 5)
+        c = apply_fog(c, depth);
 
     uint32_t at = pica.reg[REG_ALPHA_TEST];
     if ((at & 1) && !test(at >> 4 & 7, (uint32_t)c.a, at >> 8 & 0xFF))
@@ -591,8 +616,8 @@ static void check_unsupported(void)
     if (pica.reg[REG_LIGHTING_ENABLE0] & 1)
         gpu_fatal("fragment lighting is not implemented yet");
     uint32_t fog = pica.reg[REG_TEXENV_UPDATE_BUFFER] & 7;
-    if (fog)
-        gpu_fatal("%s is not implemented yet", fog == 5 ? "fog" : fog == 7 ? "gas" : "fog/gas mode");
+    if (fog && fog != 5)
+        gpu_fatal("%s is not implemented yet", fog == 7 ? "gas" : "fog/gas mode");
     if (pica.reg[REG_COLOR_OPERATION] & 3)
         gpu_fatal("fragment operation mode %" PRIu32 " (gas/shadow) is not implemented yet",
                   pica.reg[REG_COLOR_OPERATION] & 3);
