@@ -375,8 +375,11 @@ $(M6)/%.dis: $(M6)/%.elf
 $(M6)/gen_%.c: $(M6)/%.elf $(RECOMP_DEP)
 	$(PYTHON) -m recomp $< -o $@ > $(M6)/recomp_$*.log
 
+# Whole programs are built unoptimised (-O0; the last -O wins): clang's
+# optimiser takes minutes over tens of thousands of lines of generated C,
+# and these tests check behaviour, not speed. The sanitizers stay on.
 $(M6)/run_%: tests/m6/runner.c $(M6)/gen_%.c $(RUNTIME_DEP) $(HLE_DEP) $(GPU_DEP)
-	$(HOST_CC) $(HOST_FLAGS) -Ihle -Igpu -pthread $< $(M6)/gen_$*.c $(RUNTIME_SRC) $(HLE_SRC) $(GPU_SRC) -lm -o $@
+	$(HOST_CC) $(HOST_FLAGS) -O0 -Ihle -Igpu -pthread $< $(M6)/gen_$*.c $(RUNTIME_SRC) $(HLE_SRC) $(GPU_SRC) -lm -o $@
 
 .PRECIOUS: $(M6)/%.elf $(M6)/gen_%.c
 
@@ -414,8 +417,9 @@ run-m6: $(M6)/run_hello
 
 # ---------------------------------------------------------------- compat
 #
-# The compatibility sweep (slow, so only a quick subset is part of `make
-# test`): every example in tests/compat/examples.txt (devkitPro's
+# The compatibility sweep (~4 minutes; seconds when nothing changed, since
+# each step is skipped if its inputs are unchanged; a quick subset is part
+# of `make test`): every example in tests/compat/examples.txt (devkitPro's
 # public-domain 3ds-examples) is built, recompiled and run on the HLE; the
 # outcome table goes to docs/compat.md. Fails if an example falls behind
 # its expected outcome or its frame changes (tests/compat/hashes.txt).

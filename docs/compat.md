@@ -6,8 +6,8 @@ cleanly via svcExitProcess after START was pressed; `stops` names the first miss
 
 | Outcome | Examples |
 |---|---|
-| runs | 31 |
-| stops | 23 |
+| runs | 35 |
+| stops | 19 |
 | c-failed | 0 |
 | recomp-failed | 0 |
 | build-failed | 8 |
@@ -29,80 +29,84 @@ What the remaining blockers mean:
 
 | Blocker | Count | Examples |
 |---|---|---|
-| stops: hle: GSP GX commands need the GPU (not implemented): MemoryFill | 20 | graphics/gpu/2d_shapes, graphics/gpu/both_screens, graphics/gpu/cubemap, graphics/gpu/fragment_light, graphics/gpu/geoshader, graphics/gpu/gpusprites, graphics/gpu/immediate, graphics/gpu/lenny, graphics/gpu/loop_subdivision, graphics/gpu/mipmap_fog, graphics/gpu/multiple_buf, graphics/gpu/normal_mapping, graphics/gpu/particles, graphics/gpu/proctex, graphics/gpu/simple_tri, graphics/gpu/stereoscopic_2d, graphics/gpu/textured_cube, graphics/gpu/toon_shading, graphics/gpu/wide_mode_3d, qtm/lenny_qtm_movement_naive |
-| build-failed: no .elf (a library?) | 1 | templates/library |
-| build-failed: video.h264 not found! | 1 | mvd |
-| build-failed: Image Magick not found! | 1 | graphics/bitmap/24bit-color |
+| stops: GPU: fragment lighting is not implemented yet | 6 | graphics/gpu/fragment_light, graphics/gpu/lenny, graphics/gpu/normal_mapping, graphics/gpu/toon_shading, graphics/gpu/wide_mode_3d, qtm/lenny_qtm_movement_naive |
+| stops: GPU: colour combiner 0 uses texture 0: textures are not implemented yet | 4 | graphics/gpu/cubemap, graphics/gpu/gpusprites, graphics/gpu/stereoscopic_2d, graphics/gpu/textured_cube |
+| stops: GPU: geometry shaders are not implemented yet | 3 | graphics/gpu/geoshader, graphics/gpu/loop_subdivision, graphics/gpu/particles |
 | stops: hle: APT GetSharedFont: the system font is firmware data, which we don't have | 3 | graphics/gpu/composite_scene, graphics/printing/custom-font, graphics/printing/system-font |
+| stops: GPU: colour combiner 0 uses texture 3: textures are not implemented yet | 2 | graphics/gpu/2d_shapes, graphics/gpu/proctex |
+| build-failed: Image Magick not found! | 1 | graphics/bitmap/24bit-color |
+| build-failed: no .elf (a library?) | 1 | templates/library |
 | build-failed: out/compat/audio/modplug-decoding/source/main.c:9:10: fatal error: libmodplug/modplug.h: No such file or directory | 1 | audio/modplug-decoding |
 | build-failed: out/compat/audio/ogg-vorbis-decoding/source/main.c:14:10: fatal error: tremor/ivorbisfile.h: No such file or directory | 1 | audio/ogg-vorbis-decoding |
 | build-failed: out/compat/audio/opus-decoding/source/main.c:18:10: fatal error: opusfile.h: No such file or directory | 1 | audio/opus-decoding |
 | build-failed: out/compat/physics/box2d/source/main.cpp:4:10: fatal error: box2d/box2d.h: No such file or directory | 1 | physics/box2d |
 | build-failed: out/compat/qtm/eye_position/source/main.c:8:69: error: 'QtmTrackingData' has no member named 'eyesTracked' | 1 | qtm/eye_position |
+| build-failed: video.h264 not found! | 1 | mvd |
+| stops: GPU: fog is not implemented yet | 1 | graphics/gpu/mipmap_fog |
 
 ## Every example
 
 | Example | Needs | Outcome | First blocker | Services asked for but missing | Frame |
 |---|---|---|---|---|---|
-| app_launch | applet | runs |  | ptm:sysm | new |
-| audio/filters | audio | runs |  | ptm:sysm | new |
-| audio/mic | audio | runs |  | csnd:SND, mic:u, ptm:sysm | new |
+| app_launch | applet | runs |  | ptm:sysm | matches |
+| audio/filters | audio | runs |  | ptm:sysm | matches |
+| audio/mic | audio | runs |  | csnd:SND, mic:u, ptm:sysm | matches |
 | audio/modplug-decoding | portlib | build-failed | out/compat/audio/modplug-decoding/source/main.c:9:10: fatal error: libmodplug/modplug.h: No such file or directory |  |  |
 | audio/ogg-vorbis-decoding | portlib | build-failed | out/compat/audio/ogg-vorbis-decoding/source/main.c:14:10: fatal error: tremor/ivorbisfile.h: No such file or directory |  |  |
 | audio/opus-decoding | portlib | build-failed | out/compat/audio/opus-decoding/source/main.c:18:10: fatal error: opusfile.h: No such file or directory |  |  |
-| audio/streaming | audio | runs |  | ptm:sysm | new |
-| camera/image | camera | runs |  | ac:i, ac:u, cam:u, ptm:sysm | new |
-| camera/video | camera | runs |  | ac:i, ac:u, cam:u, ptm:sysm | new |
-| get_system_language | console | runs |  | ptm:sysm | new |
+| audio/streaming | audio | runs |  | ptm:sysm | matches |
+| camera/image | camera | runs |  | ac:i, ac:u, cam:u, ptm:sysm | matches |
+| camera/video | camera | runs |  | ac:i, ac:u, cam:u, ptm:sysm | matches |
+| get_system_language | console | runs |  | ptm:sysm | matches |
 | graphics/bitmap/24bit-color | framebuffer | build-failed | Image Magick not found! |  |  |
-| graphics/gpu/2d_shapes | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/both_screens | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
+| graphics/gpu/2d_shapes | gpu | stops | GPU: colour combiner 0 uses texture 3: textures are not implemented yet | ptm:sysm |  |
+| graphics/gpu/both_screens | gpu | runs |  | ptm:sysm | matches |
 | graphics/gpu/composite_scene | gpu | stops | hle: APT GetSharedFont: the system font is firmware data, which we don't have | ptm:sysm |  |
-| graphics/gpu/cubemap | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/fragment_light | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/geoshader | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/gpusprites | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/immediate | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/lenny | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/loop_subdivision | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/mipmap_fog | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/multiple_buf | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/normal_mapping | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/particles | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/proctex | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/simple_tri | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/stereoscopic_2d | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/textured_cube | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/toon_shading | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/gpu/wide_mode_3d | gpu | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| graphics/printing/both-screen-text | console | runs |  | ptm:sysm | new |
-| graphics/printing/colored-text | console | runs |  | ptm:sysm | new |
+| graphics/gpu/cubemap | gpu | stops | GPU: colour combiner 0 uses texture 0: textures are not implemented yet | ptm:sysm |  |
+| graphics/gpu/fragment_light | gpu | stops | GPU: fragment lighting is not implemented yet | ptm:sysm |  |
+| graphics/gpu/geoshader | gpu | stops | GPU: geometry shaders are not implemented yet | ptm:sysm |  |
+| graphics/gpu/gpusprites | gpu | stops | GPU: colour combiner 0 uses texture 0: textures are not implemented yet | ptm:sysm |  |
+| graphics/gpu/immediate | gpu | runs |  | ptm:sysm | matches |
+| graphics/gpu/lenny | gpu | stops | GPU: fragment lighting is not implemented yet | ptm:sysm |  |
+| graphics/gpu/loop_subdivision | gpu | stops | GPU: geometry shaders are not implemented yet | ptm:sysm |  |
+| graphics/gpu/mipmap_fog | gpu | stops | GPU: fog is not implemented yet | ptm:sysm |  |
+| graphics/gpu/multiple_buf | gpu | runs |  | ptm:sysm | matches |
+| graphics/gpu/normal_mapping | gpu | stops | GPU: fragment lighting is not implemented yet | ptm:sysm |  |
+| graphics/gpu/particles | gpu | stops | GPU: geometry shaders are not implemented yet | ptm:sysm |  |
+| graphics/gpu/proctex | gpu | stops | GPU: colour combiner 0 uses texture 3: textures are not implemented yet | ptm:sysm |  |
+| graphics/gpu/simple_tri | gpu | runs |  | ptm:sysm | matches |
+| graphics/gpu/stereoscopic_2d | gpu | stops | GPU: colour combiner 0 uses texture 0: textures are not implemented yet | ptm:sysm |  |
+| graphics/gpu/textured_cube | gpu | stops | GPU: colour combiner 0 uses texture 0: textures are not implemented yet | ptm:sysm |  |
+| graphics/gpu/toon_shading | gpu | stops | GPU: fragment lighting is not implemented yet | ptm:sysm |  |
+| graphics/gpu/wide_mode_3d | gpu | stops | GPU: fragment lighting is not implemented yet | ptm:sysm |  |
+| graphics/printing/both-screen-text | console | runs |  | ptm:sysm | matches |
+| graphics/printing/colored-text | console | runs |  | ptm:sysm | matches |
 | graphics/printing/custom-font | gpu | stops | hle: APT GetSharedFont: the system font is firmware data, which we don't have | ptm:sysm |  |
-| graphics/printing/hello-world | console | runs |  | ptm:sysm | new |
-| graphics/printing/multiple-windows-text | console | runs |  | ptm:sysm | new |
+| graphics/printing/hello-world | console | runs |  | ptm:sysm | matches |
+| graphics/printing/multiple-windows-text | console | runs |  | ptm:sysm | matches |
 | graphics/printing/system-font | gpu | stops | hle: APT GetSharedFont: the system font is firmware data, which we don't have | ptm:sysm |  |
-| graphics/printing/wide-console | console | runs |  | ptm:sysm | new |
-| input/read-controls | console | runs |  | ptm:sysm | new |
-| input/software-keyboard | applet | runs |  | ptm:sysm | new |
-| input/touch-screen | console | runs |  | ptm:sysm | new |
-| libapplet_launch | applet | runs |  | ptm:sysm | new |
-| mii_selector | applet | runs |  | ptm:sysm | new |
+| graphics/printing/wide-console | console | runs |  | ptm:sysm | matches |
+| input/read-controls | console | runs |  | ptm:sysm | matches |
+| input/software-keyboard | applet | runs |  | ptm:sysm | matches |
+| input/touch-screen | console | runs |  | ptm:sysm | matches |
+| libapplet_launch | applet | runs |  | ptm:sysm | matches |
+| mii_selector | applet | runs |  | ptm:sysm | matches |
 | mvd | mvd | build-failed | video.h264 not found! |  |  |
-| network/3dslink-demo | network | runs |  | ptm:sysm, soc:U | new |
-| network/boss | network | runs |  | boss:P, boss:U, ptm:sysm | new |
-| network/http | network | runs |  | http:C, ptm:sysm | new |
-| network/http_post | network | runs |  | http:C, ptm:sysm | new |
-| network/sockets | network | runs |  | ptm:sysm, soc:U | new |
-| network/sslc | network | runs |  | ptm:sysm, soc:U | new |
-| network/uds | network | runs |  | ndm:u, ptm:sysm | new |
-| nfc | nfc | runs |  | nfc:m, nfc:u, ptm:sysm | new |
+| network/3dslink-demo | network | runs |  | ptm:sysm, soc:U | matches |
+| network/boss | network | runs |  | boss:P, boss:U, ptm:sysm | matches |
+| network/http | network | runs |  | http:C, ptm:sysm | matches |
+| network/http_post | network | runs |  | http:C, ptm:sysm | matches |
+| network/sockets | network | runs |  | ptm:sysm, soc:U | matches |
+| network/sslc | network | runs |  | ptm:sysm, soc:U | matches |
+| network/uds | network | runs |  | ndm:u, ptm:sysm | matches |
+| nfc | nfc | runs |  | nfc:m, nfc:u, ptm:sysm | matches |
 | physics/box2d | portlib | build-failed | out/compat/physics/box2d/source/main.cpp:4:10: fatal error: box2d/box2d.h: No such file or directory |  |  |
 | qtm/eye_position | qtm | build-failed | out/compat/qtm/eye_position/source/main.c:8:69: error: 'QtmTrackingData' has no member named 'eyesTracked' |  |  |
-| qtm/lenny_qtm_movement_naive | qtm | stops | hle: GSP GX commands need the GPU (not implemented): MemoryFill | ptm:sysm |  |
-| romfs | console | runs |  | ptm:sysm | new |
-| sdmc | framebuffer | runs |  | ptm:sysm | new |
-| templates/application | console | runs |  | ptm:sysm | new |
+| qtm/lenny_qtm_movement_naive | qtm | stops | GPU: fragment lighting is not implemented yet | ptm:sysm |  |
+| romfs | console | runs |  | ptm:sysm | matches |
+| sdmc | framebuffer | runs |  | ptm:sysm | matches |
+| templates/application | console | runs |  | ptm:sysm | matches |
 | templates/library | library | build-failed | no .elf (a library?) |  |  |
-| threads/event | console | runs |  | ptm:sysm | new |
-| threads/thread-basic | console | runs |  | ptm:sysm | new |
-| time/rtc | console | runs |  | ptm:sysm | new |
+| threads/event | console | runs |  | ptm:sysm | matches |
+| threads/thread-basic | console | runs |  | ptm:sysm | matches |
+| time/rtc | console | runs |  | ptm:sysm | matches |

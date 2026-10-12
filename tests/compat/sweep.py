@@ -12,6 +12,7 @@ Exit status 1 if any example falls behind its expected outcome.
 """
 import argparse
 import concurrent.futures
+import hashlib
 import os
 import re
 import shlex
@@ -125,6 +126,56 @@ def classify_run(code, log):
     return 'stops', f'exit {code}'
 
 
+def host_cc():
+    return shlex.split(os.environ.get('HOST_CC', 'clang'))
+
+
+def host_flags():
+    return shlex.split(os.environ.get('HOST_FLAGS', '-std=c11 -O1 -g -Wall -Wextra -Werror -fno-math-errno '
+                                      '-fsanitize=undefined,address -fno-sanitize-recover=all -Iruntime'))
+
+
+def digest(*parts):
+    """A key over files (Paths) and strings: a step whose key hasn't
+    changed since last time is skipped."""
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(p.read_bytes() if isinstance(p, Path) else str(p).encode())
+        h.update(b'\0')
+    return h.hexdigest()
+
+
+def up_to_date(key_file, key):
+    return key_file.exists() and key_file.read_text() == key
+
+
+LIB = OUT / 'liboslayer.a'
+
+
+def build_os_layer():
+    """runtime/ + hle/ + gpu/, built once per sweep, optimised, with the
+    sanitizers. Only each example's generated C is built unoptimised:
+    clang's optimiser takes minutes over 90k lines of generated code, and
+    the examples need correctness checks, not speed."""
+    sources = [ROOT / 'runtime' / 'runtime.c'] + sorted(p for d in ('hle', 'gpu') for p in (ROOT / d).glob('*.c'))
+    headers = sorted(p for d in ('runtime', 'hle', 'gpu') for p in (ROOT / d).glob('*.h'))
+    key = digest(*sources, *headers, *host_flags())
+    if LIB.exists() and up_to_date(OUT / 'liboslayer.key', key):
+        return
+    OUT.mkdir(parents=True, exist_ok=True)
+    objs = []
+    for src in sources:
+        obj = OUT / 'oslayer' / (src.parent.name + '_' + src.stem + '.o')
+        obj.parent.mkdir(exist_ok=True)
+        cmd = host_cc() + host_flags() + ['-Ihle', '-Igpu', '-pthread', '-c', str(src), '-o', str(obj)]
+        if subprocess.run(cmd, cwd=ROOT).returncode != 0:
+            sys.exit(f'building {src} failed')
+        objs.append(str(obj))
+    LIB.unlink(missing_ok=True)
+    subprocess.run(['ar', 'rcs', str(LIB), *objs], check=True)
+    (OUT / 'liboslayer.key').write_text(key)
+
+
 def sweep_one(ex, args):
     r = Result(ex)
     work = OUT / ex.path
@@ -141,18 +192,23 @@ def sweep_one(ex, args):
         r.status, r.detail = 'build-failed', first_line(work / 'build.log', r'not found!') or 'no .elf (a library?)'
         return r
     env_py = os.environ.get('PYTHON', str(ROOT / '.venv' / 'bin' / 'python'))
-    if run([env_py, '-m', 'recomp', str(elfs[0]), '-o', str(work / 'gen.c')], ROOT, work / 'recomp.log', 600) != 0:
-        r.status, r.detail = 'recomp-failed', first_line(work / 'recomp.log', r'error') or 'see recomp.log'
-        return r
-    cc = shlex.split(os.environ.get('HOST_CC', 'clang'))
-    flags = shlex.split(os.environ.get('HOST_FLAGS', '-std=c11 -O1 -g -Wall -Wextra -Werror -fno-math-errno '
-                                       '-fsanitize=undefined,address -fno-sanitize-recover=all -Iruntime'))
-    os_layer = sorted(str(p) for d in ('hle', 'gpu') for p in (ROOT / d).glob('*.c'))
-    cmd = cc + flags + ['-Ihle', '-Igpu', '-pthread', 'tests/m6/runner.c', str(work / 'gen.c'), 'runtime/runtime.c',
-                        *os_layer, '-lm', '-o', str(work / 'run')]
-    if run(cmd, ROOT, work / 'cc.log', 900) != 0:
-        r.status, r.detail = 'c-failed', first_line(work / 'cc.log', r'error') or 'see cc.log'
-        return r
+    gen_key = digest(elfs[0], *sorted((ROOT / 'recomp').glob('*.py')))
+    if not ((work / 'gen.c').exists() and up_to_date(work / 'gen.key', gen_key)):
+        (work / 'gen.key').unlink(missing_ok=True)
+        if run([env_py, '-m', 'recomp', str(elfs[0]), '-o', str(work / 'gen.c')], ROOT, work / 'recomp.log', 600) != 0:
+            r.status, r.detail = 'recomp-failed', first_line(work / 'recomp.log', r'error') or 'see recomp.log'
+            return r
+        (work / 'gen.key').write_text(gen_key)
+    flags = host_flags() + ['-O0']      # the last -O wins: generated code unoptimised (see build_os_layer)
+    run_key = digest(work / 'gen.c', work / 'gen.h', ROOT / 'tests' / 'm6' / 'runner.c', LIB, *flags)
+    if not ((work / 'run').exists() and up_to_date(work / 'run.key', run_key)):
+        (work / 'run.key').unlink(missing_ok=True)
+        cmd = host_cc() + flags + ['-Ihle', '-Igpu', '-pthread', 'tests/m6/runner.c', str(work / 'gen.c'),
+                                   str(LIB), '-lm', '-o', str(work / 'run')]
+        if run(cmd, ROOT, work / 'cc.log', 900) != 0:
+            r.status, r.detail = 'c-failed', first_line(work / 'cc.log', r'error') or 'see cc.log'
+            return r
+        (work / 'run.key').write_text(run_key)
     frame = work / 'frame.bmp'
     frame.unlink(missing_ok=True)
     options = list(ex.options)
@@ -233,6 +289,7 @@ def main():
     if args.only:
         examples = [e for e in examples if any(o in e.path for o in args.only)]
     hashes = load_hashes()
+    build_os_layer()
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
         futures = {pool.submit(sweep_one, ex, args): ex for ex in examples}
         for f in concurrent.futures.as_completed(futures):

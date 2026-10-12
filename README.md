@@ -4,7 +4,7 @@ A **static recompiler** for Nintendo 3DS code. It translates 32-bit ARM (ARMv6K)
 
 Why ahead of time? iOS doesn't allow JIT compilation, so 3DS emulators on iPhone fall back to slow interpreters. If the whole program is translated before it runs, nothing has to be generated at runtime.
 
-> **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls), M2 (memory: loads/stores, literal pools, switch tables), M3 (instruction-by-instruction differential testing against Unicorn), M4 (Thumb + ARM/Thumb interworking), M5 (VFP floating point) and M6a (recompiling a real libctru homebrew app in full) are done. In M6b the recompiled libctru hello world **runs** on our own minimal OS layer (threads, APT, GSP, HID) and prints to its screen. In M7, 31 of devkitPro's 62 example programs run correctly; nearly all the rest need the GPU, which is next ([docs/compat.md](docs/compat.md)). Development currently targets x86-64 Linux; iOS comes much later.
+> **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls), M2 (memory: loads/stores, literal pools, switch tables), M3 (instruction-by-instruction differential testing against Unicorn), M4 (Thumb + ARM/Thumb interworking), M5 (VFP floating point) and M6a (recompiling a real libctru homebrew app in full) are done. In M6b the recompiled libctru hello world **runs** on our own minimal OS layer (threads, APT, GSP, HID) and prints to its screen. In M7, 31 of devkitPro's 62 example programs ran correctly. In M8 our own GPU emulation (no third-party GPU code) draws its first 3D scenes, bringing it to 35; the rest need textures, lighting, geometry shaders or fog, which come next ([docs/compat.md](docs/compat.md)). Development currently targets x86-64 Linux; iOS comes much later.
 
 ## How it works
 
@@ -78,7 +78,7 @@ wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc "make test"
 
 `make run-m6` runs the recompiled hello world, presses START at frame 10 and saves both screens to `out/m6/frame.bmp`.
 
-`make compat` builds, recompiles and runs every example in devkitPro's `3ds-examples` (installed with `3ds-dev`) and writes the table in [docs/compat.md](docs/compat.md). It takes about 12 minutes.
+`make compat` builds, recompiles and runs every example in devkitPro's `3ds-examples` (installed with `3ds-dev`) and writes the table in [docs/compat.md](docs/compat.md). It takes about 4 minutes, and seconds when nothing changed.
 
 ## Repo layout
 
@@ -99,6 +99,11 @@ hle/               the OS layer: high-level emulation of the 3DS kernel and serv
   srv.c apt.c gsp.c hid.c fs.c cfg.c   one file per service
   config_mem.c     the kernel config page and shared page (versions, clock)
   framebuffer.c    3DS framebuffer -> upright .bmp
+gpu/               our own emulation of the 3DS GPU (PICA200), from the 3dbrew docs
+  gx.c pixel.c     2D engines (fill, display transfer, texture copy), formats, tiling, float24
+  regs.c           command lists: register writes and the data FIFOs
+  shader.c         vertex shader interpreter
+  draw.c           vertex fetch, clipping, rasteriser, colour combiners, tests, blending
 tests/
   m0/ ... m5/      one directory per milestone
   real/            -O2 code + libgcc; extends, DSP multiplies, saturation, unusual control flow
@@ -131,7 +136,9 @@ dumps/  out/       gitignored: your own dumps and all generated code
 | M6a | Recompile a real libctru homebrew app in full (303 functions, RunFast VFP, atomics, svc hook) | ✅ |
 | M6b | OS layer: kernel (threads, sync, scheduler), IPC, APT/GSP/HID/FS; the hello world runs and draws its text | ✅ |
 | M7 | Compatibility sweep over devkitPro's 62 examples: 31 run, the rest need the GPU, firmware or extra libraries | ✅ |
-| M8 | The GPU: GX commands and the PICA200 | next |
+| M8 | Our own GPU, part 1: GX engines, command lists, vertex shaders, rasteriser, colour combiners, blending, depth | ✅ |
+| M9 | GPU textures | next |
+| M10 | Lighting, fog, procedural textures, geometry shaders | |
 | later | Cycle counting, CRO relocation, indirect-jump table + interpreter fallback, Metal renderer, iOS shell app | |
 
 ## Contributing
