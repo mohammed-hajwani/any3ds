@@ -137,8 +137,8 @@ dumps/  out/       gitignored: your own dumps and all generated code
 | M6b | OS layer: kernel (threads, sync, scheduler), IPC, APT/GSP/HID/FS; the hello world runs and draws its text | ✅ |
 | M7 | Compatibility sweep over devkitPro's 62 examples: 31 run, the rest need the GPU, firmware or extra libraries | ✅ |
 | M8 | Our own GPU, part 1: GX engines, command lists, vertex shaders, rasteriser, colour combiners, blending, depth | ✅ |
-| M9 | GPU textures | next |
-| M10 | Lighting, fog, procedural textures, geometry shaders | |
+| M9 | GPU textures (14 formats incl. ETC1, filtering, mipmaps, cube maps) and procedural textures; citro2d works | ✅ |
+| M10 | Fragment lighting, fog, geometry shaders | next |
 | later | Cycle counting, CRO relocation, indirect-jump table + interpreter fallback, Metal renderer, iOS shell app | |
 
 ## Contributing

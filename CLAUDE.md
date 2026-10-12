@@ -172,6 +172,16 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
     1. M9: textures (formats incl. ETC1, tiling, filtering, wrap).
     2. M10: fragment lighting, fog, procedural textures, geometry shaders.
     3. Later: float24-exact arithmetic; leaner generated C for optimised release builds (the giant jump-table switches slow clang down).
+- **M9 done: textures, plus procedural textures (documented parts).** `gpu/texture.c`:
+  - **Texture units 0-2:**
+    - Formats: all 14 (incl. ETC1/ETC1A4), from 8x8 Morton tiles with t = 0 at the last memory row.
+    - Sampling: nearest/linear, the four wrap modes and the border colour, mipmaps (LOD from screen-space derivatives + bias, clamped), and cube maps.
+  - **Unit 3 (procedural):**
+    - Implemented: the clamp modes, base shapes, mapping tables, colour table and separate alpha.
+    - Noise and coordinate shifts stop by name: they aren't publicly documented, and we don't copy Azahar.
+  - **citro2d:** uses unit 3 for anti-aliased circles ("circle" table) and for image tinting ("blend" ramp); its source is in `out/ref/citro2d` for reference.
+  - **Bug found:** clamp-to-border returned texel 0 for *inside* coordinates, which made every citro2d sprite sample its transparent corner.
+  - **Result:** textured_cube, cubemap, 2d_shapes, gpusprites and stereoscopic_2d render, so 9 GPU examples run. The remaining blockers are fragment lighting (6), geometry shaders (3), fog (1), procedural noise (1) and the system font (3).
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function
