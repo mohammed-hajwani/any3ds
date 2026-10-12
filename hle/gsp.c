@@ -18,10 +18,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gpu.h"
 #include "service.h"
 
+#define EVENT_PSC0    0     /* memory fill 0 done */
+#define EVENT_PSC1    1     /* memory fill 1 done */
 #define EVENT_VBLANK0 2
 #define EVENT_VBLANK1 3
+#define EVENT_PPF     4     /* display transfer / texture copy done */
+#define EVENT_P3D     5     /* command list done */
+#define EVENT_DMA     6
 #define QUEUE_LEN     0x34
 
 typedef struct { uint32_t addr, stride, format; } Screen;
@@ -104,21 +110,49 @@ int gsp_dump_screens(const char *path)
 
 /* The GX command queue (shared memory + 0x800 + thread * 0x200): u8 first,
    u8 count, then 15 slots of 8 words from word 8. Word 0's low byte is
-   the command. Running them needs the GPU, which isn't here yet; say
-   which ones the app asked for. */
-static void gx_queue_report(void)
+   the command. The app only triggers the queue when it was empty, so each
+   trigger runs everything queued; a finished command raises the interrupt
+   the app waits for (gspWaitForPSC0, gspWaitForPPF, ...). */
+static void run_gx_queue(void)
 {
-    static const char *names[] = { "RequestDma", "ProcessCommandList", "MemoryFill",
-                                   "DisplayTransfer", "TextureCopy", "FlushCacheRegions" };
-    uint8_t *q = kshm_ptr(shm) + 0x800 + thread_index * 0x200;
-    fprintf(stderr, "hle: GSP GX commands need the GPU (not implemented):");
-    for (int i = 0; i < q[1]; i++) {
-        uint32_t id;
-        memcpy(&id, q + 0x20 * (1 + (q[0] + i) % 15), 4);
-        id &= 0xFF;
-        fprintf(stderr, " %s", id < 6 ? names[id] : "?");
+    uint8_t *base = kshm_ptr(shm), *q = base + 0x800 + thread_index * 0x200;
+    uint8_t *interrupts = base + thread_index * 0x40;
+    while (q[1]) {
+        uint32_t c[8];
+        memcpy(c, q + 0x20 * (1 + q[0]), sizeof c);
+        q[0] = (uint8_t)((q[0] + 1) % 15);
+        q[1]--;
+        switch (c[0] & 0xFF) {
+        case 0:     /* RequestDma(src, dst, size) */
+            memcpy(gpu_mem(c[2], c[3]), gpu_mem(c[1], c[3]), c[3]);
+            push_interrupt(interrupts, EVENT_DMA);
+            break;
+        case 2:     /* MemoryFill: two buffers, each (start, value, end) + a 16-bit control */
+            gx_memory_fill(c[1], c[2], c[3], c[7] & 0xFFFF);
+            gx_memory_fill(c[4], c[5], c[6], c[7] >> 16);
+            if (c[1])
+                push_interrupt(interrupts, EVENT_PSC0);
+            if (c[4])
+                push_interrupt(interrupts, EVENT_PSC1);
+            break;
+        case 3:     /* DisplayTransfer(in, out, in dim, out dim, flags) */
+            gx_display_transfer(c[1], c[2], c[3], c[4], c[5]);
+            push_interrupt(interrupts, EVENT_PPF);
+            break;
+        case 4:     /* TextureCopy(in, out, size, in dim, out dim, flags) */
+            gx_texture_copy(c[1], c[2], c[3], c[4], c[5], c[6]);
+            push_interrupt(interrupts, EVENT_PPF);
+            break;
+        case 5:     /* FlushCacheRegions: host memory is coherent */
+            break;
+        case 1:     /* ProcessCommandList(address, size, flags) */
+            gpu_fatal("GX ProcessCommandList (%" PRIu32 " bytes at %08" PRIx32 "): PICA command lists are not "
+                      "implemented yet", c[2], c[1]);
+        default:
+            gpu_fatal("GX command %" PRIu32, c[0] & 0xFF);
+        }
     }
-    fprintf(stderr, "\n");
+    kevent_signal(interrupt_event);
 }
 
 void gsp_handle(KObj *session, uint32_t *cmd)
@@ -161,8 +195,9 @@ void gsp_handle(KObj *session, uint32_t *cmd)
         ipc_reply(cmd, RES_OK);
         return;
     case 0x0C:      /* TriggerCmdReqQueue: run the GX commands queued in shared memory */
-        gx_queue_report();
-        exit(3);
+        run_gx_queue();
+        ipc_reply(cmd, RES_OK);
+        return;
     default:
         ipc_unhandled("gsp::Gpu", cmd);
     }

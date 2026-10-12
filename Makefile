@@ -38,11 +38,11 @@ ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-m6 test-compat-quick venv clean
+.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-compat-quick venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-m6 test-compat-quick
+test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-compat-quick
 
 venv: $(VENV)/.installed
 
@@ -320,6 +320,25 @@ test-real: $(REAL)/real_arm_harness $(REAL)/real_thumb_harness $(REAL_DIFFS) $(R
 	    timeout 180 ./$$d 100 $(REAL_SKIP) || exit 1; \
 	done
 
+# ---------------------------------------------------------------- GPU (M8)
+#
+# gpu/ is our own emulation of the 3DS GPU (PICA200) and its 2D engines.
+# Its unit tests check pieces against exact expected values: float24,
+# tiling, pixel formats, the GX fills and copies.
+
+GPU_SRC := $(wildcard gpu/*.c)
+GPU_DEP := $(GPU_SRC) $(wildcard gpu/*.h)
+
+out/gpu:
+	mkdir -p $@
+
+out/gpu/test_gpu: tests/gpu/test_gpu.c $(GPU_DEP) $(RUNTIME_DEP) | out/gpu
+	$(HOST_CC) $(HOST_FLAGS) -Igpu $< $(GPU_SRC) $(RUNTIME_SRC) -lm -o $@
+
+test-gpu: out/gpu/test_gpu
+	@echo '=== GPU: unit tests (tests/gpu/test_gpu.c) ==='
+	@./out/gpu/test_gpu
+
 # ---------------------------------------------------------------- M6
 #
 # The canonical libctru "hello world", built against the real libctru +
@@ -352,8 +371,8 @@ $(M6)/%.dis: $(M6)/%.elf
 $(M6)/gen_%.c: $(M6)/%.elf $(RECOMP_DEP)
 	$(PYTHON) -m recomp $< -o $@ > $(M6)/recomp_$*.log
 
-$(M6)/run_%: tests/m6/runner.c $(M6)/gen_%.c $(RUNTIME_DEP) $(HLE_DEP)
-	$(HOST_CC) $(HOST_FLAGS) -Ihle -pthread $< $(M6)/gen_$*.c $(RUNTIME_SRC) $(HLE_SRC) -o $@
+$(M6)/run_%: tests/m6/runner.c $(M6)/gen_%.c $(RUNTIME_DEP) $(HLE_DEP) $(GPU_DEP)
+	$(HOST_CC) $(HOST_FLAGS) -Ihle -Igpu -pthread $< $(M6)/gen_$*.c $(RUNTIME_SRC) $(HLE_SRC) $(GPU_SRC) -lm -o $@
 
 .PRECIOUS: $(M6)/%.elf $(M6)/gen_%.c
 

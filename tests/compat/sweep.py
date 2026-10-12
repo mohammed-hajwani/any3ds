@@ -100,6 +100,7 @@ def classify_run(code, log):
     patterns = [
         (r'hle: svc (0x[0-9a-f]+) \((\S+)\) is not implemented', lambda m: f'svc {m[1]} {m[2]}'),
         (r'hle: (\S+) command (0x[0-9a-f]+) \(header', lambda m: f'IPC {m[1]} {m[2]}'),
+        (r'^gpu: (.*)', lambda m: f'GPU: {m[1]}'),
         (r'hle: deadlock', lambda m: 'deadlock'),
         (r'hle: stopping: still running after', lambda m: 'virtual-time limit (hang?)'),
         (r'hle: guest called svcBreak', lambda m: 'svcBreak'),
@@ -146,9 +147,9 @@ def sweep_one(ex, args):
     cc = shlex.split(os.environ.get('HOST_CC', 'clang'))
     flags = shlex.split(os.environ.get('HOST_FLAGS', '-std=c11 -O1 -g -Wall -Wextra -Werror -fno-math-errno '
                                        '-fsanitize=undefined,address -fno-sanitize-recover=all -Iruntime'))
-    hle = sorted(str(p) for p in (ROOT / 'hle').glob('*.c'))
-    cmd = cc + flags + ['-Ihle', '-pthread', 'tests/m6/runner.c', str(work / 'gen.c'), 'runtime/runtime.c',
-                        *hle, '-o', str(work / 'run')]
+    os_layer = sorted(str(p) for d in ('hle', 'gpu') for p in (ROOT / d).glob('*.c'))
+    cmd = cc + flags + ['-Ihle', '-Igpu', '-pthread', 'tests/m6/runner.c', str(work / 'gen.c'), 'runtime/runtime.c',
+                        *os_layer, '-lm', '-o', str(work / 'run')]
     if run(cmd, ROOT, work / 'cc.log', 900) != 0:
         r.status, r.detail = 'c-failed', first_line(work / 'cc.log', r'error') or 'see cc.log'
         return r

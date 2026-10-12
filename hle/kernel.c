@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gpu.h"
 #include "kernel.h"
 
 #define MAX_THREADS 32
@@ -646,6 +647,7 @@ void hle_run(uint8_t *guest_mem, const HleConfig *cfg)
     hle_trace = getenv("HLE_TRACE") != NULL;
     recomp_svc_handler = hle_svc;
     config_mem_init(mem);
+    gpu_init(mem);
 
     pthread_mutex_lock(&big_lock);
     KThread *main_thread = thread_new(cfg->entry, 0x30);
