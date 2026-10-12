@@ -267,10 +267,16 @@ void shader_exec(const ShaderUnit *unit, uint32_t entry, uint16_t bools, const u
                 if ((e.bools >> id & 1) != (num & 1))
                     jump = dst;
                 break;
-            case 0x2A:                      /* EMIT */
-            case 0x2B:                      /* SETEMIT */
-                gpu_fatal("geometry shader instruction %08" PRIx32 " at %03" PRIx32 " (geometry shaders come later)",
-                          insn, pc);
+            case 0x2A:                      /* EMIT (geometry shaders) */
+                if (!s->on_emit)
+                    gpu_fatal("EMIT at %03" PRIx32 " outside a geometry shader", pc);
+                s->on_emit(s);
+                break;
+            case 0x2B:                      /* SETEMIT: vertex slot, primitive and winding flags */
+                s->emit_vertex = (int)(insn >> 24 & 3);
+                s->emit_prim = (int)(insn >> 23 & 1);
+                s->emit_winding = (int)(insn >> 22 & 1);
+                break;
             default:
                 gpu_fatal("shader instruction %08" PRIx32 " (opcode 0x%02" PRIx32 ") at %03" PRIx32 " is unknown",
                           insn, op, pc);

@@ -27,7 +27,7 @@ graphics/gpu/both_screens            gpu          runs
 graphics/gpu/composite_scene         gpu          stops
 graphics/gpu/cubemap                 gpu          runs
 graphics/gpu/fragment_light          gpu          runs
-graphics/gpu/geoshader               gpu          stops
+graphics/gpu/geoshader               gpu          runs
 graphics/gpu/gpusprites              gpu          runs
 graphics/gpu/immediate               gpu          runs
 graphics/gpu/lenny                   gpu          runs

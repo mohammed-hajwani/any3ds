@@ -91,7 +91,28 @@ static void load_attributes(uint32_t index, Vec4 attr[12])
 
 /* Run the vertex shader on one vertex's attributes and gather its outputs
    by semantic. */
-static void shade(const Vec4 attr[12], Vertex *out)
+/* Map a shader's output registers to vertex attributes: the n-th register
+   enabled in `mask` is described by SH_OUTMAP_On. */
+static void outputs_to_vertex(const ShaderRegs *s, uint32_t mask, Vertex *out)
+{
+    for (int i = 0; i < NSEM; i++)
+        out->a[i] = 0;
+    out->a[SEM_POS + 3] = 1;
+    uint32_t n = 0, total = pica.reg[REG_SH_OUTMAP_TOTAL] & 7;
+    for (int r = 0; r < 16 && n < total; r++) {
+        if (!(mask >> r & 1))
+            continue;
+        uint32_t map = pica.reg[REG_SH_OUTMAP_O0 + n++];
+        float o[4] = { s->o[r].x, s->o[r].y, s->o[r].z, s->o[r].w };
+        for (int c = 0; c < 4; c++) {
+            uint32_t sem = map >> (8 * c) & 0x1F;
+            if (sem < NSEM)
+                out->a[sem] = o[c];
+        }
+    }
+}
+
+static void shade(const Vec4 attr[12], ShaderRegs *regs_out, Vertex *out)
 {
     const uint32_t *vsh = &pica.reg[REG_VSH_BASE];
     ShaderRegs s;
@@ -104,23 +125,10 @@ static void shade(const Vec4 attr[12], Vertex *out)
     for (int i = 0; i < 4; i++)
         memcpy(ints[i], &vsh[SH_INTUNIFORM_I0 + i], 4);
     shader_exec(&pica.vsh, vsh[SH_ENTRYPOINT] & 0xFFFF, (uint16_t)vsh[SH_BOOLUNIFORM], ints, &s);
-
-    /* The n-th enabled output register is described by SH_OUTMAP_On. */
-    for (int i = 0; i < NSEM; i++)
-        out->a[i] = 0;
-    out->a[SEM_POS + 3] = 1;
-    uint32_t mask = vsh[SH_OUTMAP_MASK], n = 0, total = pica.reg[REG_SH_OUTMAP_TOTAL] & 7;
-    for (int r = 0; r < 16 && n < total; r++) {
-        if (!(mask >> r & 1))
-            continue;
-        uint32_t map = pica.reg[REG_SH_OUTMAP_O0 + n++];
-        float o[4] = { s.o[r].x, s.o[r].y, s.o[r].z, s.o[r].w };
-        for (int c = 0; c < 4; c++) {
-            uint32_t sem = map >> (8 * c) & 0x1F;
-            if (sem < NSEM)
-                out->a[sem] = o[c];
-        }
-    }
+    if (regs_out)
+        *regs_out = s;
+    if (out)
+        outputs_to_vertex(&s, vsh[SH_OUTMAP_MASK], out);
 }
 
 /* ---------------------------------------------------------------- clipping */
@@ -794,6 +802,69 @@ static void draw_triangle(const Vertex *a, const Vertex *b, const Vertex *c)
         raster_triangle(&t, &win[0], &win[i], &win[i + 1]);
 }
 
+/* ---------------------------------------------------------------- geometry shaders */
+
+/* Point mode (the only mode implemented): the vertex shader's enabled
+   output registers, vertex after vertex, fill the geometry shader's input
+   buffer; when it holds GSH_INPUTBUFFER_CONFIG + 1 attributes the
+   geometry shader runs once on them (through the input permutation) and
+   emits vertices: SETEMIT picks a slot 0-2, EMIT stores the outputs there,
+   and an emit flagged "primitive" draws slots 0-2 as a triangle (the
+   winding flag swaps two of them). */
+static Vec4 gs_input[16];
+static uint32_t gs_inputs;
+static Vertex gs_slots[3];
+
+static void gs_emit(ShaderRegs *s)
+{
+    Vertex *v = &gs_slots[s->emit_vertex % 3];
+    outputs_to_vertex(s, pica.reg[REG_GSH_BASE + SH_OUTMAP_MASK], v);
+    if (s->emit_prim) {
+        if (s->emit_winding)
+            draw_triangle(&gs_slots[0], &gs_slots[2], &gs_slots[1]);
+        else
+            draw_triangle(&gs_slots[0], &gs_slots[1], &gs_slots[2]);
+    }
+}
+
+static void gs_feed(const ShaderRegs *vs)
+{
+    const uint32_t *gsh = &pica.reg[REG_GSH_BASE];
+    uint32_t mask = pica.reg[REG_VSH_BASE + SH_OUTMAP_MASK], need = (gsh[SH_INPUTBUFFER_CONFIG] & 0xF) + 1;
+    for (int r = 0; r < 16; r++) {
+        if (!(mask >> r & 1))
+            continue;
+        gs_input[gs_inputs++ & 15] = vs->o[r];
+        if (gs_inputs < need)
+            continue;
+        gs_inputs = 0;
+        ShaderRegs g;
+        memset(&g, 0, sizeof g);
+        uint64_t perm = (uint64_t)gsh[SH_ATTRIBUTES_PERMUTATION_HIGH] << 32 | gsh[SH_ATTRIBUTES_PERMUTATION_LOW];
+        for (uint32_t k = 0; k < need; k++)
+            g.v[perm >> (4 * k) & 0xF] = gs_input[k];
+        uint8_t ints[4][4];
+        for (int i = 0; i < 4; i++)
+            memcpy(ints[i], &gsh[SH_INTUNIFORM_I0 + i], 4);
+        g.on_emit = gs_emit;
+        shader_exec(&pica.gsh, gsh[SH_ENTRYPOINT] & 0xFFFF, (uint16_t)gsh[SH_BOOLUNIFORM], ints, &g);
+    }
+}
+
+static int geometry_shader_on(void)
+{
+    if ((pica.reg[REG_GEOSTAGE_CONFIG] & 3) != 2)
+        return 0;
+    switch (pica.reg[0x252] & 0xFF) {               /* GSH_MISC0: the processing mode */
+    case 0:
+        return 1;                                   /* point mode */
+    case 1:
+        gpu_fatal("variable-size-primitive (subdivision) geometry shaders are not implemented yet");
+    default:
+        gpu_fatal("fixed-size-primitive (particle) geometry shaders are not implemented yet");
+    }
+}
+
 /* ---------------------------------------------------------------- primitive assembly */
 
 static Vertex assembly[3];
@@ -848,8 +919,8 @@ static void assemble(const Vertex *v)
 void pica_draw(int indexed)
 {
     check_unsupported();
-    if ((pica.reg[REG_GEOSTAGE_CONFIG] & 3) == 2)
-        gpu_fatal("geometry shaders are not implemented yet");
+    int gs = geometry_shader_on();
+    gs_inputs = 0;
     uint32_t count = pica.reg[REG_NUMVERTICES], first = pica.reg[REG_VERTEX_OFFSET];
     uint32_t ib = pica.reg[REG_INDEXBUFFER_CONFIG], base = pica.reg[REG_ATTRIBBUFFERS_LOC] << 3;
     const uint8_t *indices = NULL;
@@ -876,9 +947,13 @@ void pica_draw(int indexed)
         }
         Vec4 attr[12];
         Vertex v;
+        ShaderRegs s;
         load_attributes(index, attr);
-        shade(attr, &v);
-        assemble(&v);
+        shade(attr, &s, gs ? NULL : &v);
+        if (gs)
+            gs_feed(&s);
+        else
+            assemble(&v);
     }
 }
 
@@ -888,6 +963,11 @@ void pica_immediate_vertex(const Vec4 *attribs)
     Vec4 attr[12];
     memcpy(attr, attribs, sizeof attr);
     Vertex v;
-    shade(attr, &v);
-    assemble(&v);
+    ShaderRegs s;
+    int gs = geometry_shader_on();
+    shade(attr, &s, gs ? NULL : &v);
+    if (gs)
+        gs_feed(&s);
+    else
+        assemble(&v);
 }

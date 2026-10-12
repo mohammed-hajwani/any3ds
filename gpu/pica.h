@@ -85,10 +85,15 @@ typedef struct {
 extern Pica pica;
 
 /* A shader unit's registers while it runs one vertex (shader.c). */
-typedef struct {
+typedef struct ShaderRegs {
     Vec4 v[16], o[16], r[16];       /* inputs, outputs, temporaries */
     int32_t a0x, a0y, aL;           /* address registers */
     int cmpx, cmpy;                 /* condition flags set by CMP */
+    /* Geometry shaders: SETEMIT picks the slot (0-2) of the next emitted
+       vertex and whether it completes a primitive (and its winding); EMIT
+       calls on_emit with the output registers. */
+    int emit_vertex, emit_prim, emit_winding;
+    void (*on_emit)(struct ShaderRegs *s);
 } ShaderRegs;
 
 /* Run a unit's program from word `entry` until END. bools: b0-b15;
