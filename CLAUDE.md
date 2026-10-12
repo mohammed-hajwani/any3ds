@@ -182,6 +182,15 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
   - **citro2d:** uses unit 3 for anti-aliased circles ("circle" table) and for image tinting ("blend" ramp); its source is in `out/ref/citro2d` for reference.
   - **Bug found:** clamp-to-border returned texel 0 for *inside* coordinates, which made every citro2d sprite sample its transparent corner.
   - **Result:** textured_cube, cubemap, 2d_shapes, gpusprites and stereoscopic_2d render, so 9 GPU examples run. The remaining blockers are fragment lighting (6), geometry shaders (3), fog (1), procedural noise (1) and the system font (3).
+- **M10 (in progress): fog and fragment lighting done.**
+  - **Fog (`gpu/draw.c`):** a depth-indexed 128-entry table blends towards the fog colour.
+  - **Lighting (`gpu/lighting.c`):**
+    - Normals: per-pixel, from the interpolated quaternion or a bump map.
+    - Lights: up to 8, positional or directional, with diffuse/ambient, specular0 * D0 + specular1 * reflection * D1, spotlight and distance-attenuation tables, and Fresnel into alpha.
+    - Lookup tables: the environment configurations, input selectors, abs flags and scales.
+    - Not done (named stops): shadows, geometric factors, tangent maps and cos(phi).
+  - **Result:** fragment_light, lenny, toon_shading, normal_mapping, wide_mode_3d and qtm/lenny_qtm_movement_naive render lit 3D. 16 GPU-using examples run.
+  - **Left:** geometry shaders (geoshader, loop_subdivision, particles). Procedural noise is undocumented and stays a named stop; the system font is firmware.
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function

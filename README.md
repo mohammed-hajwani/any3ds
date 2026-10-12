@@ -138,7 +138,7 @@ dumps/  out/       gitignored: your own dumps and all generated code
 | M7 | Compatibility sweep over devkitPro's 62 examples: 31 run, the rest need the GPU, firmware or extra libraries | ✅ |
 | M8 | Our own GPU, part 1: GX engines, command lists, vertex shaders, rasteriser, colour combiners, blending, depth | ✅ |
 | M9 | GPU textures (14 formats incl. ETC1, filtering, mipmaps, cube maps) and procedural textures; citro2d works | ✅ |
-| M10 | Fragment lighting, fog, geometry shaders | next |
+| M10 | Fog and fragment lighting (done: lit 3D models render), geometry shaders | in progress |
 | later | Cycle counting, CRO relocation, indirect-jump table + interpreter fallback, Metal renderer, iOS shell app | |
 
 ## Contributing
