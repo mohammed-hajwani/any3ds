@@ -190,7 +190,13 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
     - Lookup tables: the environment configurations, input selectors, abs flags and scales.
     - Not done (named stops): shadows, geometric factors, tangent maps and cos(phi).
   - **Result:** fragment_light, lenny, toon_shading, normal_mapping, wide_mode_3d and qtm/lenny_qtm_movement_naive render lit 3D. 16 GPU-using examples run.
-  - **Left:** geometry shaders (geoshader, loop_subdivision, particles). Procedural noise is undocumented and stays a named stop; the system font is firmware.
+  - **Geometry shaders, point mode:**
+    - The interpreter does SETEMIT/EMIT. The vertex shader's outputs fill the geometry shader's input buffer, and every full buffer runs it once.
+    - Emitted triangles are drawn, with the winding flag honoured. The mode is GSH_MISC0's low byte.
+    - Result: geoshader renders.
+  - **Left:**
+    - Geometry-shader variable-size (loop_subdivision) and fixed-size/particle (particles) modes stop by name.
+    - Procedural noise is undocumented and stays a named stop. The system font is firmware.
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function
