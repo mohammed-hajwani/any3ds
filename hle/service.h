@@ -55,6 +55,10 @@ void cfg_handle(KObj *session, uint32_t *cmd);
 void fs_file_handle(KObj *session, uint32_t *cmd);     /* an open file (FSFILE_*) */
 void fs_dir_handle(KObj *session, uint32_t *cmd);      /* an open directory (FSDIR_*) */
 
+/* Services that only need to say "fine" (stubs.c): each command listed. */
+void stub_handle(KObj *session, uint32_t *cmd);
+const Service *stub_service(const char *name);         /* NULL if not a stubbed service */
+
 /* Make a session to an object served by a service (an open file, ...). */
 KObj *session_new(const Service *service, void *data);
 

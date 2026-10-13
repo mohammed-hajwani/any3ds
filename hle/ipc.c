@@ -42,7 +42,7 @@ int service_known(const char *name)
     for (size_t i = 0; i < sizeof services / sizeof services[0]; i++)
         if (strcmp(name, services[i].name) == 0)
             return 1;
-    return 0;
+    return stub_service(name) != NULL;
 }
 
 KObj *service_connect(const char *name)
@@ -50,7 +50,8 @@ KObj *service_connect(const char *name)
     for (size_t i = 0; i < sizeof services / sizeof services[0]; i++)
         if (strcmp(name, services[i].name) == 0)
             return session_new(&services[i], NULL);
-    return NULL;
+    const Service *stub = stub_service(name);
+    return stub ? session_new(stub, NULL) : NULL;
 }
 
 static uint32_t *command_buffer(void)

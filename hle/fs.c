@@ -3,7 +3,7 @@
  * Two archives are backed by something real:
  *   SDMC (9)    the SD card: a host folder (runner --sdmc DIR); none by default
  *   ROMFS (3)   this app's read-only RomFS: served from a host file (runner
- *               --romfs FILE), either a raw RomFS image or a .3dsx, whose
+ *               --romfs FILE), a raw RomFS image, a decrypted .cxi/.3ds, or a .3dsx, whose
  *               RomFS sits at the offset its header gives (fsOffset)
  * Opening a file or directory returns a new session (handle) on which the
  * app sends FSFILE_* / FSDIR_* commands.
@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -69,38 +70,81 @@ void fs_set_sdmc(const char *dir)
     sdmc_dir = dir;
 }
 
-int fs_set_romfs(const char *path)
+static uint32_t le32(const uint8_t *p)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f)
-        return 0;
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint8_t *data = malloc((size_t)size);
-    if (!data || fread(data, 1, (size_t)size, f) != (size_t)size) {
-        fclose(f);
-        free(data);
-        return 0;
-    }
-    fclose(f);
-    uint32_t offset = 0;
-    if (size >= 4 && memcmp(data, "3DSX", 4) == 0) {
-        uint16_t header_size = 0;
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+/* Where the RomFS level 3 (the actual file system) sits inside a file:
+     - a .3dsx: the extended header's fsOffset (word at 0x28);
+     - a decrypted NCCH (.cxi), or a .3ds whose first partition is one:
+       the NCCH's RomFS is wrapped in an IVFC hash tree; level 3 starts
+       after the 0x60-byte header and the master hash, aligned to its block
+       size (3dbrew: RomFS);
+     - anything else: a raw RomFS image.
+   Returns 0 if the file has no RomFS we can read. */
+static int romfs_offset(const uint8_t *data, uint64_t size, uint64_t *offset, uint64_t *length)
+{
+    *offset = 0;
+    *length = size;
+    if (size >= 0x2C && memcmp(data, "3DSX", 4) == 0) {
+        uint16_t header_size;
         memcpy(&header_size, data + 4, 2);
-        if (header_size >= 0x2C)                /* the extended header: fsOffset at 0x28 */
-            memcpy(&offset, data + 0x28, 4);
-        if (!offset) {                          /* this .3dsx has no RomFS */
-            free(data);
+        uint32_t off = header_size >= 0x2C ? le32(data + 0x28) : 0;
+        if (!off || off >= size)
+            return 0;
+        *offset = off;
+        *length = size - off;
+        return 1;
+    }
+    uint64_t ncch = 0;
+    if (size >= 0x200 && memcmp(data + 0x100, "NCSD", 4) == 0)
+        ncch = (uint64_t)le32(data + 0x120) * 0x200;            /* partition 0 */
+    if (ncch + 0x200 <= size && memcmp(data + ncch + 0x100, "NCCH", 4) == 0) {
+        const uint8_t *h = data + ncch;
+        if (!(h[0x18F] & 4)) {
+            fprintf(stderr, "hle: FS: this NCCH is encrypted; decrypt your own dump on your console first\n");
             return 0;
         }
+        uint64_t ivfc = ncch + (uint64_t)le32(h + 0x1B0) * 0x200;
+        if (!le32(h + 0x1B4) || ivfc + 0x60 > size || memcmp(data + ivfc, "IVFC", 4) != 0)
+            return 0;
+        uint32_t master = le32(data + ivfc + 0x08), block = 1u << le32(data + ivfc + 0x4C);
+        uint64_t level3 = ivfc + ((0x60 + (uint64_t)master + block - 1) & ~(uint64_t)(block - 1));
+        uint64_t level3_size;
+        memcpy(&level3_size, data + ivfc + 0x44, 8);
+        if (level3 + level3_size > size)
+            return 0;
+        *offset = level3;
+        *length = level3_size;
     }
-    if (offset >= (uint32_t)size) {
-        free(data);
+    return 1;
+}
+
+int fs_set_romfs(const char *path)
+{
+    /* Mapped, not read: a game's RomFS is often over a gigabyte. */
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        return 0;
+    }
+    uint8_t *data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (data == MAP_FAILED)
+        return 0;
+    uint64_t offset, length;
+    if (!romfs_offset(data, (uint64_t)st.st_size, &offset, &length)) {
+        munmap(data, (size_t)st.st_size);
         return 0;
     }
     romfs = data + offset;
-    romfs_size = (uint64_t)size - offset;
+    romfs_size = length;
     return 1;
 }
 
@@ -224,11 +268,22 @@ static void open_sd_dir(uint32_t *cmd, uint32_t type, uint32_t size, uint32_t ad
     reply_handle(cmd, session_new(&dir_service, d));
 }
 
+static uint32_t priority;    /* SetPriority: remembered for GetPriority */
+
 void fs_handle(KObj *session, uint32_t *cmd)
 {
     (void)session;
     char path[512];
     switch (cmd[0] >> 16) {
+    case 0x0862:    /* SetPriority(priority): FS request scheduling, nothing for us */
+        priority = cmd[1];
+        ipc_reply(cmd, RES_OK);
+        return;
+    case 0x0863:    /* GetPriority -> priority */
+        cmd[0] = ipc_header(0x0863, 2, 0);
+        cmd[1] = RES_OK;
+        cmd[2] = priority;
+        return;
     case 0x0801:    /* Initialize(process id descriptor) */
     case 0x0861:    /* InitializeWithSdkVersion */
         ipc_reply(cmd, RES_OK);

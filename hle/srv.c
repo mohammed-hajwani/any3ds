@@ -40,6 +40,12 @@ void srv_handle(KObj *session, uint32_t *cmd)
         cmd[3] = handle_new(session);
         return;
     }
+    case 0x9:       /* Subscribe(notification id): e.g. sleep, shutdown */
+    case 0xA:       /* Unsubscribe(notification id) */
+        /* We never publish any, so the notification semaphore never fires
+           and ReceiveNotification (0xB) is never asked for. */
+        ipc_reply(cmd, RES_OK);
+        return;
     case 0xE: {     /* IsServiceRegistered(name[8], name length) -> bool */
         char name[9] = { 0 };
         memcpy(name, &cmd[1], 8);
