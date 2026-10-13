@@ -52,6 +52,7 @@ void gsp_handle(KObj *session, uint32_t *cmd);
 void hid_handle(KObj *session, uint32_t *cmd);
 void fs_handle(KObj *session, uint32_t *cmd);
 void cfg_handle(KObj *session, uint32_t *cmd);
+void dsp_handle(KObj *session, uint32_t *cmd);
 void fs_file_handle(KObj *session, uint32_t *cmd);     /* an open file (FSFILE_*) */
 void fs_dir_handle(KObj *session, uint32_t *cmd);      /* an open directory (FSDIR_*) */
 

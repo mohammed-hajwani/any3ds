@@ -1,0 +1,10 @@
+ndspInit: ok
+back to back: buffer 0 finished
+back to back: buffer 1 finished 3 frames after buffer 0 (expected 3)
+back to back: buffer 2 finished 10 frames after buffer 1 (expected 10)
+back to back: channel playing afterwards: no
+half rate: 800 samples took at least 10 frames
+half rate: then 160 samples took 2 frames (expected 2)
+looping: finished: no, playing: yes, position inside the buffer: yes
+cleared: playing: no
+ndspExit: returned

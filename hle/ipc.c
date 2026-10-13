@@ -17,6 +17,7 @@ static const Service services[] = {
     { "cfg:u",    cfg_handle },
     { "cfg:s",    cfg_handle },
     { "cfg:i",    cfg_handle },
+    { "dsp::DSP", dsp_handle },
 };
 
 static const Service srv_port = { "srv:", srv_handle };

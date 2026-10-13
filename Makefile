@@ -38,11 +38,11 @@ ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-compat-quick venv clean
+.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-dsp test-compat-quick venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-compat-quick
+test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-dsp test-compat-quick
 
 venv: $(VENV)/.installed
 
@@ -432,6 +432,28 @@ COMPAT_QUICK := --only printing/colored-text --only input/read-controls --only r
 test-compat-quick: $(VENV)/.installed
 	@echo '=== compat (quick): 4 devkitPro examples built, recompiled and run on the HLE ==='
 	@$(COMPAT_ENV) $(PYTHON) tests/compat/sweep.py $(COMPAT_QUICK)
+
+# ---------------------------------------------------------------- DSP (M12)
+#
+# libctru's ndsp against our DSP HLE (hle/dsp.c): buffers played back to
+# back, rates, looping, stopping, and the init/shutdown handshake. The test
+# SD card holds a placeholder "DSP component" (ndsp insists on loading one).
+DSPT := out/dsp
+
+$(DSPT)/dsp_test.elf: tests/dsp/dsp_test.c
+	@mkdir -p $(DSPT)
+	$(ARM_CC) $(CTRU_FLAGS) -specs=3dsx.specs -L$(CTRU)/lib $< -lctru -lm -o $@
+
+$(DSPT)/gen_dsp_test.c: $(DSPT)/dsp_test.elf $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@ > $(DSPT)/recomp.log
+
+$(DSPT)/run_dsp_test: tests/m6/runner.c $(DSPT)/gen_dsp_test.c $(RUNTIME_DEP) $(HLE_DEP) $(GPU_DEP)
+	$(HOST_CC) $(HOST_FLAGS) -O0 -Ihle -Igpu -pthread $< $(DSPT)/gen_dsp_test.c $(RUNTIME_SRC) $(HLE_SRC) $(GPU_SRC) -lm -o $@
+
+test-dsp: $(DSPT)/run_dsp_test
+	@echo '=== DSP: libctru ndsp on our DSP HLE (tests/dsp/dsp_test.c) ==='
+	@timeout 120 ./$(DSPT)/run_dsp_test --sdmc tests/dsp/sdmc > $(DSPT)/dsp_test.out 2> $(DSPT)/dsp_test.log 	  || { cat $(DSPT)/dsp_test.log; echo "the DSP test did not exit cleanly"; exit 1; }
+	@diff -u tests/dsp/dsp_test.expected $(DSPT)/dsp_test.out && echo "    output matches dsp_test.expected"
 
 # ---------------------------------------------------------------- M11
 #
