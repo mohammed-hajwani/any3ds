@@ -125,10 +125,22 @@ def _pc(insn):
     return insn.address + (4 if _is_thumb(insn) else 8)
 
 
+# Relocatable output (CRO modules, M13). A module's code is only placed when
+# the game loads it, so every address that comes from where the code is
+# (pc reads, adr, return addresses) is relative to its runtime base: the
+# generated file defines RB. Addresses are then offsets into the module.
+RELOCATABLE = False
+
+
+def _code_addr(value):
+    """A code-derived address as a C expression."""
+    return f'(RB + {_imm(value)})' if RELOCATABLE else _imm(value)
+
+
 def _read_reg(insn, reg):
     n = _reg_num(insn, reg)
     if n == PC:
-        return _imm(_pc(insn))
+        return _code_addr(_pc(insn))
     return f'ctx->r[{n}]'
 
 
@@ -335,7 +347,7 @@ def _binary(insn, fc):
 
     if _is_thumb(insn) and _reg_num(insn, rn_op.reg) == PC and _encoding(insn) >> 11 == 0b10100:
         # Thumb `add rd, pc, #imm` (adr) uses pc aligned down to 4.
-        n = _imm(_pc(insn) & ~3)
+        n = _code_addr(_pc(insn) & ~3)
     else:
         n = _read_reg(insn, rn_op.reg)
     setflags = _sets_flags(insn) or not writes_rd
@@ -408,7 +420,7 @@ def _adr(insn, fc):
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
     rd = _dest_reg(insn, ops[0])
     base = _pc(insn) & ~3 if _is_thumb(insn) else _pc(insn)
-    return [f'ctx->r[{rd}] = {_imm(base + ops[1].imm)};']
+    return [f'ctx->r[{rd}] = {_code_addr(base + ops[1].imm)};']
 
 
 def _mul(insn, fc):
@@ -639,7 +651,7 @@ def _bl(insn, fc):
         if _reg_num(insn, op.reg) == PC:
             raise UnsupportedInstruction(insn, 'blx pc is unpredictable')
         return ['{', f'    uint32_t target = {_read_reg(insn, op.reg)};',
-                f'    ctx->r[14] = {_imm(ret)};', '    recomp_call(ctx, target);', '}']
+                f'    ctx->r[14] = {_code_addr(ret)};', '    recomp_call(ctx, target);', '}']
     target = _branch_target(insn)
     callee = fc.entries.get(target)
     if callee is None:
@@ -649,7 +661,7 @@ def _bl(insn, fc):
     if callee.thumb != expected_mode:
         mode = 'Thumb' if callee.thumb else 'ARM'
         raise UnsupportedInstruction(insn, f'calls {callee.name}, a {mode} function, without switching mode')
-    return [f'ctx->r[14] = {_imm(ret)};', f'{c_name(target)}(ctx);  /* {callee.name} */']
+    return [f'ctx->r[14] = {_code_addr(ret)};', f'{c_name(target)}(ctx);  /* {callee.name} */']
 
 
 def _bx(insn, fc):
@@ -676,7 +688,7 @@ def _computed_jump(insn, fc, op):
         raise UnsupportedInstruction(insn, 'writes pc (computed branches come later)')
     value = _read_reg(insn, op.reg)
     # Thumb `mov pc` doesn't switch mode on ARMv6; bit 0 is ignored.
-    lines = [f'switch ({value} & ~1u) {{']
+    lines = [f'switch (({value} & ~1u){" - RB" if RELOCATABLE else ""}) {{']
     for addr in sorted(fc.code_addrs):
         fc.labels.add(addr)
         lines.append(f'case {_imm(addr)}: goto L_{addr:08x};')
@@ -831,14 +843,17 @@ def _load(insn, fc):
         if insn.id == ARM_INS_LDR and addr.rn == PC and addr.const is not None and fc.program:
             # A veneer, `ldr pc, [pc, #-4]` + .word target: a jump to a
             # fixed address (bit 0 = Thumb), so a tail call to that function.
-            raw = fc.program.read(addr.const, 4)
+            raw = fc.program.literal(addr.const, 4)
             target = int.from_bytes(raw, 'little') if raw else None
             callee = fc.entries.get(target & ~1) if target is not None else None
-            if callee is None or callee.thumb != bool(target & 1):
-                where = f'{target:08x}' if target is not None else 'an unknown address'
-                raise UnsupportedInstruction(insn, f'jumps to {where}, which is not a function we recompiled')
             fc.terminates = True
-            return _tail_call(fc, f'{c_name(target & ~1)}(ctx);  /* veneer to {callee.name} */')
+            if callee is not None and callee.thumb == bool(target & 1):
+                return _tail_call(fc, f'{c_name(target & ~1)}(ctx);  /* veneer to {callee.name} */')
+            # The word isn't a constant we know: a CRO's import veneer, whose
+            # word the loader fills in when it links the module. Do what the
+            # CPU does: load it and jump there (bit 0 = Thumb).
+            return _tail_call(fc, f'recomp_call(ctx, read32(ctx, {_code_addr(addr.const)}));  '
+                                  '/* veneer through a word filled in at load time */')
         raise UnsupportedInstruction(insn, 'load into pc (indirect jumps come later)')
     if addr.mode != 'offset' and rt == addr.rn:
         raise UnsupportedInstruction(insn, 'writeback to the loaded register is unpredictable')
@@ -859,7 +874,7 @@ def _load(insn, fc):
         return f'(uint32_t)(int32_t)({sign}){v}' if sign else v
 
     if addr.mode == 'offset':
-        where = _imm(addr.const) if addr.const is not None else addr.apply(addr.base)
+        where = _code_addr(addr.const) if addr.const is not None else addr.apply(addr.base)
         return [f'ctx->r[{rt}] = {value(where)};']
     return _with_writeback(addr, rt, f'ctx->r[{rt}] = {value("a")}')
 
@@ -873,7 +888,7 @@ def _store(insn, fc):
     if addr.mode != 'offset' and rt == addr.rn:
         raise UnsupportedInstruction(insn, 'writeback to the stored register is unpredictable')
     if addr.mode == 'offset':
-        where = _imm(addr.const) if addr.const is not None else addr.apply(addr.base)
+        where = _code_addr(addr.const) if addr.const is not None else addr.apply(addr.base)
         return [f'{helper}(ctx, {where}, ctx->r[{rt}]);']
     return _with_writeback(addr, rt, f'{helper}(ctx, a, ctx->r[{rt}])')
 
@@ -897,7 +912,7 @@ def _ldrd_strd(insn, fc):
     if addr.mode == 'offset':
         # The address is computed once up front: ldrd may load over its own
         # base register.
-        where = _imm(addr.const) if addr.const is not None else addr.apply(addr.base)
+        where = _code_addr(addr.const) if addr.const is not None else addr.apply(addr.base)
         parts = [part.strip() + ';' for part in access.format(t=rt, t2=rt2, a='a').split(';')]
         return ['{', f'    uint32_t a = {where};'] + [f'    {part}' for part in parts] + ['}']
     return _with_writeback(addr, rt, access.format(t=rt, t2=rt2, a='a'))
@@ -958,7 +973,7 @@ def _block(insn, fc):
         a = _block_addr(start + 4 * i)
         if not load and r == PC:
             # Storing pc stores this instruction + 8 (ARM11's choice).
-            lines.append(f'    write32(ctx, {a}, {_imm(_pc(insn))});')
+            lines.append(f'    write32(ctx, {a}, {_code_addr(_pc(insn))});')
         elif not load:
             lines.append(f'    write32(ctx, {a}, ctx->r[{r}]);')
         elif r == PC:
@@ -1167,7 +1182,7 @@ def _vldr_vstr(insn, fc):
     if addr.mode != 'offset':
         raise UnsupportedInstruction(insn, 'unexpected addressing mode')
     size = 4 if k == 's' else 8
-    where = _imm(addr.const) if addr.const is not None else addr.apply(addr.base)
+    where = _code_addr(addr.const) if addr.const is not None else addr.apply(addr.base)
     reg = _vref(k, n)
     if insn.id == ARM_INS_VSTR:
         return [f'write{8 * size}(ctx, {where}, {reg});']

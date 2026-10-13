@@ -249,6 +249,26 @@ extern const uint32_t recomp_entry;
 /* Find a recompiled function by its guest entry address, with bit 0 set
    for Thumb functions (as in a function pointer); NULL if there is none. */
 GuestFn recomp_find(uint32_t addr);
+GuestFn recomp_find_static(uint32_t addr);      /* the main program's (generated) */
+
+/* ---- CRO modules (M13) ----
+   A module's code is recompiled relative to where it will be loaded: its
+   functions read the load address from *base (RB in the generated code).
+   When the game loads the module, the OS layer attaches it at that address,
+   and recomp_find then finds its functions there too. */
+typedef struct { uint32_t offset; GuestFn fn; } RecompModuleFn;   /* offset: bit 0 = Thumb */
+typedef struct {
+    const char *name;
+    size_t nfns;
+    const RecompModuleFn *fns;      /* sorted by offset */
+    uint32_t *base;
+} RecompModule;
+/* Every recompiled module linked into this program, NULL-terminated. A
+   program with modules defines this; the runtime's weak default has none. */
+const RecompModule *const *recomp_module_table(void);
+const RecompModule *recomp_module_named(const char *name);
+void recomp_module_attach(const RecompModule *m, uint32_t base, uint32_t size);
+void recomp_module_detach(const RecompModule *m);
 
 /* ---- The OS boundary ----
    `svc #n` (a system call into the 3DS kernel) calls recomp_svc, which the

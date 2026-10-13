@@ -38,11 +38,11 @@ ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-dsp test-compat-quick venv clean
+.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-m13 test-dsp test-compat-quick venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-dsp test-compat-quick
+test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-m13 test-dsp test-compat-quick
 
 venv: $(VENV)/.installed
 
@@ -432,6 +432,47 @@ COMPAT_QUICK := --only printing/colored-text --only input/read-controls --only r
 test-compat-quick: $(VENV)/.installed
 	@echo '=== compat (quick): 4 devkitPro examples built, recompiled and run on the HLE ==='
 	@$(COMPAT_ENV) $(PYTHON) tests/compat/sweep.py $(COMPAT_QUICK)
+
+# ---------------------------------------------------------------- M13: CRO modules
+#
+# Two CRO modules built from our own C (tests/m13/mod_{a,b}.c, mkcro.py),
+# recompiled relative to their load address (recomp --cro), loaded through
+# our ldr:ro by a libctru program (ro_test.c): A imports from B, which is
+# loaded after it, then A is reloaded elsewhere. The output must equal the
+# same modules compiled natively (native_main.c).
+M13 := out/m13
+M13_ARM_FLAGS := -marm -mcpu=mpcore -mfloat-abi=hard -O2 -fno-common
+
+$(M13)/mod_%.o: tests/m13/mod_%.c
+	@mkdir -p $(M13)/sdmc
+	$(ARM_CC) $(M13_ARM_FLAGS) -c $< -o $@
+
+$(M13)/sdmc/mod_%.cro: $(M13)/mod_%.o tests/m13/mkcro.py $(VENV)/.installed
+	$(PYTHON) tests/m13/mkcro.py $< mod_$* $@
+
+$(M13)/cro_%.c: $(M13)/sdmc/mod_%.cro $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@ > $(M13)/recomp_$*.log
+
+$(M13)/ro_test.elf: tests/m13/ro_test.c tests/m13/sequence.h
+	$(ARM_CC) $(CTRU_FLAGS) -specs=3dsx.specs -L$(CTRU)/lib $< -lctru -lm -o $@
+
+$(M13)/gen_ro_test.c: $(M13)/ro_test.elf $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@ > $(M13)/recomp_ro_test.log
+
+$(M13)/run_ro_test: tests/m6/runner.c $(M13)/gen_ro_test.c $(M13)/cro_a.c $(M13)/cro_b.c tests/m13/modules.c $(RUNTIME_DEP) $(HLE_DEP) $(GPU_DEP)
+	$(HOST_CC) $(HOST_FLAGS) -O0 -Ihle -Igpu -pthread $< $(M13)/gen_ro_test.c $(M13)/cro_a.c $(M13)/cro_b.c \
+	  tests/m13/modules.c $(RUNTIME_SRC) $(HLE_SRC) $(GPU_SRC) -lm -o $@
+
+$(M13)/native: tests/m13/native_main.c tests/m13/mod_a.c tests/m13/mod_b.c tests/m13/sequence.h
+	@mkdir -p $(M13)
+	$(HOST_CC) -std=c11 -O1 -Wall -fno-common $(filter %.c,$^) -o $@
+
+test-m13: $(M13)/run_ro_test $(M13)/native $(M13)/sdmc/mod_a.cro $(M13)/sdmc/mod_b.cro
+	@echo '=== M13: two CRO modules through our ldr:ro, recompiled relative to their load address ==='
+	@./$(M13)/native > $(M13)/expected.out
+	@timeout 120 ./$(M13)/run_ro_test --sdmc $(M13)/sdmc > $(M13)/ro_test.out 2> $(M13)/ro_test.log \
+	  || { cat $(M13)/ro_test.log; echo "the CRO test did not exit cleanly"; exit 1; }
+	@diff -u $(M13)/expected.out $(M13)/ro_test.out && echo "    output matches the modules compiled natively ($$(wc -l < $(M13)/expected.out) lines)"
 
 # ---------------------------------------------------------------- DSP (M12)
 #

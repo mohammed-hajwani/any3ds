@@ -3,6 +3,7 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 
@@ -51,6 +52,83 @@ static void svc_unimplemented(Ctx *ctx, uint32_t number)
 }
 
 SvcHandler recomp_svc_handler = svc_unimplemented;
+
+/* ---- CRO modules (see context.h) */
+
+/* No modules unless the program links a table of them (tools/build_dump.sh). */
+__attribute__((weak)) const RecompModule *const *recomp_module_table(void)
+{
+    static const RecompModule *const none[] = { NULL };
+    return none;
+}
+
+#define MAX_ATTACHED 64
+static struct { const RecompModule *m; uint32_t base, size; } attached[MAX_ATTACHED];
+static int nattached;
+
+const RecompModule *recomp_module_named(const char *name)
+{
+    const RecompModule *const *mods = recomp_module_table();
+    for (int i = 0; mods[i]; i++)
+        if (strcmp(mods[i]->name, name) == 0)
+            return mods[i];
+    return NULL;
+}
+
+void recomp_module_attach(const RecompModule *m, uint32_t base, uint32_t size)
+{
+    recomp_module_detach(m);
+    if (nattached == MAX_ATTACHED) {
+        fprintf(stderr, "recomp: more than %d CRO modules loaded at once\n", MAX_ATTACHED);
+        abort();
+    }
+    *m->base = base;
+    attached[nattached].m = m;
+    attached[nattached].base = base;
+    attached[nattached].size = size;
+    nattached++;
+}
+
+void recomp_module_detach(const RecompModule *m)
+{
+    for (int i = 0; i < nattached; i++)
+        if (attached[i].m == m) {
+            attached[i] = attached[--nattached];
+            return;
+        }
+}
+
+/* The main program's functions: generated code defines this (emit_c.py);
+   a test that links no recompiled program gets none. */
+__attribute__((weak)) GuestFn recomp_find_static(uint32_t addr)
+{
+    (void)addr;
+    return NULL;
+}
+
+GuestFn recomp_find(uint32_t addr)
+{
+    GuestFn fn = recomp_find_static(addr);
+    if (fn)
+        return fn;
+    for (int i = 0; i < nattached; i++) {
+        uint32_t off = addr - attached[i].base;
+        if (off >= attached[i].size)
+            continue;
+        const RecompModuleFn *f = attached[i].m->fns;
+        size_t lo = 0, hi = attached[i].m->nfns;
+        while (lo < hi) {           /* binary search by offset (bit 0 = Thumb) */
+            size_t mid = lo + (hi - lo) / 2;
+            if (f[mid].offset == off)
+                return f[mid].fn;
+            if (f[mid].offset < off)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+    }
+    return NULL;
+}
 
 TickHandler recomp_tick_handler;   /* NULL: no OS layer, time doesn't matter */
 

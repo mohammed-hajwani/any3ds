@@ -7,6 +7,8 @@ from pathlib import Path
 
 from capstone.arm import ARM_INS_B, ARM_INS_BLX
 
+from . import cro as cro_format
+from . import emit_c, translate
 from .ctr_loader import load_ctr
 from .disasm import DisasmError, disassemble
 from .discover import discover
@@ -107,6 +109,13 @@ def _load_without_symbols(args):
                 value = int(line, 16)
                 extra.append((value & ~1, bool(value & 1)))
     functions, report = discover(program, extra)
+    if path.suffix.lower() in ('.cxi', '.3ds', '.cci'):
+        # Words the CRO loader patches in the main program (static.crs:
+        # addresses of functions in modules) must be read at run time.
+        crs = _static_crs(path)
+        if crs is not None:
+            patched = {crs.segments[p.at[0]].offset + p.at[1] for imp in crs.imports for p in imp.patches}
+            program.data_ranges = cro_format.without_patched(program.data_ranges, patched)
     decoded = {fn.addr: _decode(fn) for fn in functions}
     lines = [f'{k}: {v}' for k, v in report.items() if k != 'rejected']
     lines += [f'rejected {value:08x}: {why}' for value, why in sorted(report['rejected'].items())]
@@ -115,6 +124,37 @@ def _load_without_symbols(args):
     print(f'discovery: {report["functions"]} functions, {report["instructions"]} instructions, '
           f'{report["pointer_functions"]} found through pointers, {len(report["rejected"])} pointers rejected')
     return program, functions, decoded
+
+
+def _static_crs(path):
+    """The game's static.crs (what the main program exports to its CRO
+    modules and imports from them), or None if it has no RomFS or no CRS."""
+    from .romfs import RomFS
+    try:
+        fs = RomFS(path)
+    except LoadError:
+        return None
+    for name in ('static.crs', 'cro/static.crs'):
+        try:
+            return cro_format.parse(fs.read(name))
+        except LoadError:
+            continue
+    return None
+
+
+def _load_cro(args):
+    """A CRO module, recompiled to code relative to its load address."""
+    from .romfs import RomFS
+    path = Path(args.input)
+    data = path.read_bytes() if path.suffix.lower() == '.cro' else RomFS(path).read(args.cro)
+    module = cro_format.parse(data)
+    program, roots = cro_format.relocated_program(module)
+    functions, report = discover(program, roots)
+    program.data_ranges = cro_format.without_patched(program.data_ranges, program.patched)
+    decoded = {fn.addr: _decode(fn) for fn in functions}
+    print(f'module {module.name}: {report["functions"]} functions, {report["instructions"]} instructions, '
+          f'{len(roots)} exported or hooks, {report["pointer_functions"]} found through relocations')
+    return module, program, functions, decoded
 
 
 def _report_failures(path, failures):
@@ -151,13 +191,21 @@ def main(argv=None):
     parser.add_argument('--split', type=int, metavar='N',
                         help='put the functions in extra files of N functions each (OUTPUT_001.c, ...) '
                              'so a big program compiles in parallel')
+    parser.add_argument('--cro', metavar='MODULE',
+                        help='recompile the CRO module MODULE (a path in the RomFS of INPUT, a decrypted dump; '
+                             'or give a .cro file as INPUT) into code relative to its load address')
     parser.add_argument('--entries', metavar='FILE',
                         help='extra function starts, one hex address per line (bit 0 = Thumb)')
     args = parser.parse_args(argv)
 
     try:
         path = Path(args.input)
-        if args.no_symbols or path.is_dir() or path.suffix.lower() in ('.cxi', '.3ds', '.cci', '.app'):
+        module = None
+        if args.cro or path.suffix.lower() == '.cro':
+            module, program, functions, decoded = _load_cro(args)
+            translate.RELOCATABLE = True
+            emit_c.NAME_PREFIX = emit_c.module_prefix(module.name)
+        elif args.no_symbols or path.is_dir() or path.suffix.lower() in ('.cxi', '.3ds', '.cci', '.app'):
             program, functions, decoded = _load_without_symbols(args)
         else:
             program = load_program(args.input)
@@ -180,7 +228,10 @@ def main(argv=None):
             _report_failures(args.output.with_suffix('.failures.txt'), failures)
 
         header = args.output.with_suffix('.h')
-        c_src, h_src = emit(translated, header.name, program, trace=args.trace, split=args.split)
+        if module is not None:
+            c_src, h_src = emit_c.emit_module(translated, header.name, module.name, split=args.split)
+        else:
+            c_src, h_src = emit(translated, header.name, program, trace=args.trace, split=args.split)
     except (LoadError, DisasmError, UnsupportedInstruction) as e:
         # Nothing has been written yet, so a failed run leaves no stale output.
         print(f'recomp: error: {e}', file=sys.stderr)
@@ -194,10 +245,13 @@ def main(argv=None):
             args.output.with_name(f'{args.output.stem}_{i:03d}.c').write_text(chunk, newline='\n')
     else:
         args.output.write_text(c_src, newline='\n')
+    if module is not None:
+        # For the table of modules a program links (tools/build_dump.sh).
+        args.output.with_suffix('.module').write_text(re.sub(r'\W', '_', module.name) + '\n', newline='\n')
 
     for tf in translated:
         n = sum(1 for _, _, lines in tf.body if lines)
-        print(f'  {c_name(tf.fn.addr)}  {tf.fn.name}  ({n} instructions)')
+        print(f'  {emit_c.c_name(tf.fn.addr)}  {tf.fn.name}  ({n} instructions)')
     extra = f' (+ {len(c_src) - 1} files of functions)' if args.split else ''
     print(f'wrote {args.output}{extra} and {header.name}')
     return 0

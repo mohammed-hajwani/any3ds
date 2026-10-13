@@ -78,7 +78,9 @@ class Explored:
 class Discovery:
     def __init__(self, program):
         self.program = program
-        code = [s for s in program.segments if not s.writable and s.vaddr == program.entry & ~1]
+        # A CRO module has no entry point; it names its text segment instead.
+        code = [program.text_segment] if getattr(program, 'text_segment', None) else \
+            [s for s in program.segments if not s.writable and s.vaddr == program.entry & ~1]
         if not code:
             raise LoadError('no code segment at the entry point')
         self.text = code[0]
@@ -535,7 +537,8 @@ class Discovery:
 
     def run(self, extra=()):
         """Returns (functions, report)."""
-        roots = {(self.program.entry & ~1, bool(self.program.entry & 1))} | set(extra)
+        entry = self.program.entry
+        roots = ({(entry & ~1, bool(entry & 1))} if entry is not None else set()) | set(extra)
         accepted, rejected = set(), {}
         while True:
             try:
@@ -692,6 +695,10 @@ class Discovery:
         out = set()
         for fn in fns.values():
             out |= fn.pointers
+        exact = getattr(self.program, 'pointer_candidates', None)
+        if exact is not None:
+            # A CRO's relocations say exactly which words point into its code.
+            return out | exact
         for seg in self.program.segments:
             if seg is self.text:
                 continue

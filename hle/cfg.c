@@ -24,6 +24,19 @@ static void read_block(uint32_t id, uint8_t *out, uint32_t size)
         if (size >= 4)
             out[3] = 110;
         return;
+    case 0x00070001:            /* sound output: 1 = stereo */
+        out[0] = 1;
+        return;
+    case 0x000B0001: {          /* country name, UTF-16, one 0x80-byte entry per language */
+        static const char country[] = "United Kingdom";
+        for (uint32_t lang = 0; (lang + 1) * 0x80 <= size; lang++)
+            for (uint32_t i = 0; country[i]; i++)
+                out[lang * 0x80 + 2 * i] = (uint8_t)country[i];
+        return;
+    }
+    case 0x000B0002:            /* state name (UTF-16 per language): none */
+    case 0x000B0003:            /* coordinates: 0, 0 */
+        return;
     case 0x000A0000: {          /* user name: UTF-16, then flags */
         static const char name[] = "any3ds";
         for (uint32_t i = 0; name[i] && 2 * i + 1 < size; i++)
