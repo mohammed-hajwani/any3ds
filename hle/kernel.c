@@ -265,6 +265,14 @@ static void vblank(void *arg)
     frame_count++;
     gsp_vblank();
     hid_vblank(frame_count);
+    if (config.live_path && frame_count % config.live_every == 0) {
+        /* A live view (runner --live): written to a side file, then renamed,
+           so a viewer never reads half a picture. */
+        char tmp[1024];
+        snprintf(tmp, sizeof tmp, "%s.tmp", config.live_path);
+        if (gsp_dump_screens(tmp))
+            rename(tmp, config.live_path);
+    }
 }
 
 void kernel_start_vblank(void)

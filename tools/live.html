@@ -1,0 +1,38 @@
+<!doctype html>
+<!-- Watch a run live: start the runner with `--live live.bmp` (in the folder
+     this page is in, or edit SRC below) and open this page in a browser.
+     It reloads the picture a few times a second. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>any3ds live</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0d1117;
+         color: #e6edf3; font: 14px system-ui, sans-serif; }
+  figure { margin: 16px; text-align: center; }
+  img { image-rendering: pixelated; width: min(800px, 92vw); height: auto; background: #000;
+        border-radius: 6px; box-shadow: 0 0 0 1px #30363d; }
+  figcaption { margin-top: 8px; color: #8b949e; }
+</style>
+</head>
+<body>
+<figure>
+  <img id="screen" alt="both 3DS screens: top above bottom" hidden>
+  <figcaption id="status">waiting for the first frame...</figcaption>
+</figure>
+<script>
+  const SRC = new URLSearchParams(location.search).get('src') || 'live.bmp';
+  const img = document.getElementById('screen'), status = document.getElementById('status');
+  let frames = 0;
+  function refresh() {
+    const next = new Image();
+    next.onload = () => { img.src = next.src; img.hidden = false; status.textContent = `live: ${SRC} (update ${++frames})`; setTimeout(refresh, 250); };
+    next.onerror = () => setTimeout(refresh, 500);
+    next.src = `${SRC}?t=${Date.now()}`;
+  }
+  refresh();
+</script>
+</body>
+</html>

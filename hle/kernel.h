@@ -97,6 +97,8 @@ typedef struct {
     uint32_t entry;
     uint32_t max_seconds;           /* virtual-time limit, catches hangs */
     void   (*on_exit)(void);        /* e.g. dump the framebuffer */
+    const char *live_path;          /* if set: the screens are saved here every live_every frames */
+    uint32_t live_every;
 } HleConfig;
 void hle_run(uint8_t *mem, const HleConfig *config) __attribute__((noreturn));
 

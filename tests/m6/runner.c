@@ -2,6 +2,7 @@
  *
  *   runner [--max-seconds N] [--hold FRAME:KEYS]... [--touch FRAME:X,Y|FRAME:up]...
  *          [--sdmc DIR] [--save DIR] [--romfs FILE] [--shared-font FILE] [--dump FILE.bmp]
+ *          [--live FILE.bmp]
  *
  * --hold presses buttons from a frame on (KEYS in hex, libctru's KEY_*
  * bits; 0 releases them), e.g. --hold 10:8 holds START from frame 10.
@@ -11,6 +12,8 @@
  * app its RomFS (a RomFS image, or the .3dsx or decrypted .cxi/.3ds that
  * carries one). --shared-font gives it the system font: firmware we never
  * ship, so it must be your own dump of it (a .bcfnt).
+ * --live saves both screens to FILE.bmp every 30 frames while it runs, to
+ * watch it (tools/live.html shows that file, refreshing).
  * --dump saves the last frame shown when the program exits: the top
  * screen above the bottom one. Guest debug output (svcOutputDebugString) goes to stdout; the
  * OS layer's log goes to stderr (HLE_TRACE=1 logs every svc and IPC). */
@@ -32,7 +35,8 @@ static void on_exit_dump(void)
 static void usage(void)
 {
     fprintf(stderr, "usage: runner [--max-seconds N] [--hold FRAME:KEYS]... [--touch FRAME:X,Y|FRAME:up]...\n"
-                    "              [--sdmc DIR] [--save DIR] [--romfs FILE] [--shared-font FILE] [--dump FILE.bmp]\n");
+                    "              [--sdmc DIR] [--save DIR] [--romfs FILE] [--shared-font FILE] [--dump FILE.bmp]\n"
+                    "              [--live FILE.bmp]\n");
     exit(2);
 }
 
@@ -71,6 +75,9 @@ int main(int argc, char **argv)
                 fprintf(stderr, "runner: can't read a RomFS from %s\n", argv[i]);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--live") == 0) {
+            config.live_path = argv[++i];
+            config.live_every = 30;
         } else if (strcmp(argv[i], "--dump") == 0) {
             dump_path = argv[++i];
         } else {
