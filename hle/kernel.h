@@ -130,6 +130,7 @@ void hid_hold_keys(uint32_t frame, uint32_t keys);
 void hid_touch(uint32_t frame, int down, uint32_t x, uint32_t y);
 int  gsp_dump_screens(const char *path);
 void fs_set_sdmc(const char *dir);          /* back the SD card with a host folder */
+void fs_set_save(const char *dir);          /* back the app's save data with a host folder */
 int  fs_set_romfs(const char *path);        /* the app's RomFS: an image, a .3dsx or a decrypted .cxi/.3ds */
 int  apt_set_shared_font(const char *path); /* your own dump of the system font (a .bcfnt) */
 

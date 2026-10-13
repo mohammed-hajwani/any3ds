@@ -1,10 +1,13 @@
 /* FS (fs:USER): files.
  *
- * Two archives are backed by something real:
- *   SDMC (9)    the SD card: a host folder (runner --sdmc DIR); none by default
- *   ROMFS (3)   this app's read-only RomFS: served from a host file (runner
- *               --romfs FILE), a raw RomFS image, a decrypted .cxi/.3ds, or a .3dsx, whose
- *               RomFS sits at the offset its header gives (fsOffset)
+ * Three archives are backed by something real:
+ *   SDMC (9)      the SD card: a host folder (runner --sdmc DIR); none by default
+ *   SAVEDATA (4)  this app's save data: a host folder (runner --save DIR) holding
+ *                 data/ (the files) and format.bin (written by FormatSaveData;
+ *                 until then the archive is "not formatted" and the app formats it)
+ *   ROMFS (3)     this app's read-only RomFS: served from a host file (runner
+ *                 --romfs FILE), a raw RomFS image, a decrypted .cxi/.3ds, or a .3dsx, whose
+ *                 RomFS sits at the offset its header gives (fsOffset)
  * Opening a file or directory returns a new session (handle) on which the
  * app sends FSFILE_* / FSDIR_* commands.
  *
@@ -25,13 +28,17 @@
 
 #include "service.h"
 
-#define ARCHIVE_ROMFS 3
-#define ARCHIVE_SDMC  9
+#define ARCHIVE_ROMFS    3
+#define ARCHIVE_SAVEDATA 4
+#define ARCHIVE_SDMC     9
 
 #define RES_FS_NOT_FOUND      0xC8804478u
 #define RES_FS_EXISTS         0xC82044BEu
 #define RES_FS_BAD_PATH       0xE0E046BEu
 #define RES_FS_NOT_SUPPORTED  0xE0C046BEu
+/* An unformatted save data archive: level Status, summary InvalidState,
+   module FS, description 340. Games format their save when they see it. */
+#define RES_FS_NOT_FORMATTED  0xC8A04554u
 
 #define PATH_EMPTY  1
 #define PATH_BINARY 2
@@ -42,6 +49,8 @@
 #define OPEN_CREATE 4
 
 static const char *sdmc_dir;
+static const char *save_dir;
+static char save_data_dir[512];
 static uint8_t *romfs;              /* the RomFS image, from the RomFS header on */
 static uint64_t romfs_size;
 
@@ -68,6 +77,59 @@ static int narchives;
 void fs_set_sdmc(const char *dir)
 {
     sdmc_dir = dir;
+}
+
+void fs_set_save(const char *dir)
+{
+    save_dir = dir;
+    mkdir(dir, 0755);
+    snprintf(save_data_dir, sizeof save_data_dir, "%s/data", dir);
+}
+
+/* Save data format (FormatSaveData): total size, directories, files, duplicate. */
+typedef struct { uint32_t total_size, dirs, files, duplicate; } SaveFormat;
+
+static int save_format(SaveFormat *out)
+{
+    char path[600];
+    if (!save_dir)
+        return 0;
+    snprintf(path, sizeof path, "%s/format.bin", save_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    int ok = fread(out, sizeof *out, 1, f) == 1;
+    fclose(f);
+    return ok;
+}
+
+/* The host folder behind an archive id, or NULL if it has none (yet). */
+static const char *archive_root(int id)
+{
+    SaveFormat fmt;
+    if (id == ARCHIVE_SDMC)
+        return sdmc_dir;
+    if (id == ARCHIVE_SAVEDATA && save_format(&fmt))
+        return save_data_dir;
+    return NULL;
+}
+
+static void remove_tree(const char *path)
+{
+    DIR *d = opendir(path);
+    if (d) {
+        for (struct dirent *e; (e = readdir(d));) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                continue;
+            char child[1024];
+            snprintf(child, sizeof child, "%s/%s", path, e->d_name);
+            remove_tree(child);
+        }
+        closedir(d);
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
 }
 
 static uint32_t le32(const uint8_t *p)
@@ -196,13 +258,15 @@ static int path_to_utf8(uint32_t type, uint32_t size, uint32_t addr, char *out, 
     return strstr(out, "..") == NULL;
 }
 
-/* The host path of an SD card path; 0 if there is no SD card or it's refused. */
-static int sd_path(uint32_t type, uint32_t size, uint32_t addr, char *out, size_t cap)
+/* The host path of a path in archive `id`; 0 if the archive has no host
+   folder or the path is refused. */
+static int arch_path(int id, uint32_t type, uint32_t size, uint32_t addr, char *out, size_t cap)
 {
     char rel[400];
-    if (!sdmc_dir || !path_to_utf8(type, size, addr, rel, sizeof rel))
+    const char *root = archive_root(id);
+    if (!root || !path_to_utf8(type, size, addr, rel, sizeof rel))
         return 0;
-    snprintf(out, cap, "%s/%s", sdmc_dir, rel[0] == '/' ? rel + 1 : rel);
+    snprintf(out, cap, "%s/%s", root, rel[0] == '/' ? rel + 1 : rel);
     return 1;
 }
 
@@ -220,12 +284,12 @@ static void reply_handle(uint32_t *cmd, KObj *o)
     cmd[3] = handle_new(o);
 }
 
-static void open_sd_file(uint32_t *cmd, uint32_t type, uint32_t size, uint32_t addr, uint32_t flags)
+static void open_file(int id, uint32_t *cmd, uint32_t type, uint32_t size, uint32_t addr, uint32_t flags)
 {
     File *f = calloc(1, sizeof *f);
-    if (!f || !sd_path(type, size, addr, f->path, sizeof f->path)) {
+    if (!f || !arch_path(id, type, size, addr, f->path, sizeof f->path)) {
         free(f);
-        ipc_reply(cmd, sdmc_dir ? RES_FS_BAD_PATH : RES_FS_NOT_FOUND);
+        ipc_reply(cmd, archive_root(id) ? RES_FS_BAD_PATH : RES_FS_NOT_FOUND);
         return;
     }
     int mode = (flags & OPEN_WRITE) ? O_RDWR : O_RDONLY;
@@ -245,11 +309,11 @@ static int name_cmp(const void *a, const void *b)
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
-static void open_sd_dir(uint32_t *cmd, uint32_t type, uint32_t size, uint32_t addr)
+static void open_dir(int id, uint32_t *cmd, uint32_t type, uint32_t size, uint32_t addr)
 {
     Dir *d = calloc(1, sizeof *d);
     DIR *h = NULL;
-    if (!d || !sd_path(type, size, addr, d->path, sizeof d->path) || !(h = opendir(d->path))) {
+    if (!d || !arch_path(id, type, size, addr, d->path, sizeof d->path) || !(h = opendir(d->path))) {
         free(d);
         ipc_reply(cmd, RES_FS_NOT_FOUND);
         return;
@@ -290,7 +354,11 @@ void fs_handle(KObj *session, uint32_t *cmd)
         return;
     case 0x080C: {  /* OpenArchive(id, path type, path size; path) -> u64 archive handle */
         uint32_t id = cmd[1];
-        if (!(id == ARCHIVE_SDMC && sdmc_dir) || narchives == MAX_ARCHIVES) {
+        if (id == ARCHIVE_SAVEDATA && !archive_root((int)id)) {
+            ipc_reply(cmd, RES_FS_NOT_FORMATTED);      /* the app formats it, then opens it again */
+            return;
+        }
+        if (!archive_root((int)id) || narchives == MAX_ARCHIVES) {
             fprintf(stderr, "hle: FS OpenArchive(0x%" PRIx32 "): not available, returning not-found\n", id);
             ipc_reply(cmd, RES_FS_NOT_FOUND);
             return;
@@ -306,11 +374,7 @@ void fs_handle(KObj *session, uint32_t *cmd)
         ipc_reply(cmd, RES_OK);
         return;
     case 0x0802:    /* OpenFile(0, archive, path type, size, flags, attributes; path) */
-        if (archive_of(cmd[2]) != ARCHIVE_SDMC) {
-            ipc_reply(cmd, RES_FS_NOT_FOUND);
-            return;
-        }
-        open_sd_file(cmd, cmd[4], cmd[5], cmd[9], cmd[6]);
+        open_file(archive_of(cmd[2]), cmd, cmd[4], cmd[5], cmd[9], cmd[6]);
         return;
     case 0x0803: {  /* OpenFileDirectly(0, archive id, archive path type/size, file path type/size, flags, attrs) */
         uint32_t id = cmd[2];
@@ -326,8 +390,8 @@ void fs_handle(KObj *session, uint32_t *cmd)
             reply_handle(cmd, session_new(&file_service, f));
             return;
         }
-        if (id == ARCHIVE_SDMC) {
-            open_sd_file(cmd, cmd[5], cmd[6], cmd[12], cmd[7]);
+        if (archive_root((int)id)) {
+            open_file((int)id, cmd, cmd[5], cmd[6], cmd[12], cmd[7]);
             return;
         }
         fprintf(stderr, "hle: FS OpenFileDirectly on archive 0x%" PRIx32 ": not available\n", id);
@@ -335,21 +399,76 @@ void fs_handle(KObj *session, uint32_t *cmd)
         return;
     }
     case 0x080B:    /* OpenDirectory(archive, path type, size; path) */
-        if (archive_of(cmd[1]) != ARCHIVE_SDMC) {
-            ipc_reply(cmd, RES_FS_NOT_FOUND);
-            return;
-        }
-        open_sd_dir(cmd, cmd[3], cmd[4], cmd[6]);
+        open_dir(archive_of(cmd[1]), cmd, cmd[3], cmd[4], cmd[6]);
         return;
     case 0x0804:    /* DeleteFile(0, archive, path type, size; path) */
-        if (archive_of(cmd[2]) != ARCHIVE_SDMC || !sd_path(cmd[4], cmd[5], cmd[7], path, sizeof path)) {
+        if (!arch_path(archive_of(cmd[2]), cmd[4], cmd[5], cmd[7], path, sizeof path)) {
             ipc_reply(cmd, RES_FS_NOT_FOUND);
             return;
         }
         ipc_reply(cmd, unlink(path) == 0 ? RES_OK : RES_FS_NOT_FOUND);
         return;
+    case 0x0805: {  /* RenameFile(0, src archive, type, size, dst archive, type, size; src, dst paths) */
+        char to[512];
+        if (!arch_path(archive_of(cmd[2]), cmd[4], cmd[5], cmd[11], path, sizeof path)
+            || !arch_path(archive_of(cmd[6]), cmd[8], cmd[9], cmd[13], to, sizeof to)) {
+            ipc_reply(cmd, RES_FS_NOT_FOUND);
+            return;
+        }
+        ipc_reply(cmd, rename(path, to) == 0 ? RES_OK : RES_FS_NOT_FOUND);
+        return;
+    }
+    case 0x0806:    /* DeleteDirectory(0, archive, path type, size; path) */
+    case 0x0807:    /* DeleteDirectoryRecursively(0, archive, path type, size; path) */
+        if (!arch_path(archive_of(cmd[2]), cmd[4], cmd[5], cmd[7], path, sizeof path)) {
+            ipc_reply(cmd, RES_FS_NOT_FOUND);
+            return;
+        }
+        if ((cmd[0] >> 16) == 0x0807)
+            remove_tree(path);
+        ipc_reply(cmd, (cmd[0] >> 16) == 0x0807 || rmdir(path) == 0 ? RES_OK : RES_FS_NOT_FOUND);
+        return;
+    case 0x080D:    /* ControlArchive(archive, action, ...): 0 = commit save data */
+        if (cmd[3] != 0) {
+            fprintf(stderr, "hle: FS ControlArchive action %" PRIu32 " is not implemented\n", cmd[3]);
+            exit(3);
+        }
+        ipc_reply(cmd, RES_OK);                 /* our files are written as they go */
+        return;
+    case 0x0845: {  /* GetFormatInfo(archive id, path type, size; path) -> size, dirs, files, duplicate */
+        SaveFormat fmt;
+        if (cmd[1] != ARCHIVE_SAVEDATA || !save_format(&fmt)) {
+            ipc_reply(cmd, cmd[1] == ARCHIVE_SAVEDATA ? RES_FS_NOT_FORMATTED : RES_FS_NOT_SUPPORTED);
+            return;
+        }
+        cmd[0] = ipc_header(0x0845, 5, 0);
+        cmd[1] = RES_OK;
+        cmd[2] = fmt.total_size;
+        cmd[3] = fmt.dirs;
+        cmd[4] = fmt.files;
+        cmd[5] = fmt.duplicate;
+        return;
+    }
+    case 0x084C: {  /* FormatSaveData(archive id, path type, size, block size, dirs, files,
+                       dir buckets, file buckets, duplicate; path) */
+        if (cmd[1] != ARCHIVE_SAVEDATA || !save_dir) {
+            fprintf(stderr, "hle: FS FormatSaveData: give the runner a folder for save data (--save DIR)\n");
+            exit(3);
+        }
+        remove_tree(save_data_dir);
+        mkdir(save_data_dir, 0755);
+        SaveFormat fmt = { 0x100000, cmd[5], cmd[6], cmd[9] & 0xFF };
+        char fpath[600];
+        snprintf(fpath, sizeof fpath, "%s/format.bin", save_dir);
+        FILE *f = fopen(fpath, "wb");
+        int ok = f && fwrite(&fmt, sizeof fmt, 1, f) == 1;
+        if (f)
+            fclose(f);
+        ipc_reply(cmd, ok ? RES_OK : RES_FS_NOT_FOUND);
+        return;
+    }
     case 0x0808: {  /* CreateFile(0, archive, path type, size, attributes, u64 file size; path) */
-        if (archive_of(cmd[2]) != ARCHIVE_SDMC || !sd_path(cmd[4], cmd[5], cmd[10], path, sizeof path)) {
+        if (!arch_path(archive_of(cmd[2]), cmd[4], cmd[5], cmd[10], path, sizeof path)) {
             ipc_reply(cmd, RES_FS_NOT_FOUND);
             return;
         }
@@ -364,7 +483,7 @@ void fs_handle(KObj *session, uint32_t *cmd)
         return;
     }
     case 0x0809:    /* CreateDirectory(0, archive, path type, size, attributes; path) */
-        if (archive_of(cmd[2]) != ARCHIVE_SDMC || !sd_path(cmd[4], cmd[5], cmd[8], path, sizeof path)) {
+        if (!arch_path(archive_of(cmd[2]), cmd[4], cmd[5], cmd[8], path, sizeof path)) {
             ipc_reply(cmd, RES_FS_NOT_FOUND);
             return;
         }

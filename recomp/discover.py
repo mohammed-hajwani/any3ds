@@ -302,6 +302,24 @@ class Discovery:
         If it points at code, it may be called: ARMCC's interworking veneer
         `add ip, pc, #1; bx ip` enters the Thumb function right after it."""
         ops = insn.operands
+        regs = [_reg_num(insn, op.reg) for op in ops if op.type == ARM_OP_REG]
+        if insn.id == ARM_INS_ADD and PC in regs[1:] and len(regs) == len(ops) and len(regs) >= 2:
+            # Position-independent code: `ldr rX, =offset` then `add rX, pc`
+            # (Thumb) or `add rX, pc, rX` (ARM): the address is the literal
+            # plus pc, here.
+            other = [r for r in regs[1:] if r != PC] or [regs[0]]
+            load = next((p for p in self._back(fn, insn.address, 8) if self._writes(p, other[0])), None)
+            mem = load.operands[1] if load is not None and len(load.operands) == 2 else None
+            if load is None or load.id != ARM_INS_LDR or mem.type != ARM_OP_MEM or \
+                    _reg_num(load, mem.mem.base) != PC:
+                return
+            raw = self.program.read(_address(load).const, 4)
+            if raw is None:
+                return
+            value = (int.from_bytes(raw, 'little') + insn.address + (4 if thumb else 8)) & 0xFFFFFFFF
+            if self.in_text(value & ~1):
+                fn.pointers.add(value)
+            return
         if insn.id == ARM_INS_ADR:          # Capstone's Thumb form: the offset from Align(pc, 4)
             if len(ops) != 2 or ops[1].type != ARM_OP_IMM:
                 return
@@ -695,6 +713,7 @@ class Discovery:
         out = set()
         for fn in fns.values():
             out |= fn.pointers
+        out |= getattr(self.program, 'pointer_hints', set())
         exact = getattr(self.program, 'pointer_candidates', None)
         if exact is not None:
             # A CRO's relocations say exactly which words point into its code.

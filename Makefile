@@ -493,7 +493,8 @@ $(DSPT)/run_dsp_test: tests/m6/runner.c $(DSPT)/gen_dsp_test.c $(RUNTIME_DEP) $(
 
 test-dsp: $(DSPT)/run_dsp_test
 	@echo '=== DSP: libctru ndsp on our DSP HLE (tests/dsp/dsp_test.c) ==='
-	@timeout 120 ./$(DSPT)/run_dsp_test --sdmc tests/dsp/sdmc > $(DSPT)/dsp_test.out 2> $(DSPT)/dsp_test.log 	  || { cat $(DSPT)/dsp_test.log; echo "the DSP test did not exit cleanly"; exit 1; }
+	@timeout 120 ./$(DSPT)/run_dsp_test --sdmc tests/dsp/sdmc > $(DSPT)/dsp_test.out 2> $(DSPT)/dsp_test.log \
+	  || { cat $(DSPT)/dsp_test.log; echo "the DSP test did not exit cleanly"; exit 1; }
 	@diff -u tests/dsp/dsp_test.expected $(DSPT)/dsp_test.out && echo "    output matches dsp_test.expected"
 
 # ---------------------------------------------------------------- M11
@@ -521,8 +522,15 @@ test-m11: $(M11)/run_hello $(M6)/hello.elf
 	@echo '=== M11: function discovery without symbols, against the ELF symbols it never saw ==='
 	@$(PYTHON) tests/m11/recall.py $(M6)/hello.elf --min 90
 	@echo "=== M11: hello world from a symbol-less, compressed .cxi: $$(head -1 $(M11)/recomp_hello.log) ==="
-	@timeout 120 ./$(M11)/run_hello --hold 10:8 --dump $(M11)/frame.bmp > $(M11)/hello.out 2> $(M11)/hello.log 	  || { cat $(M11)/hello.log; echo "hello world (from code.bin) did not exit cleanly"; exit 1; }
-	@echo "$$(cat tests/m6/hello_frame.sha256)  $(M11)/frame.bmp" | sha256sum -c --quiet 	  && echo "    the screens match the frame recorded from the ELF (tests/m6/hello_frame.sha256)"
+	@timeout 120 ./$(M11)/run_hello --hold 10:8 --dump $(M11)/frame.bmp > $(M11)/hello.out 2> $(M11)/hello.log \
+	  || { cat $(M11)/hello.log; echo "hello world (from code.bin) did not exit cleanly"; exit 1; }
+	@echo "$$(cat tests/m6/hello_frame.sha256)  $(M11)/frame.bmp" | sha256sum -c --quiet \
+	  && echo "    the screens match the frame recorded from the ELF (tests/m6/hello_frame.sha256)"
+
+# docs/progress.svg, the coverage map in the README (tools/progress.py).
+.PHONY: progress
+progress: $(VENV)/.installed
+	$(PYTHON) tools/progress.py
 
 .PHONY: compat
 compat: $(VENV)/.installed

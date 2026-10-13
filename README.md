@@ -6,6 +6,12 @@ Why ahead of time? iOS doesn't allow JIT compilation, so 3DS emulators on iPhone
 
 > **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls), M2 (memory: loads/stores, literal pools, switch tables), M3 (instruction-by-instruction differential testing against Unicorn), M4 (Thumb + ARM/Thumb interworking), M5 (VFP floating point) and M6a (recompiling a real libctru homebrew app in full) are done. In M6b the recompiled libctru hello world **runs** on our own minimal OS layer (threads, APT, GSP, HID) and prints to its screen. In M7, 31 of devkitPro's 62 example programs ran correctly. In M8-M10 our own GPU emulation (no third-party GPU code) gained 3D drawing, textures, fog, fragment lighting and geometry shaders, bringing it to 49; of the rest, 8 don't build, 3 need the console's system font (firmware), and 2 use undocumented procedural-texture noise ([docs/compat.md](docs/compat.md)). Development currently targets x86-64 Linux; iOS comes much later.
 
+## Progress
+
+![What we cover: OS service commands, CPU instructions and GPU shader instructions; green = implemented](docs/progress.svg)
+
+One cell per item, green when implemented: every command 3dbrew documents for each OS service (including services we don't have at all yet, so the grey is what's left), every ARMv6K + VFPv2 instruction the CPU can execute, and every PICA200 shader instruction. Generated from 3dbrew's command lists and our own source by `make progress` (`tools/progress.py`); hover a cell for its name.
+
 ## How it works
 
 ```

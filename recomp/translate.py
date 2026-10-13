@@ -674,9 +674,17 @@ def _bx(insn, fc):
         return ['RETURN_TO(ctx->r[14]);']
     if op.type == ARM_OP_REG and _reg_num(insn, op.reg) != PC:
         # An indirect tail call (e.g. through a function pointer): look the
-        # target up and call it (see _tail_call).
+        # target up and call it (see _tail_call). Unless it goes where we
+        # were called from: that is a return through another register
+        # (ARMCC: `pop {r3}; add sp, #16; bx r3`).
         fc.terminates = True
-        return _tail_call(fc, f'recomp_call(ctx, {_read_reg(insn, op.reg)});  /* indirect tail call */')
+        fc.uses_ret = True
+        target = _read_reg(insn, op.reg)
+        return ['{', f'    uint32_t target = {target};',
+                '    if (target == ret) return;   /* a return through a register */',
+                '    uint32_t to = ctx->r[14];',
+                '    recomp_call(ctx, target);  /* indirect tail call */',
+                '    recomp_continue(ctx, to, ret);', '}', 'return;']
     raise UnsupportedInstruction(insn, 'bx pc')
 
 

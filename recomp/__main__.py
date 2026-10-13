@@ -97,6 +97,8 @@ def _load_without_symbols(args):
     path = Path(args.input)
     if path.is_dir() or path.suffix.lower() in ('.cxi', '.3ds', '.cci', '.app'):
         program = load_ctr(path)
+        if path.suffix.lower() in ('.cxi', '.3ds', '.cci'):
+            program.pointer_hints = _static_entry_hints(path)
     else:
         program = load_program(path)
         program.functions, program.data_ranges, program.code_regions = [], [], []
@@ -140,6 +142,36 @@ def _static_crs(path):
         except LoadError:
             continue
     return None
+
+
+def _static_entry_hints(path):
+    """Main-program code addresses its CRO modules use: the exports in
+    static.crs, and every address a module imports from the main program
+    (by name or as an anonymous offset). Nothing else in the main program
+    may point at those functions; they still have to pass discovery's
+    checks like any other guess."""
+    from .romfs import RomFS
+    crs = _static_crs(path)
+    if crs is None:
+        return set()
+
+    def addr(seg, off):
+        s = crs.segments[seg]
+        return s.offset + off if s.kind == cro_format.SEG_TEXT and off < s.size else None
+
+    hints = {addr(s, o) for s, o in list(crs.named_exports.values()) + crs.indexed_exports}
+    fs = RomFS(path)
+    for name, _, _ in fs.walk():
+        if not name.endswith('.cro'):
+            continue
+        for imp in cro_format.parse(fs.read(name)).imports:
+            if imp.name.startswith('|static|@'):
+                seg, off = imp.name.split('@')[1].split(':')
+                hints.add(addr(int(seg), int(off, 16)))
+            elif imp.name in crs.named_exports:
+                hints.add(addr(*crs.named_exports[imp.name]))
+    hints.discard(None)
+    return hints
 
 
 def _load_cro(args):

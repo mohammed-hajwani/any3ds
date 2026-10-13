@@ -173,6 +173,11 @@ void recomp_bad_call(Ctx *ctx, uint32_t addr)
             "recomp: indirect call/jump to 0x%08" PRIx32 ", where no recompiled %s function starts"
             " (lr = 0x%08" PRIx32 ")\n",
             addr, addr & 1 ? "Thumb" : "ARM", ctx->r[14]);
+    fprintf(stderr, "    r0-r7  = %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+            " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n",
+            ctx->r[0], ctx->r[1], ctx->r[2], ctx->r[3], ctx->r[4], ctx->r[5], ctx->r[6], ctx->r[7]);
+    fprintf(stderr, "    r8-r13 = %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n",
+            ctx->r[8], ctx->r[9], ctx->r[10], ctx->r[11], ctx->r[12], ctx->r[13]);
     abort();
 }
 

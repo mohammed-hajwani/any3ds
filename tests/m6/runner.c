@@ -1,12 +1,13 @@
 /* Run a recompiled libctru program on the HLE OS layer (hle/).
  *
  *   runner [--max-seconds N] [--hold FRAME:KEYS]... [--touch FRAME:X,Y|FRAME:up]...
- *          [--sdmc DIR] [--romfs FILE] [--shared-font FILE] [--dump FILE.bmp]
+ *          [--sdmc DIR] [--save DIR] [--romfs FILE] [--shared-font FILE] [--dump FILE.bmp]
  *
  * --hold presses buttons from a frame on (KEYS in hex, libctru's KEY_*
  * bits; 0 releases them), e.g. --hold 10:8 holds START from frame 10.
  * --touch touches the bottom screen at X,Y (or lifts the stylus) from a
- * frame on. --sdmc backs the SD card with a host folder; --romfs gives the
+ * frame on. --sdmc backs the SD card with a host folder, --save the app's
+ * save data (formatted by the app the first time); --romfs gives the
  * app its RomFS (a RomFS image, or the .3dsx or decrypted .cxi/.3ds that
  * carries one). --shared-font gives it the system font: firmware we never
  * ship, so it must be your own dump of it (a .bcfnt).
@@ -31,7 +32,7 @@ static void on_exit_dump(void)
 static void usage(void)
 {
     fprintf(stderr, "usage: runner [--max-seconds N] [--hold FRAME:KEYS]... [--touch FRAME:X,Y|FRAME:up]...\n"
-                    "              [--sdmc DIR] [--romfs FILE] [--shared-font FILE] [--dump FILE.bmp]\n");
+                    "              [--sdmc DIR] [--save DIR] [--romfs FILE] [--shared-font FILE] [--dump FILE.bmp]\n");
     exit(2);
 }
 
@@ -60,6 +61,8 @@ int main(int argc, char **argv)
             hid_touch(frame, down, x, y);
         } else if (strcmp(argv[i], "--sdmc") == 0) {
             fs_set_sdmc(argv[++i]);
+        } else if (strcmp(argv[i], "--save") == 0) {
+            fs_set_save(argv[++i]);
         } else if (strcmp(argv[i], "--shared-font") == 0) {
             if (!apt_set_shared_font(argv[++i]))
                 return 1;
