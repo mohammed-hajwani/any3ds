@@ -29,7 +29,7 @@ What the remaining blockers mean:
 
 | Blocker | Count | Examples |
 |---|---|---|
-| stops: hle: APT GetSharedFont: the system font is firmware data, which we don't have | 3 | graphics/gpu/composite_scene, graphics/printing/custom-font, graphics/printing/system-font |
+| stops: hle: APT GetSharedFont: the system font is firmware, which we never ship; give the runner your own dump with --shared-font FILE.bcfnt | 3 | graphics/gpu/composite_scene, graphics/printing/custom-font, graphics/printing/system-font |
 | stops: GPU: procedural texture noise is not implemented (not publicly documented) | 2 | graphics/gpu/particles, graphics/gpu/proctex |
 | build-failed: Image Magick not found! | 1 | graphics/bitmap/24bit-color |
 | build-failed: no .elf (a library?) | 1 | templates/library |
@@ -57,7 +57,7 @@ What the remaining blockers mean:
 | graphics/bitmap/24bit-color | framebuffer | build-failed | Image Magick not found! |  |  |
 | graphics/gpu/2d_shapes | gpu | runs |  | ptm:sysm | matches |
 | graphics/gpu/both_screens | gpu | runs |  | ptm:sysm | matches |
-| graphics/gpu/composite_scene | gpu | stops | hle: APT GetSharedFont: the system font is firmware data, which we don't have | ptm:sysm |  |
+| graphics/gpu/composite_scene | gpu | stops | hle: APT GetSharedFont: the system font is firmware, which we never ship; give the runner your own dump with --shared-font FILE.bcfnt | ptm:sysm |  |
 | graphics/gpu/cubemap | gpu | runs |  | ptm:sysm | matches |
 | graphics/gpu/fragment_light | gpu | runs |  | ptm:sysm | matches |
 | graphics/gpu/geoshader | gpu | runs |  | ptm:sysm | matches |
@@ -77,10 +77,10 @@ What the remaining blockers mean:
 | graphics/gpu/wide_mode_3d | gpu | runs |  | ptm:sysm | matches |
 | graphics/printing/both-screen-text | console | runs |  | ptm:sysm | matches |
 | graphics/printing/colored-text | console | runs |  | ptm:sysm | matches |
-| graphics/printing/custom-font | gpu | stops | hle: APT GetSharedFont: the system font is firmware data, which we don't have | ptm:sysm |  |
+| graphics/printing/custom-font | gpu | stops | hle: APT GetSharedFont: the system font is firmware, which we never ship; give the runner your own dump with --shared-font FILE.bcfnt | ptm:sysm |  |
 | graphics/printing/hello-world | console | runs |  | ptm:sysm | matches |
 | graphics/printing/multiple-windows-text | console | runs |  | ptm:sysm | matches |
-| graphics/printing/system-font | gpu | stops | hle: APT GetSharedFont: the system font is firmware data, which we don't have | ptm:sysm |  |
+| graphics/printing/system-font | gpu | stops | hle: APT GetSharedFont: the system font is firmware, which we never ship; give the runner your own dump with --shared-font FILE.bcfnt | ptm:sysm |  |
 | graphics/printing/wide-console | console | runs |  | ptm:sysm | matches |
 | input/read-controls | console | runs |  | ptm:sysm | matches |
 | input/software-keyboard | applet | runs |  | ptm:sysm | matches |
@@ -94,7 +94,7 @@ What the remaining blockers mean:
 | network/http_post | network | runs |  | http:C, ptm:sysm | matches |
 | network/sockets | network | runs |  | ptm:sysm, soc:U | matches |
 | network/sslc | network | runs |  | ptm:sysm, soc:U | matches |
-| network/uds | network | runs |  | ndm:u, ptm:sysm | matches |
+| network/uds | network | runs |  | nwm::UDS, ptm:sysm | matches |
 | nfc | nfc | runs |  | nfc:m, nfc:u, ptm:sysm | matches |
 | physics/box2d | portlib | build-failed | out/compat/physics/box2d/source/main.cpp:4:10: fatal error: box2d/box2d.h: No such file or directory |  |  |
 | qtm/eye_position | qtm | build-failed | out/compat/qtm/eye_position/source/main.c:8:69: error: 'QtmTrackingData' has no member named 'eyesTracked' |  |  |

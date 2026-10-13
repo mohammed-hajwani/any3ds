@@ -53,7 +53,11 @@ typedef struct KObj {
         struct { struct KThread *owner; int count; } mtx;
         struct { int32_t count, max; } sem;
         struct KThread *thread;
-        struct { uint32_t size, addr; } shm;    /* addr: where the app mapped it, 0 if not */
+        struct {
+            uint32_t size, addr;    /* addr: where the app mapped it, 0 if not */
+            uint32_t home;          /* where it goes when the app maps it at 0 */
+            const uint8_t *init;    /* contents it starts with (NULL: zeros) */
+        } shm;
         const struct Service *service;
     };
 } KObj;
@@ -126,7 +130,8 @@ void hid_hold_keys(uint32_t frame, uint32_t keys);
 void hid_touch(uint32_t frame, int down, uint32_t x, uint32_t y);
 int  gsp_dump_screens(const char *path);
 void fs_set_sdmc(const char *dir);          /* back the SD card with a host folder */
-int  fs_set_romfs(const char *path);        /* the app's RomFS: an image or a .3dsx */
+int  fs_set_romfs(const char *path);        /* the app's RomFS: an image, a .3dsx or a decrypted .cxi/.3ds */
+int  apt_set_shared_font(const char *path); /* your own dump of the system font (a .bcfnt) */
 
 /* Fill the kernel config page and the shared page (config_mem.c). */
 void config_mem_init(uint8_t *mem);

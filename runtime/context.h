@@ -27,6 +27,7 @@ typedef struct {
     uint32_t tls;          // CP15 c13 TPIDRURO: the thread-local storage pointer
     uint32_t excl_addr;    // ldrex/strex exclusive monitor: the address ldrex marked,
     uint32_t excl_valid;   //   and whether the monitor is armed
+    int32_t budget;        // loop iterations left before the next tick (RECOMP_BACKEDGE)
 } Ctx;
 
 /* ---- Tracing (M3 differential testing) ----
@@ -256,6 +257,20 @@ GuestFn recomp_find(uint32_t addr);
 typedef void (*SvcHandler)(Ctx *ctx, uint32_t number);
 extern SvcHandler recomp_svc_handler;
 static inline void recomp_svc(Ctx *ctx, uint32_t number) { recomp_svc_handler(ctx, number); }
+
+/* ---- Time passing in guest code ----
+   On a console, time passes while code runs: timers fire, and a thread
+   they wake can preempt the one running. Our OS layer only gets control at
+   an svc, so a loop that never makes one (a spin on a lock another thread
+   holds) would freeze time. So every backward branch spends one unit of
+   ctx->budget; when it runs out, recomp_tick calls the OS layer's tick
+   handler, which advances the virtual clock, fires due timers and may
+   switch to a thread they woke. Deterministic: it counts, it doesn't time. */
+#define RECOMP_TICK_EDGES 1024      /* back-edges per tick */
+typedef void (*TickHandler)(Ctx *ctx);
+extern TickHandler recomp_tick_handler;
+void recomp_tick(Ctx *ctx);
+#define RECOMP_BACKEDGE() do { if (--ctx->budget <= 0) recomp_tick(ctx); } while (0)
 
 /* `udf`: a deliberate trap (e.g. __builtin_trap()); the guest wanted to crash. */
 void recomp_udf(Ctx *ctx, uint32_t addr) __attribute__((noreturn));

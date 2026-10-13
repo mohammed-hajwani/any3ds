@@ -282,8 +282,14 @@ void hle_svc(Ctx *ctx, uint32_t n)
     case 0x1F: {    /* MapMemoryBlock(handle, addr, my perm, other perm) */
         GET_OR_FAIL(m, ctx->r[0], KO_SHMEM);
         regions_init();
-        m->shm.addr = ctx->r[1];
+        m->shm.addr = ctx->r[1] ? ctx->r[1] : m->shm.home;
+        if (!m->shm.addr) {
+            fprintf(stderr, "hle: MapMemoryBlock(%s) at address 0, and the block has no address of its own\n", m->name);
+            exit(3);
+        }
         memset(kernel_mem() + m->shm.addr, 0, m->shm.size);
+        if (m->shm.init)
+            memcpy(kernel_mem() + m->shm.addr, m->shm.init, m->shm.size);
         region_add(m->shm.addr, m->shm.size, ctx->r[2], MEMSTATE_SHARED);
         if (hle_trace)
             fprintf(stderr, "    -> %s mapped at %08" PRIx32 "\n", m->name, m->shm.addr);

@@ -609,6 +609,9 @@ def _b(insn, fc):
     callee = fc.entries.get(target)
     if target in fc.code_addrs or (fc.start <= target < fc.end and callee is None):
         fc.labels.add(target)
+        if target <= insn.address:
+            # A loop: let time pass (see RECOMP_BACKEDGE in context.h).
+            return ['RECOMP_BACKEDGE();', f'goto L_{target:08x};']
         return [f'goto L_{target:08x};']
     # A tail call: jump to another function (see _tail_call). Without
     # symbols, a function's code can have gaps holding other functions, so

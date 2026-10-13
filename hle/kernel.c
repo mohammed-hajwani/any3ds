@@ -290,6 +290,11 @@ static void report_threads(void)
                 fprintf(stderr, " on address %08" PRIx32, t->wait_addr);
         }
         fprintf(stderr, "  (lr = %08" PRIx32 ")\n", t->ctx.r[14]);
+        if (t->state == T_READY)
+            fprintf(stderr, "        r0-r3 = %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+                    "  r4-r7 = %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "  sp = %08" PRIx32 "\n",
+                    t->ctx.r[0], t->ctx.r[1], t->ctx.r[2], t->ctx.r[3],
+                    t->ctx.r[4], t->ctx.r[5], t->ctx.r[6], t->ctx.r[7], t->ctx.r[13]);
     }
 }
 
@@ -312,6 +317,8 @@ static void run_due(void)
         fprintf(stderr, "hle: stopping: still running after %" PRIu32 " s of virtual time (frame %" PRIu32 ")\n",
                 config.max_seconds, frame_count);
         report_threads();
+        if (config.on_exit)
+            config.on_exit();       /* e.g. save the screens: what was it showing? */
         exit(6);
     }
 }
@@ -410,6 +417,20 @@ void k_svc_enter(void)
 void k_svc_leave(void)
 {
     reschedule();                   /* a woken higher-priority thread goes first */
+}
+
+/* RECOMP_TICK_EDGES loop iterations have run without an svc (see
+   RECOMP_BACKEDGE). At a few instructions per iteration and ~268 per
+   microsecond, call it 20 us; then do what an svc does: fire due timers,
+   and let a thread they woke preempt this one. */
+#define TICK_COST (20 * (TICKS_PER_SEC / 1000000))
+
+static void k_tick(Ctx *ctx)
+{
+    (void)ctx;
+    now_ticks += TICK_COST;
+    run_due();
+    reschedule();
 }
 
 /* ------------------------------------------------------------------ */
@@ -646,6 +667,7 @@ void hle_run(uint8_t *guest_mem, const HleConfig *cfg)
     config = *cfg;
     hle_trace = getenv("HLE_TRACE") != NULL;
     recomp_svc_handler = hle_svc;
+    recomp_tick_handler = k_tick;
     config_mem_init(mem);
     gpu_init(mem);
 
