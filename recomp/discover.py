@@ -583,7 +583,10 @@ class Discovery:
                     rejected[g[0] | g[1]] = 'inside the literal data of another function'
                 continue
             falls = {a for fn in fns.values() for a in fn.falls_into}
-            middle = {g for g in accepted if g[0] in falls}
+            # ...unless the code before it ends in a filler nop: ARMCC puts
+            # `mov r0, r0` where one function deliberately runs on into the
+            # next (`ldr r0, [r0, #0x5c]; mov r0, r0` then the next function).
+            middle = {g for g in accepted if g[0] in falls and not self._after_filler(g)}
             if middle:
                 for g in middle:
                     accepted.discard(g)
@@ -655,6 +658,16 @@ class Discovery:
             if failure is not None:
                 return failure
         return 'its literal data never settled'
+
+    def _after_filler(self, start):
+        """Whether the instruction just before a function start is a filler
+        nop (ARM `mov r0, r0` or `nop`; Thumb `mov r8, r8`)."""
+        addr, thumb = start
+        prev = self.decode(addr - (2 if thumb else 4), thumb)
+        if prev is None:
+            return False
+        word = int.from_bytes(prev.bytes, 'little')
+        return word in (0xE1A00000, 0xE320F000) if not thumb else word == 0x46C0
 
     def _untranslatable(self, fns, roots):
         """{guess root: reason} for guessed functions the translator refuses."""

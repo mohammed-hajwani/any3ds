@@ -318,8 +318,7 @@ void ro_handle(KObj *session, uint32_t *cmd)
                 if (mods[i].used && &mods[i] != m)
                     link_imports(&mods[i], m);
         }
-        if (hle_trace)
-            fprintf(stderr, "    -> RO loaded %s at %08" PRIx32 " (%" PRIu32 " bytes)\n", m->name, mapped, size);
+        fprintf(stderr, "hle: RO loaded module %s at %08" PRIx32 " (%" PRIu32 " bytes)\n", m->name, mapped, size);
         cmd[0] = ipc_header(id, 2, 0);
         cmd[1] = RES_OK;
         cmd[2] = size;

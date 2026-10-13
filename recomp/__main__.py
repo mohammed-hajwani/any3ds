@@ -174,6 +174,35 @@ def _static_entry_hints(path):
     return hints
 
 
+def _incoming_imports(fs, module):
+    """Entry points of `module` that the main program (static.crs) and the
+    other modules import from it, by index or as an anonymous offset: often
+    its only way in, since a module may export nothing else by name."""
+    roots = []
+    for name, _, _ in fs.walk():
+        if not (name.endswith('.cro') or name.endswith('.crs')):
+            continue
+        other = cro_format.parse(fs.read(name))
+        if other.name == module.name:
+            continue
+        for imp in other.imports:
+            mod, _, rest = imp.name.partition('@') if '@' in imp.name else imp.name.partition('#')
+            if mod != module.name:
+                continue
+            if '@' in imp.name:
+                seg, off = rest.split(':')
+                seg, off = int(seg), int(off, 16)
+            else:
+                index = int(rest)
+                if index >= len(module.indexed_exports):
+                    continue
+                seg, off = module.indexed_exports[index]
+            if seg < len(module.segments) and module.segments[seg].kind == cro_format.SEG_TEXT:
+                value = cro_format.segment_address(module, seg) + off
+                roots.append((value & ~1, bool(value & 1)))
+    return roots
+
+
 def _load_cro(args):
     """A CRO module, recompiled to code relative to its load address."""
     from .romfs import RomFS
@@ -181,6 +210,8 @@ def _load_cro(args):
     data = path.read_bytes() if path.suffix.lower() == '.cro' else RomFS(path).read(args.cro)
     module = cro_format.parse(data)
     program, roots = cro_format.relocated_program(module)
+    if path.suffix.lower() != '.cro':
+        roots += _incoming_imports(RomFS(path), module)
     functions, report = discover(program, roots)
     program.data_ranges = cro_format.without_patched(program.data_ranges, program.patched)
     decoded = {fn.addr: _decode(fn) for fn in functions}

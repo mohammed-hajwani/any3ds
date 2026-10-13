@@ -5,6 +5,8 @@
  *   SAVEDATA (4)  this app's save data: a host folder (runner --save DIR) holding
  *                 data/ (the files) and format.bin (written by FormatSaveData;
  *                 until then the archive is "not formatted" and the app formats it)
+ *   EXTSAVEDATA (6) extra save data, by id: DIR/extdata/<id>/ (CreateExtSaveData
+ *                 makes it; until then opening it says "not found")
  *   ROMFS (3)     this app's read-only RomFS: served from a host file (runner
  *                 --romfs FILE), a raw RomFS image, a decrypted .cxi/.3ds, or a .3dsx, whose
  *                 RomFS sits at the offset its header gives (fsOffset)
@@ -30,6 +32,7 @@
 
 #define ARCHIVE_ROMFS    3
 #define ARCHIVE_SAVEDATA 4
+#define ARCHIVE_EXTSAVEDATA 6
 #define ARCHIVE_SDMC     9
 
 #define RES_FS_NOT_FOUND      0xC8804478u
@@ -71,7 +74,7 @@ static const Service dir_service = { "FS directory", fs_dir_handle };
 
 /* Archive handles (u64 to the app): which archive each one is. */
 #define MAX_ARCHIVES 32
-static uint32_t archives[MAX_ARCHIVES];
+static struct { uint32_t id; char root[512]; } archives[MAX_ARCHIVES];
 static int narchives;
 
 void fs_set_sdmc(const char *dir)
@@ -103,14 +106,29 @@ static int save_format(SaveFormat *out)
     return ok;
 }
 
-/* The host folder behind an archive id, or NULL if it has none (yet). */
-static const char *archive_root(int id)
+/* The host folder of an ExtSaveData id (its binary archive path: media
+   type, then the u64 id). */
+static void extdata_dir(uint32_t lo, uint32_t hi, char *out, size_t cap)
 {
+    snprintf(out, cap, "%s/extdata/%08" PRIx32 "%08" PRIx32, save_dir ? save_dir : ".", hi, lo);
+}
+
+/* The host folder behind an archive (id, and the archive's own path for
+   ExtSaveData), or NULL if it has none (yet). */
+static const char *archive_root_path(uint32_t id, uint32_t type, uint32_t size, uint32_t addr)
+{
+    static char ext[512];
     SaveFormat fmt;
+    struct stat st;
     if (id == ARCHIVE_SDMC)
         return sdmc_dir;
     if (id == ARCHIVE_SAVEDATA && save_format(&fmt))
         return save_data_dir;
+    if (id == ARCHIVE_EXTSAVEDATA && save_dir && type == PATH_BINARY && size >= 12) {
+        const uint32_t *w = (const uint32_t *)(kernel_mem() + addr);
+        extdata_dir(w[1], w[2], ext, sizeof ext);
+        return stat(ext, &st) == 0 && S_ISDIR(st.st_mode) ? ext : NULL;
+    }
     return NULL;
 }
 
@@ -260,20 +278,20 @@ static int path_to_utf8(uint32_t type, uint32_t size, uint32_t addr, char *out, 
 
 /* The host path of a path in archive `id`; 0 if the archive has no host
    folder or the path is refused. */
-static int arch_path(int id, uint32_t type, uint32_t size, uint32_t addr, char *out, size_t cap)
+static int arch_path(const char *root, uint32_t type, uint32_t size, uint32_t addr, char *out, size_t cap)
 {
     char rel[400];
-    const char *root = archive_root(id);
     if (!root || !path_to_utf8(type, size, addr, rel, sizeof rel))
         return 0;
     snprintf(out, cap, "%s/%s", root, rel[0] == '/' ? rel + 1 : rel);
     return 1;
 }
 
-static int archive_of(uint32_t lo)
+/* The host folder of an open archive handle (its low word), or NULL. */
+static const char *archive_of(uint32_t lo)
 {
     uint32_t i = lo - 0x100000u;
-    return i < (uint32_t)narchives ? (int)archives[i] : -1;
+    return i < (uint32_t)narchives ? archives[i].root : NULL;
 }
 
 static void reply_handle(uint32_t *cmd, KObj *o)
@@ -284,12 +302,12 @@ static void reply_handle(uint32_t *cmd, KObj *o)
     cmd[3] = handle_new(o);
 }
 
-static void open_file(int id, uint32_t *cmd, uint32_t type, uint32_t size, uint32_t addr, uint32_t flags)
+static void open_file(const char *root, uint32_t *cmd, uint32_t type, uint32_t size, uint32_t addr, uint32_t flags)
 {
     File *f = calloc(1, sizeof *f);
-    if (!f || !arch_path(id, type, size, addr, f->path, sizeof f->path)) {
+    if (!f || !arch_path(root, type, size, addr, f->path, sizeof f->path)) {
         free(f);
-        ipc_reply(cmd, archive_root(id) ? RES_FS_BAD_PATH : RES_FS_NOT_FOUND);
+        ipc_reply(cmd, root ? RES_FS_BAD_PATH : RES_FS_NOT_FOUND);
         return;
     }
     int mode = (flags & OPEN_WRITE) ? O_RDWR : O_RDONLY;
@@ -309,11 +327,11 @@ static int name_cmp(const void *a, const void *b)
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
-static void open_dir(int id, uint32_t *cmd, uint32_t type, uint32_t size, uint32_t addr)
+static void open_dir(const char *root, uint32_t *cmd, uint32_t type, uint32_t size, uint32_t addr)
 {
     Dir *d = calloc(1, sizeof *d);
     DIR *h = NULL;
-    if (!d || !arch_path(id, type, size, addr, d->path, sizeof d->path) || !(h = opendir(d->path))) {
+    if (!d || !arch_path(root, type, size, addr, d->path, sizeof d->path) || !(h = opendir(d->path))) {
         free(d);
         ipc_reply(cmd, RES_FS_NOT_FOUND);
         return;
@@ -354,16 +372,22 @@ void fs_handle(KObj *session, uint32_t *cmd)
         return;
     case 0x080C: {  /* OpenArchive(id, path type, path size; path) -> u64 archive handle */
         uint32_t id = cmd[1];
-        if (id == ARCHIVE_SAVEDATA && !archive_root((int)id)) {
+        const char *root = archive_root_path(id, cmd[2], cmd[3], cmd[5]);
+        if (id == ARCHIVE_SAVEDATA && !root) {
             ipc_reply(cmd, RES_FS_NOT_FORMATTED);      /* the app formats it, then opens it again */
             return;
         }
-        if (!archive_root((int)id) || narchives == MAX_ARCHIVES) {
+        if (id == ARCHIVE_EXTSAVEDATA && !root) {
+            ipc_reply(cmd, RES_FS_NOT_FOUND);          /* the app creates it, then opens it again */
+            return;
+        }
+        if (!root || narchives == MAX_ARCHIVES) {
             fprintf(stderr, "hle: FS OpenArchive(0x%" PRIx32 "): not available, returning not-found\n", id);
             ipc_reply(cmd, RES_FS_NOT_FOUND);
             return;
         }
-        archives[narchives] = id;
+        archives[narchives].id = id;
+        snprintf(archives[narchives].root, sizeof archives[narchives].root, "%s", root);
         cmd[0] = ipc_header(0x80C, 3, 0);
         cmd[1] = RES_OK;
         cmd[2] = 0x100000u + (uint32_t)narchives++;
@@ -390,8 +414,9 @@ void fs_handle(KObj *session, uint32_t *cmd)
             reply_handle(cmd, session_new(&file_service, f));
             return;
         }
-        if (archive_root((int)id)) {
-            open_file((int)id, cmd, cmd[5], cmd[6], cmd[12], cmd[7]);
+        const char *root = archive_root_path(id, cmd[3], cmd[4], cmd[10]);
+        if (root) {
+            open_file(root, cmd, cmd[5], cmd[6], cmd[12], cmd[7]);
             return;
         }
         fprintf(stderr, "hle: FS OpenFileDirectly on archive 0x%" PRIx32 ": not available\n", id);
@@ -447,6 +472,35 @@ void fs_handle(KObj *session, uint32_t *cmd)
         cmd[3] = fmt.dirs;
         cmd[4] = fmt.files;
         cmd[5] = fmt.duplicate;
+        return;
+    }
+    case 0x0851: {  /* CreateExtSaveData(info[4]: media, u64 id, -; dirs, files, u64 limit, SMDH size; SMDH) */
+        char dir[512], icon[600];
+        if (!save_dir) {
+            fprintf(stderr, "hle: FS CreateExtSaveData: give the runner a folder for save data (--save DIR)\n");
+            exit(3);
+        }
+        snprintf(dir, sizeof dir, "%s/extdata", save_dir);
+        mkdir(dir, 0755);
+        extdata_dir(cmd[2], cmd[3], dir, sizeof dir);
+        if (mkdir(dir, 0755) != 0 && errno == EEXIST) {
+            ipc_reply(cmd, RES_FS_EXISTS);
+            return;
+        }
+        snprintf(icon, sizeof icon, "%s.icon", dir);            /* the SMDH, beside it */
+        FILE *f = fopen(icon, "wb");
+        if (f) {
+            fwrite(kernel_mem() + cmd[11], 1, cmd[9], f);
+            fclose(f);
+        }
+        ipc_reply(cmd, RES_OK);
+        return;
+    }
+    case 0x0852: {  /* DeleteExtSaveData(info[4]) */
+        char dir[512];
+        extdata_dir(cmd[2], cmd[3], dir, sizeof dir);
+        remove_tree(dir);
+        ipc_reply(cmd, RES_OK);
         return;
     }
     case 0x084C: {  /* FormatSaveData(archive id, path type, size, block size, dirs, files,
