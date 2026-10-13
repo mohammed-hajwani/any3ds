@@ -14,7 +14,10 @@
  * Accelerometer (66) and gyro (86) stay zero, which reads as "no data".
  *
  * Input comes from a script: from a given frame on, hold these keys
- * (hid_hold_keys) / touch here or nowhere (hid_touch). */
+ * (hid_hold_keys) / touch here or nowhere (hid_touch). It can also come
+ * live from a file (hid_input_file), read every frame: the held keys in
+ * hex, then optionally "X Y" for a touch on the bottom screen.
+ * tools/live_server.py writes that file from buttons in tools/live.html. */
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +35,7 @@ typedef struct { Step steps[MAX_SCRIPT]; int n; } Script;
 static KObj *shm, *pad_event;
 static Script keys_script, touch_script;
 static uint32_t last_keys, last_touch[2];
+static const char *input_path;
 
 static void script_add(Script *s, uint32_t frame, uint32_t value, uint32_t down)
 {
@@ -59,6 +63,29 @@ void hid_touch(uint32_t frame, int down, uint32_t x, uint32_t y)
     script_add(&touch_script, frame, x | y << 16, (uint32_t)down);
 }
 
+void hid_input_file(const char *path)
+{
+    input_path = path;
+}
+
+/* Live input on top of the script: the file's keys are added to the held
+   ones, and its touch (if any) wins. A missing file means nothing held. */
+static void read_input_file(uint32_t *keys, uint32_t *touch)
+{
+    FILE *f = fopen(input_path, "r");
+    if (!f)
+        return;
+    unsigned k, x, y;
+    int n = fscanf(f, "%x %u %u", &k, &x, &y);
+    fclose(f);
+    if (n >= 1)
+        *keys |= k;
+    if (n == 3 && x < 320 && y < 240) {
+        touch[0] = x | y << 16;
+        touch[1] = 1;
+    }
+}
+
 /* Publish a new entry in the section at word `section`, whose ring of
    entries starts at word `entries`. */
 static void section_push(uint8_t *base, uint32_t section, uint32_t entries, const uint32_t *entry, uint32_t words)
@@ -84,6 +111,11 @@ void hid_vblank(uint32_t frame)
 
     const Step *k = script_at(&keys_script, frame);
     uint32_t keys = k ? k->value : 0;
+    const Step *t = script_at(&touch_script, frame);
+    uint32_t touch[2] = { t && t->down ? t->value : 0, t ? t->down : 0 };
+    if (input_path)
+        read_input_file(&keys, touch);
+
     uint32_t pad[4] = { keys, keys & ~last_keys, last_keys & ~keys, 0 };
     if (keys != last_keys)
         fprintf(stderr, "    -> HID: frame %" PRIu32 ", keys %08" PRIx32 "\n", frame, keys);
@@ -91,8 +123,6 @@ void hid_vblank(uint32_t frame)
     section_push(base, PAD_SECTION, PAD_SECTION + 10, pad, 4);
     memcpy(base + 7 * 4, &keys, 4);     /* raw current pad state */
 
-    const Step *t = script_at(&touch_script, frame);
-    uint32_t touch[2] = { t && t->down ? t->value : 0, t ? t->down : 0 };
     if (touch[0] != last_touch[0] || touch[1] != last_touch[1])
         fprintf(stderr, "    -> HID: frame %" PRIu32 ", touch %s (%" PRIu32 ", %" PRIu32 ")\n", frame,
                 touch[1] ? "down" : "up", touch[0] & 0xFFFF, touch[0] >> 16);

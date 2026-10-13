@@ -1,38 +1,121 @@
 <!doctype html>
-<!-- Watch a run live: start the runner with `--live live.bmp` (in the folder
-     this page is in, or edit SRC below) and open this page in a browser.
-     It reloads the picture a few times a second. -->
+<!-- Watch a run live, and press its buttons.
+     Start the server:  python tools/live_server.py
+     Run the game with: --live out/game/live.bmp --input out/game/keys.txt
+     Open:              http://localhost:8765/tools/live.html?src=/out/game/live.bmp
+     The picture reloads a few times a second. Buttons (or the keyboard:
+     arrows, X = A, Z = B, S = X, A = Y, Q = L, W = R, Enter = START,
+     Backspace = SELECT) and clicks on the bottom screen go to the runner.
+     Opened as a plain file it still shows the picture, without input. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>any3ds live</title>
 <style>
-  :root { color-scheme: dark; }
-  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0d1117;
-         color: #e6edf3; font: 14px system-ui, sans-serif; }
-  figure { margin: 16px; text-align: center; }
-  img { image-rendering: pixelated; width: min(800px, 92vw); height: auto; background: #000;
-        border-radius: 6px; box-shadow: 0 0 0 1px #30363d; }
-  figcaption { margin-top: 8px; color: #8b949e; }
+  :root { color-scheme: dark; --bg: #0d1117; --fg: #e6edf3; --dim: #8b949e; --line: #30363d;
+          --key: #21262d; --key-on: #2f81f7; --b: clamp(26px, 9vw, 40px); }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg);
+         color: var(--fg); font: 14px system-ui, sans-serif; }
+  main { margin: 8px; display: grid; justify-items: center; gap: 8px; }
+  img { image-rendering: pixelated; height: auto; background: #000;
+        width: min(480px, calc(100vw - 16px), max(160px, calc((100vh - 170px) * 400 / 480)));
+        border-radius: 6px; box-shadow: 0 0 0 1px var(--line); touch-action: none; user-select: none; }
+  #status { color: var(--dim); text-align: center; font-size: 12px; }
+  .pad { display: grid; grid-template-columns: auto auto auto; gap: clamp(6px, 3vw, 18px); align-items: center;
+         user-select: none; touch-action: none; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, var(--b)); grid-template-rows: repeat(3, var(--b)); gap: 2px; }
+  .mid { display: grid; gap: 6px; justify-items: center; }
+  .row { display: flex; gap: 4px; }
+  button { background: var(--key); color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
+           font: inherit; font-weight: 600; min-width: var(--b); height: var(--b); padding: 0; cursor: pointer; }
+  button.small { height: 26px; font-size: 11px; padding: 0 6px; }
+  button.round { border-radius: 50%; }
+  button.on { background: var(--key-on); border-color: var(--key-on); }
 </style>
 </head>
 <body>
-<figure>
+<main>
   <img id="screen" alt="both 3DS screens: top above bottom" hidden>
-  <figcaption id="status">waiting for the first frame...</figcaption>
-</figure>
+  <div id="status">waiting for the first frame...</div>
+  <div class="pad" id="pad">
+    <div class="grid3">
+      <span></span><button data-key="40" title="Up (arrow)">&#9650;</button><span></span>
+      <button data-key="20" title="Left (arrow)">&#9664;</button><span></span><button data-key="10" title="Right (arrow)">&#9654;</button>
+      <span></span><button data-key="80" title="Down (arrow)">&#9660;</button><span></span>
+    </div>
+    <div class="mid">
+      <div class="row"><button class="small" data-key="200" title="L (Q)">L</button><button class="small" data-key="100" title="R (W)">R</button></div>
+      <div class="row"><button class="small" data-key="4" title="SELECT (Backspace)">SELECT</button><button class="small" data-key="8" title="START (Enter)">START</button></div>
+    </div>
+    <div class="grid3">
+      <span></span><button class="round" data-key="400" title="X (S)">X</button><span></span>
+      <button class="round" data-key="800" title="Y (A)">Y</button><span></span><button class="round" data-key="1" title="A (X)">A</button>
+      <span></span><button class="round" data-key="2" title="B (Z)">B</button><span></span>
+    </div>
+  </div>
+</main>
 <script>
   const SRC = new URLSearchParams(location.search).get('src') || 'live.bmp';
   const img = document.getElementById('screen'), status = document.getElementById('status');
-  let frames = 0;
+  let frames = 0, inputOk = location.protocol.startsWith('http'), note = '';
+
   function refresh() {
     const next = new Image();
-    next.onload = () => { img.src = next.src; img.hidden = false; status.textContent = `live: ${SRC} (update ${++frames})`; setTimeout(refresh, 250); };
+    next.onload = () => {
+      img.src = next.src; img.hidden = false;
+      status.textContent = `live: ${SRC} (update ${++frames})${note}`;
+      setTimeout(refresh, 250);
+    };
     next.onerror = () => setTimeout(refresh, 500);
     next.src = `${SRC}?t=${Date.now()}`;
   }
   refresh();
+
+  /* Input: held keys (libctru KEY_* bits) and an optional touch, sent whole on every change. */
+  const held = new Set();
+  let touch = null;
+  function send() {
+    if (!inputOk) return;
+    let keys = 0;
+    for (const k of held) keys |= k;
+    const body = keys.toString(16) + (touch ? ` ${touch[0]} ${touch[1]}` : '');
+    fetch('/keys', { method: 'POST', body }).then(r => {
+      if (!r.ok) throw new Error(r.status);
+      note = '';
+    }).catch(() => { note = ' — buttons need tools/live_server.py'; });
+  }
+  function setKey(bit, down) {
+    if (down === held.has(bit)) return;
+    down ? held.add(bit) : held.delete(bit);
+    for (const b of document.querySelectorAll(`[data-key="${bit.toString(16)}"]`)) b.classList.toggle('on', down);
+    send();
+  }
+
+  for (const b of document.querySelectorAll('[data-key]')) {
+    const bit = parseInt(b.dataset.key, 16);
+    b.addEventListener('pointerdown', e => { b.setPointerCapture(e.pointerId); setKey(bit, true); });
+    for (const ev of ['pointerup', 'pointercancel']) b.addEventListener(ev, () => setKey(bit, false));
+  }
+
+  const KEYBOARD = { ArrowUp: 0x40, ArrowDown: 0x80, ArrowLeft: 0x20, ArrowRight: 0x10,
+                     KeyX: 0x1, KeyZ: 0x2, KeyS: 0x400, KeyA: 0x800, KeyQ: 0x200, KeyW: 0x100,
+                     Enter: 0x8, Backspace: 0x4 };
+  addEventListener('keydown', e => { if (KEYBOARD[e.code]) { e.preventDefault(); if (!e.repeat) setKey(KEYBOARD[e.code], true); } });
+  addEventListener('keyup', e => { if (KEYBOARD[e.code]) setKey(KEYBOARD[e.code], false); });
+  addEventListener('blur', () => { for (const k of [...held]) setKey(k, false); });
+
+  /* Touch: the picture is 400x480, the bottom screen is 320x240 at (40, 240). */
+  function touchAt(e) {
+    const r = img.getBoundingClientRect();
+    const x = Math.floor((e.clientX - r.left) * 400 / r.width) - 40;
+    const y = Math.floor((e.clientY - r.top) * 480 / r.height) - 240;
+    return x >= 0 && x < 320 && y >= 0 && y < 240 ? [x, y] : null;
+  }
+  img.addEventListener('pointerdown', e => { touch = touchAt(e); if (touch) { img.setPointerCapture(e.pointerId); send(); } });
+  img.addEventListener('pointermove', e => { if (touch) { const t = touchAt(e); if (t) { touch = t; send(); } } });
+  for (const ev of ['pointerup', 'pointercancel'])
+    img.addEventListener(ev, () => { if (touch) { touch = null; send(); } });
 </script>
 </body>
 </html>

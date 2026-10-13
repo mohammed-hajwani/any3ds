@@ -200,6 +200,8 @@ void hle_svc(Ctx *ctx, uint32_t n)
         uint32_t h = 0;
         ctx->r[0] = k_create_thread(ctx->r[1], ctx->r[2], ctx->r[3], (int)ctx->r[0], &h);
         ctx->r[1] = h;
+        if (hle_trace)
+            fprintf(stderr, "    -> on core %" PRId32 "\n", (int32_t)ctx->r[4]);
         break;
     }
     case 0x09:

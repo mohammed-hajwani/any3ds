@@ -89,8 +89,30 @@ void fs_set_save(const char *dir)
     snprintf(save_data_dir, sizeof save_data_dir, "%s/data", dir);
 }
 
-/* Save data format (FormatSaveData): total size, directories, files, duplicate. */
+/* An archive's format (GetFormatInfo): total size, directories, files,
+   duplicate. Kept in a small file: format.bin for save data (from
+   FormatSaveData), <extdata folder>.format for ExtSaveData (from
+   CreateExtSaveData). */
 typedef struct { uint32_t total_size, dirs, files, duplicate; } SaveFormat;
+
+static int format_read(const char *path, SaveFormat *out)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    int ok = fread(out, sizeof *out, 1, f) == 1;
+    fclose(f);
+    return ok;
+}
+
+static int format_write(const char *path, const SaveFormat *fmt)
+{
+    FILE *f = fopen(path, "wb");
+    int ok = f && fwrite(fmt, sizeof *fmt, 1, f) == 1;
+    if (f)
+        fclose(f);
+    return ok;
+}
 
 static int save_format(SaveFormat *out)
 {
@@ -98,12 +120,7 @@ static int save_format(SaveFormat *out)
     if (!save_dir)
         return 0;
     snprintf(path, sizeof path, "%s/format.bin", save_dir);
-    FILE *f = fopen(path, "rb");
-    if (!f)
-        return 0;
-    int ok = fread(out, sizeof *out, 1, f) == 1;
-    fclose(f);
-    return ok;
+    return format_read(path, out);
 }
 
 /* The host folder of an ExtSaveData id (its binary archive path: media
@@ -462,7 +479,16 @@ void fs_handle(KObj *session, uint32_t *cmd)
         return;
     case 0x0845: {  /* GetFormatInfo(archive id, path type, size; path) -> size, dirs, files, duplicate */
         SaveFormat fmt;
-        if (cmd[1] != ARCHIVE_SAVEDATA || !save_format(&fmt)) {
+        if (cmd[1] == ARCHIVE_EXTSAVEDATA) {
+            /* What CreateExtSaveData was given; "doesn't exist" before that. */
+            const char *root = archive_root_path(cmd[1], cmd[2], cmd[3], cmd[5]);
+            char fpath[600];
+            snprintf(fpath, sizeof fpath, "%s.format", root ? root : "");
+            if (!root || !format_read(fpath, &fmt)) {
+                ipc_reply(cmd, RES_FS_NOT_FOUND);
+                return;
+            }
+        } else if (cmd[1] != ARCHIVE_SAVEDATA || !save_format(&fmt)) {
             ipc_reply(cmd, cmd[1] == ARCHIVE_SAVEDATA ? RES_FS_NOT_FORMATTED : RES_FS_NOT_SUPPORTED);
             return;
         }
@@ -493,13 +519,21 @@ void fs_handle(KObj *session, uint32_t *cmd)
             fwrite(kernel_mem() + cmd[11], 1, cmd[9], f);
             fclose(f);
         }
+        SaveFormat fmt = { 0, cmd[5], cmd[6], 0 };              /* for GetFormatInfo */
+        snprintf(icon, sizeof icon, "%s.format", dir);
+        format_write(icon, &fmt);
         ipc_reply(cmd, RES_OK);
         return;
     }
     case 0x0852: {  /* DeleteExtSaveData(info[4]) */
         char dir[512];
+        char side[600];
         extdata_dir(cmd[2], cmd[3], dir, sizeof dir);
         remove_tree(dir);
+        snprintf(side, sizeof side, "%s.icon", dir);
+        unlink(side);
+        snprintf(side, sizeof side, "%s.format", dir);
+        unlink(side);
         ipc_reply(cmd, RES_OK);
         return;
     }
@@ -514,11 +548,7 @@ void fs_handle(KObj *session, uint32_t *cmd)
         SaveFormat fmt = { 0x100000, cmd[5], cmd[6], cmd[9] & 0xFF };
         char fpath[600];
         snprintf(fpath, sizeof fpath, "%s/format.bin", save_dir);
-        FILE *f = fopen(fpath, "wb");
-        int ok = f && fwrite(&fmt, sizeof fmt, 1, f) == 1;
-        if (f)
-            fclose(f);
-        ipc_reply(cmd, ok ? RES_OK : RES_FS_NOT_FOUND);
+        ipc_reply(cmd, format_write(fpath, &fmt) ? RES_OK : RES_FS_NOT_FOUND);
         return;
     }
     case 0x0808: {  /* CreateFile(0, archive, path type, size, attributes, u64 file size; path) */

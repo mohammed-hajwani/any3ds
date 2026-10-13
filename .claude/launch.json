@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "live-view",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["C:/any3ds/tools/live_server.py", "--port", "8765"],
+      "port": 8765
+    }
+  ]
+}

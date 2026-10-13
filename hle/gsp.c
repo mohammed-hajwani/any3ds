@@ -94,17 +94,16 @@ void gsp_vblank(void)
     kevent_signal(interrupt_event);
 }
 
+/* Returns 0 if no frame was ever shown (nothing written) or on a write
+   error (reported). Quiet otherwise: the live view calls it every 30 frames. */
 int gsp_dump_screens(const char *path)
 {
-    if (!have_frame) {
-        fprintf(stderr, "hle: no frame was ever shown, nothing to dump\n");
+    if (!have_frame)
         return 0;
-    }
     if (!bmp_write(path, frame_rgb, FRAME_W, FRAME_H)) {
         perror(path);
         return 0;
     }
-    fprintf(stderr, "hle: both screens (last frame shown) saved to %s\n", path);
     return 1;
 }
 
