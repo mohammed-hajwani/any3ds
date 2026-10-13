@@ -4,7 +4,7 @@ A **static recompiler** for Nintendo 3DS code. It translates 32-bit ARM (ARMv6K)
 
 Why ahead of time? iOS doesn't allow JIT compilation, so 3DS emulators on iPhone fall back to slow interpreters. If the whole program is translated before it runs, nothing has to be generated at runtime.
 
-> **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls), M2 (memory: loads/stores, literal pools, switch tables), M3 (instruction-by-instruction differential testing against Unicorn), M4 (Thumb + ARM/Thumb interworking), M5 (VFP floating point) and M6a (recompiling a real libctru homebrew app in full) are done. In M6b the recompiled libctru hello world **runs** on our own minimal OS layer (threads, APT, GSP, HID) and prints to its screen. In M7, 31 of devkitPro's 62 example programs ran correctly. In M8 our own GPU emulation (no third-party GPU code) draws its first 3D scenes, bringing it to 35; the rest need textures, lighting, geometry shaders or fog, which come next ([docs/compat.md](docs/compat.md)). Development currently targets x86-64 Linux; iOS comes much later.
+> **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls), M2 (memory: loads/stores, literal pools, switch tables), M3 (instruction-by-instruction differential testing against Unicorn), M4 (Thumb + ARM/Thumb interworking), M5 (VFP floating point) and M6a (recompiling a real libctru homebrew app in full) are done. In M6b the recompiled libctru hello world **runs** on our own minimal OS layer (threads, APT, GSP, HID) and prints to its screen. In M7, 31 of devkitPro's 62 example programs ran correctly. In M8-M10 our own GPU emulation (no third-party GPU code) gained 3D drawing, textures, fog, fragment lighting and geometry shaders, bringing it to 49; of the rest, 8 don't build, 3 need the console's system font (firmware), and 2 use undocumented procedural-texture noise ([docs/compat.md](docs/compat.md)). Development currently targets x86-64 Linux; iOS comes much later.
 
 ## How it works
 
@@ -138,7 +138,7 @@ dumps/  out/       gitignored: your own dumps and all generated code
 | M7 | Compatibility sweep over devkitPro's 62 examples: 31 run, the rest need the GPU, firmware or extra libraries | ✅ |
 | M8 | Our own GPU, part 1: GX engines, command lists, vertex shaders, rasteriser, colour combiners, blending, depth | ✅ |
 | M9 | GPU textures (14 formats incl. ETC1, filtering, mipmaps, cube maps) and procedural textures; citro2d works | ✅ |
-| M10 | Fog and fragment lighting (done: lit 3D models render), geometry shaders | in progress |
+| M10 | Fog, fragment lighting and geometry shaders (point, fixed- and variable-size modes) | ✅ |
 | later | Cycle counting, CRO relocation, indirect-jump table + interpreter fallback, Metal renderer, iOS shell app | |
 
 ## Contributing

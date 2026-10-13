@@ -804,7 +804,7 @@ static void draw_triangle(const Vertex *a, const Vertex *b, const Vertex *c)
 
 /* ---------------------------------------------------------------- geometry shaders */
 
-/* Point mode (the only mode implemented): the vertex shader's enabled
+/* Point mode (GSH_MISC0 mode 0): the vertex shader's enabled
    output registers, vertex after vertex, fill the geometry shader's input
    buffer; when it holds GSH_INPUTBUFFER_CONFIG + 1 attributes the
    geometry shader runs once on them (through the input permutation) and
@@ -813,6 +813,7 @@ static void draw_triangle(const Vertex *a, const Vertex *b, const Vertex *c)
    winding flag swaps two of them). */
 static Vec4 gs_input[16];
 static uint32_t gs_inputs, gs_mode, gs_vertices;
+static uint32_t gs_prim_size;       /* variable mode: vertices in this primitive, 0 = expecting the count */
 static Vertex gs_slots[3];
 
 static void gs_emit(ShaderRegs *s)
@@ -864,10 +865,56 @@ static void gs_feed_fixed(const ShaderRegs *vs)
     }
 }
 
+/* Variable-size primitives (GSH_MISC0 mode 1, used for subdivision).
+   3dbrew barely documents this mode; the layout here is read off the
+   devkitPro loop_subdivision example, whose index list is
+   "count, v0 v1 v2, neighbours..." per primitive and whose geometry
+   shader reads c0 = count, then 3 registers per main vertex, then one
+   register per remaining vertex:
+     - the first index of a primitive is not a vertex but the number of
+       vertices that follow (gs_begin_variable); it goes into c0;
+     - the first GSH_MISC1 + 1 vertices write `stride` output registers
+       each from c1 (stride = GSH_INPUTBUFFER_CONFIG + 1);
+     - every later vertex writes only its first output register;
+     - once all `count` vertices are in, the geometry shader runs. */
+static void gs_begin_variable(uint32_t count)
+{
+    float n = (float)count;
+    pica.gsh.uniform[0] = (Vec4){ n, n, n, n };
+    gs_prim_size = count;
+    gs_vertices = 0;
+}
+
+static void gs_feed_variable(const ShaderRegs *vs)
+{
+    uint32_t main_vertices = (pica.reg[0x254] & 0xFF) + 1,              /* GSH_MISC1 */
+             stride = (pica.reg[REG_GSH_BASE + SH_INPUTBUFFER_CONFIG] & 0xF) + 1;
+    uint32_t mask = pica.reg[REG_VSH_BASE + SH_OUTMAP_MASK];
+    uint32_t c = gs_vertices < main_vertices ? 1 + gs_vertices * stride
+                                             : 1 + main_vertices * stride + (gs_vertices - main_vertices);
+    uint32_t n = gs_vertices < main_vertices ? stride : 1;
+    for (int r = 0; r < 16 && n; r++)
+        if (mask >> r & 1) {
+            if (c >= 96)
+                gpu_fatal("variable-size geometry primitive overflows the float uniforms (%" PRIu32 " vertices)",
+                          gs_prim_size);
+            pica.gsh.uniform[c++] = vs->o[r];
+            n--;
+        }
+    if (++gs_vertices == gs_prim_size) {
+        gs_prim_size = 0;
+        gs_run();
+    }
+}
+
 static void gs_feed(const ShaderRegs *vs)
 {
     if (gs_mode == 2) {
         gs_feed_fixed(vs);
+        return;
+    }
+    if (gs_mode == 1) {
+        gs_feed_variable(vs);
         return;
     }
     const uint32_t *gsh = &pica.reg[REG_GSH_BASE];
@@ -890,10 +937,9 @@ static int geometry_shader_on(void)
     gs_mode = pica.reg[0x252] & 0xFF;               /* GSH_MISC0: the processing mode */
     switch (gs_mode) {
     case 0:                                         /* point mode */
+    case 1:                                         /* variable-size primitives */
     case 2:                                         /* fixed-size primitives */
         return 1;
-    case 1:
-        gpu_fatal("variable-size-primitive (subdivision) geometry shaders are not implemented yet");
     default:
         gpu_fatal("geometry shader mode %" PRIu32, gs_mode);
     }
@@ -956,6 +1002,7 @@ void pica_draw(int indexed)
     int gs = geometry_shader_on();
     gs_inputs = 0;
     gs_vertices = 0;
+    gs_prim_size = 0;
     uint32_t count = pica.reg[REG_NUMVERTICES], first = pica.reg[REG_VERTEX_OFFSET];
     uint32_t ib = pica.reg[REG_INDEXBUFFER_CONFIG], base = pica.reg[REG_ATTRIBBUFFERS_LOC] << 3;
     const uint8_t *indices = NULL;
@@ -980,6 +1027,11 @@ void pica_draw(int indexed)
         } else {
             index = indices[i];
         }
+        if (gs && gs_mode == 1 && gs_prim_size == 0) {
+            if (index)                  /* a count of 0 is an empty primitive */
+                gs_begin_variable(index);
+            continue;
+        }
         Vec4 attr[12];
         Vertex v;
         ShaderRegs s;
@@ -1000,6 +1052,8 @@ void pica_immediate_vertex(const Vec4 *attribs)
     Vertex v;
     ShaderRegs s;
     int gs = geometry_shader_on();
+    if (gs && gs_mode == 1)
+        gpu_fatal("immediate-mode vertices with a variable-size geometry shader");
     shade(attr, &s, gs ? NULL : &v);
     if (gs)
         gs_feed(&s);

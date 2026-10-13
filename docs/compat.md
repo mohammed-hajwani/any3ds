@@ -6,18 +6,17 @@ cleanly via svcExitProcess after START was pressed; `stops` names the first miss
 
 | Outcome | Examples |
 |---|---|
-| runs | 48 |
-| stops | 6 |
+| runs | 49 |
+| stops | 5 |
 | c-failed | 0 |
 | recomp-failed | 0 |
 | build-failed | 8 |
 
 What the remaining blockers mean:
 
-- **GPU stops** name the missing feature: geometry shaders in variable-size (subdivision) and
-  fixed-size (particle) modes, and procedural-texture noise, which is not publicly documented.
-  Everything else the examples use (command lists, vertex shaders, textures, procedural textures,
-  fog, fragment lighting, point-mode geometry shaders) is our own GPU emulation (`gpu/`).
+- **GPU stops** name the missing feature: procedural-texture noise, which is not publicly
+  documented. Everything else the examples use (command lists, vertex and geometry shaders,
+  textures, procedural textures, fog, fragment lighting) is our own GPU emulation (`gpu/`).
 - **APT GetSharedFont**: the system font is part of the console's firmware. We can't ship it,
   and the project never handles firmware.
 - **build-failed**: examples that need portlibs (box2d, opus, vorbis, modplug) or ImageMagick,
@@ -31,6 +30,7 @@ What the remaining blockers mean:
 | Blocker | Count | Examples |
 |---|---|---|
 | stops: hle: APT GetSharedFont: the system font is firmware data, which we don't have | 3 | graphics/gpu/composite_scene, graphics/printing/custom-font, graphics/printing/system-font |
+| stops: GPU: procedural texture noise is not implemented (not publicly documented) | 2 | graphics/gpu/particles, graphics/gpu/proctex |
 | build-failed: Image Magick not found! | 1 | graphics/bitmap/24bit-color |
 | build-failed: no .elf (a library?) | 1 | templates/library |
 | build-failed: out/compat/audio/modplug-decoding/source/main.c:9:10: fatal error: libmodplug/modplug.h: No such file or directory | 1 | audio/modplug-decoding |
@@ -39,9 +39,6 @@ What the remaining blockers mean:
 | build-failed: out/compat/physics/box2d/source/main.cpp:4:10: fatal error: box2d/box2d.h: No such file or directory | 1 | physics/box2d |
 | build-failed: out/compat/qtm/eye_position/source/main.c:8:69: error: 'QtmTrackingData' has no member named 'eyesTracked' | 1 | qtm/eye_position |
 | build-failed: video.h264 not found! | 1 | mvd |
-| stops: GPU: fixed-size-primitive (particle) geometry shaders are not implemented yet | 1 | graphics/gpu/particles |
-| stops: GPU: procedural texture noise is not implemented (not publicly documented) | 1 | graphics/gpu/proctex |
-| stops: GPU: variable-size-primitive (subdivision) geometry shaders are not implemented yet | 1 | graphics/gpu/loop_subdivision |
 
 ## Every example
 
@@ -67,11 +64,11 @@ What the remaining blockers mean:
 | graphics/gpu/gpusprites | gpu | runs |  | ptm:sysm | matches |
 | graphics/gpu/immediate | gpu | runs |  | ptm:sysm | matches |
 | graphics/gpu/lenny | gpu | runs |  | ptm:sysm | matches |
-| graphics/gpu/loop_subdivision | gpu | stops | GPU: variable-size-primitive (subdivision) geometry shaders are not implemented yet | ptm:sysm |  |
+| graphics/gpu/loop_subdivision | gpu | runs |  | ptm:sysm | matches |
 | graphics/gpu/mipmap_fog | gpu | runs |  | ptm:sysm | matches |
 | graphics/gpu/multiple_buf | gpu | runs |  | ptm:sysm | matches |
 | graphics/gpu/normal_mapping | gpu | runs |  | ptm:sysm | matches |
-| graphics/gpu/particles | gpu | stops | GPU: fixed-size-primitive (particle) geometry shaders are not implemented yet | ptm:sysm |  |
+| graphics/gpu/particles | gpu | stops | GPU: procedural texture noise is not implemented (not publicly documented) | ptm:sysm |  |
 | graphics/gpu/proctex | gpu | stops | GPU: procedural texture noise is not implemented (not publicly documented) | ptm:sysm |  |
 | graphics/gpu/simple_tri | gpu | runs |  | ptm:sysm | matches |
 | graphics/gpu/stereoscopic_2d | gpu | runs |  | ptm:sysm | matches |

@@ -182,7 +182,7 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
   - **citro2d:** uses unit 3 for anti-aliased circles ("circle" table) and for image tinting ("blend" ramp); its source is in `out/ref/citro2d` for reference.
   - **Bug found:** clamp-to-border returned texel 0 for *inside* coordinates, which made every citro2d sprite sample its transparent corner.
   - **Result:** textured_cube, cubemap, 2d_shapes, gpusprites and stereoscopic_2d render, so 9 GPU examples run. The remaining blockers are fragment lighting (6), geometry shaders (3), fog (1), procedural noise (1) and the system font (3).
-- **M10 (in progress): fog and fragment lighting done.**
+- **M10 done: fog, fragment lighting and geometry shaders.**
   - **Fog (`gpu/draw.c`):** a depth-indexed 128-entry table blends towards the fog colour.
   - **Lighting (`gpu/lighting.c`):**
     - Normals: per-pixel, from the interpolated quaternion or a bump map.
@@ -190,13 +190,12 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
     - Lookup tables: the environment configurations, input selectors, abs flags and scales.
     - Not done (named stops): shadows, geometric factors, tangent maps and cos(phi).
   - **Result:** fragment_light, lenny, toon_shading, normal_mapping, wide_mode_3d and qtm/lenny_qtm_movement_naive render lit 3D. 16 GPU-using examples run.
-  - **Geometry shaders, point mode:**
-    - The interpreter does SETEMIT/EMIT. The vertex shader's outputs fill the geometry shader's input buffer, and every full buffer runs it once.
-    - Emitted triangles are drawn, with the winding flag honoured. The mode is GSH_MISC0's low byte.
-    - Result: geoshader renders.
-  - **Left:**
-    - Geometry-shader variable-size (loop_subdivision) and fixed-size/particle (particles) modes stop by name.
-    - Procedural noise is undocumented and stays a named stop. The system font is firmware.
+  - **Geometry shaders (all three modes; the mode is GSH_MISC0's low byte):**
+    - The interpreter does SETEMIT/EMIT. Emitted triangles are drawn, with the winding flag honoured.
+    - Point mode: the vertex shader's outputs fill the geometry shader's input buffer, and every full buffer runs it once. geoshader renders.
+    - Fixed-size mode: each vertex's outputs go into float uniforms from `start`, `stride` registers apart; after `count` vertices the shader runs. particles gets past it, then stops at procedural noise.
+    - Variable-size mode: 3dbrew barely documents it, so the layout comes from the loop_subdivision example's data. The first index of each primitive is the vertex count (into c0, not shaded). The first GSH_MISC1 + 1 vertices write `stride` registers each from c1, and later vertices write one register each. loop_subdivision renders.
+  - **Left:** procedural noise is undocumented and stays a named stop; the system font is firmware. Compat: 49 run, 5 stop, 8 don't build.
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function
