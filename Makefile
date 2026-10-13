@@ -38,11 +38,11 @@ ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-compat-quick venv clean
+.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-compat-quick venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-compat-quick
+test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-compat-quick
 
 venv: $(VENV)/.installed
 
@@ -432,6 +432,34 @@ COMPAT_QUICK := --only printing/colored-text --only input/read-controls --only r
 test-compat-quick: $(VENV)/.installed
 	@echo '=== compat (quick): 4 devkitPro examples built, recompiled and run on the HLE ==='
 	@$(COMPAT_ENV) $(PYTHON) tests/compat/sweep.py $(COMPAT_QUICK)
+
+# ---------------------------------------------------------------- M11
+#
+# A program with no symbols, as retail games ship: the hello world turned
+# into a compressed code.bin + exheader wrapped in a decrypted NCCH (.cxi),
+# recompiled with function discovery and run; the frame must match the one
+# recorded from the ELF. `make compat COMPAT_ARGS=--from-code` does the same
+# for every example.
+M11 := out/m11
+
+$(M11)/hello.cxi: $(M6)/hello.elf tests/m11/mkcode.py $(VENV)/.installed
+	@mkdir -p $(M11)
+	$(PYTHON) tests/m11/mkcode.py $< $(M11)/hello_code --compress --ncch $@
+
+$(M11)/gen_hello.c: $(M11)/hello.cxi $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@ > $(M11)/recomp_hello.log
+
+$(M11)/run_hello: tests/m6/runner.c $(M11)/gen_hello.c $(RUNTIME_DEP) $(HLE_DEP) $(GPU_DEP)
+	$(HOST_CC) $(HOST_FLAGS) -O0 -Ihle -Igpu -pthread $< $(M11)/gen_hello.c $(RUNTIME_SRC) $(HLE_SRC) $(GPU_SRC) -lm -o $@
+
+test-m11: $(M11)/run_hello $(M6)/hello.elf
+	@echo '=== M11: the 3DS program loader (tests/m11/test_loader.py) ==='
+	@$(PYTHON) tests/m11/test_loader.py
+	@echo '=== M11: function discovery without symbols, against the ELF symbols it never saw ==='
+	@$(PYTHON) tests/m11/recall.py $(M6)/hello.elf --min 90
+	@echo "=== M11: hello world from a symbol-less, compressed .cxi: $$(head -1 $(M11)/recomp_hello.log) ==="
+	@timeout 120 ./$(M11)/run_hello --hold 10:8 --dump $(M11)/frame.bmp > $(M11)/hello.out 2> $(M11)/hello.log 	  || { cat $(M11)/hello.log; echo "hello world (from code.bin) did not exit cleanly"; exit 1; }
+	@echo "$$(cat tests/m6/hello_frame.sha256)  $(M11)/frame.bmp" | sha256sum -c --quiet 	  && echo "    the screens match the frame recorded from the ELF (tests/m6/hello_frame.sha256)"
 
 .PHONY: compat
 compat: $(VENV)/.installed

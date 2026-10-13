@@ -601,11 +601,13 @@ def _tail_call(fc, call):
 def _b(insn, fc):
     target = _branch_target(insn)
     fc.terminates = True
-    if fc.start <= target < fc.end:
+    callee = fc.entries.get(target)
+    if target in fc.code_addrs or (fc.start <= target < fc.end and callee is None):
         fc.labels.add(target)
         return [f'goto L_{target:08x};']
-    # A tail call: jump to another function (see _tail_call).
-    callee = fc.entries.get(target)
+    # A tail call: jump to another function (see _tail_call). Without
+    # symbols, a function's code can have gaps holding other functions, so
+    # a target inside our range that we never decoded is one of those.
     if callee is None:
         raise UnsupportedInstruction(insn, f'branch to {target:08x}, which is not a known function')
     if callee.thumb != _is_thumb(insn):
@@ -1409,7 +1411,7 @@ def translate_function(fn, insns, entries, program=None):
                 body[-1][2].append(f'recomp_no_return(ctx, {_imm(insn.address)});')
                 fc.terminates = True
             end = insn.address + insn.size
-            follower = entries.get(end) if end == fn.end and not fc.terminates else None
+            follower = entries.get(end) if not fc.terminates else None
             if follower is not None and follower.thumb == fn.thumb:
                 # The code runs straight on into the next function, on purpose:
                 # libgcc's __aeabi_dsub flips a sign and falls into __adddf3.

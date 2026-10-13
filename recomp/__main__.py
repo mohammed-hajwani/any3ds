@@ -6,7 +6,9 @@ from pathlib import Path
 
 from capstone.arm import ARM_INS_B, ARM_INS_BLX
 
+from .ctr_loader import load_ctr
 from .disasm import DisasmError, disassemble
+from .discover import discover
 from .elf_loader import Function, LoadError, load_program
 from .emit_c import c_name, emit
 from .translate import UnsupportedInstruction, direct_branch_target, translate_function
@@ -86,22 +88,59 @@ def discover_functions(program):
     return functions, decoded
 
 
+def _load_without_symbols(args):
+    """A Program with no symbols: a code.bin (directory, .cxi or .3ds), or
+    an ELF whose symbols we ignore. Functions come from discovery."""
+    path = Path(args.input)
+    if path.is_dir() or path.suffix.lower() in ('.cxi', '.3ds', '.cci', '.app'):
+        program = load_ctr(path)
+    else:
+        program = load_program(path)
+        program.functions, program.data_ranges, program.code_regions = [], [], []
+        program.data_symbols = {}
+    extra = []
+    if args.entries:
+        for line in Path(args.entries).read_text().splitlines():
+            line = line.split('#')[0].strip()
+            if line:
+                value = int(line, 16)
+                extra.append((value & ~1, bool(value & 1)))
+    functions, report = discover(program, extra)
+    decoded = {fn.addr: _decode(fn) for fn in functions}
+    lines = [f'{k}: {v}' for k, v in report.items() if k != 'rejected']
+    lines += [f'rejected {value:08x}: {why}' for value, why in sorted(report['rejected'].items())]
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.with_suffix('.discovery.txt').write_text('\n'.join(lines) + '\n', newline='\n')
+    print(f'discovery: {report["functions"]} functions, {report["instructions"]} instructions, '
+          f'{report["pointer_functions"]} found through pointers, {len(report["rejected"])} pointers rejected')
+    return program, functions, decoded
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='python -m recomp',
                                      description='Recompile ARM code in an ELF file to C.')
-    parser.add_argument('input', help='ARM ELF file (.o or linked .elf)')
+    parser.add_argument('input', help='ARM ELF file (.o or linked .elf), or a 3DS program: a directory with '
+                                      'code.bin + exheader.bin, or a decrypted .cxi/.3ds')
     parser.add_argument('-o', '--output', required=True, type=Path,
                         help='C file to write; a matching .h is written next to it')
     parser.add_argument('--trace', action='store_true',
                         help='call RECOMP_TRACE before every instruction (for differential testing)')
+    parser.add_argument('--no-symbols', action='store_true',
+                        help='ignore an ELF\'s symbols and find the functions by following the code '
+                             '(always the case for a code.bin)')
+    parser.add_argument('--entries', metavar='FILE',
+                        help='extra function starts, one hex address per line (bit 0 = Thumb)')
     args = parser.parse_args(argv)
 
     try:
-        program = load_program(args.input)
-        if not program.functions:
-            raise LoadError(f'{args.input}: no function symbols found')
-
-        functions, decoded = discover_functions(program)
+        path = Path(args.input)
+        if args.no_symbols or path.is_dir() or path.suffix.lower() in ('.cxi', '.3ds', '.cci', '.app'):
+            program, functions, decoded = _load_without_symbols(args)
+        else:
+            program = load_program(args.input)
+            if not program.functions:
+                raise LoadError(f'{args.input}: no function symbols found')
+            functions, decoded = discover_functions(program)
         entries = {fn.addr: fn for fn in functions}
         translated = [translate_function(fn, decoded[fn.addr], entries, program) for fn in functions]
 

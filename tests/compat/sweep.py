@@ -192,31 +192,48 @@ def sweep_one(ex, args):
         r.status, r.detail = 'build-failed', first_line(work / 'build.log', r'not found!') or 'no .elf (a library?)'
         return r
     env_py = os.environ.get('PYTHON', str(ROOT / '.venv' / 'bin' / 'python'))
-    gen_key = digest(elfs[0], *sorted((ROOT / 'recomp').glob('*.py')))
-    if not ((work / 'gen.c').exists() and up_to_date(work / 'gen.key', gen_key)):
-        (work / 'gen.key').unlink(missing_ok=True)
-        if run([env_py, '-m', 'recomp', str(elfs[0]), '-o', str(work / 'gen.c')], ROOT, work / 'recomp.log', 600) != 0:
-            r.status, r.detail = 'recomp-failed', first_line(work / 'recomp.log', r'error') or 'see recomp.log'
+    # --from-code: recompile what a retail program ships as (code.bin +
+    # exheader, compressed, no symbols) instead of the ELF. Its files get a
+    # _code suffix so both modes keep their caches.
+    sfx = '_code' if args.from_code else ''
+    source = elfs[0]
+    if args.from_code:
+        mkcode = ROOT / 'tests' / 'm11' / 'mkcode.py'
+        source = work / 'code'
+        code_key = digest(elfs[0], mkcode)
+        if not ((source / 'code.bin').exists() and up_to_date(work / 'code.key', code_key)):
+            if run([env_py, str(mkcode), str(elfs[0]), str(source), '--compress'], ROOT, work / 'mkcode.log', 600) != 0:
+                r.status, r.detail = 'recomp-failed', first_line(work / 'mkcode.log', r'.') or 'mkcode failed'
+                return r
+            (work / 'code.key').write_text(code_key)
+    gen, header = work / f'gen{sfx}.c', work / f'gen{sfx}.h'
+    gen_key = digest(*([source / 'code.bin', source / 'exheader.bin'] if args.from_code else [source]),
+                     *sorted((ROOT / 'recomp').glob('*.py')))
+    if not (gen.exists() and up_to_date(work / f'gen{sfx}.key', gen_key)):
+        (work / f'gen{sfx}.key').unlink(missing_ok=True)
+        if run([env_py, '-m', 'recomp', str(source), '-o', str(gen)], ROOT, work / f'recomp{sfx}.log', 600) != 0:
+            r.status, r.detail = 'recomp-failed', first_line(work / f'recomp{sfx}.log', r'error') or 'see recomp.log'
             return r
-        (work / 'gen.key').write_text(gen_key)
+        (work / f'gen{sfx}.key').write_text(gen_key)
     flags = host_flags() + ['-O0']      # the last -O wins: generated code unoptimised (see build_os_layer)
-    run_key = digest(work / 'gen.c', work / 'gen.h', ROOT / 'tests' / 'm6' / 'runner.c', LIB, *flags)
-    if not ((work / 'run').exists() and up_to_date(work / 'run.key', run_key)):
-        (work / 'run.key').unlink(missing_ok=True)
-        cmd = host_cc() + flags + ['-Ihle', '-Igpu', '-pthread', 'tests/m6/runner.c', str(work / 'gen.c'),
-                                   str(LIB), '-lm', '-o', str(work / 'run')]
-        if run(cmd, ROOT, work / 'cc.log', 900) != 0:
-            r.status, r.detail = 'c-failed', first_line(work / 'cc.log', r'error') or 'see cc.log'
+    exe = work / f'run{sfx}'
+    run_key = digest(gen, header, ROOT / 'tests' / 'm6' / 'runner.c', LIB, *flags)
+    if not (exe.exists() and up_to_date(work / f'run{sfx}.key', run_key)):
+        (work / f'run{sfx}.key').unlink(missing_ok=True)
+        cmd = host_cc() + flags + ['-Ihle', '-Igpu', '-pthread', 'tests/m6/runner.c', str(gen),
+                                   str(LIB), '-lm', '-o', str(exe)]
+        if run(cmd, ROOT, work / f'cc{sfx}.log', 900) != 0:
+            r.status, r.detail = 'c-failed', first_line(work / f'cc{sfx}.log', r'error') or 'see cc.log'
             return r
-        (work / 'run.key').write_text(run_key)
-    frame = work / 'frame.bmp'
+        (work / f'run{sfx}.key').write_text(run_key)
+    frame = work / f'frame{sfx}.bmp'
     frame.unlink(missing_ok=True)
     options = list(ex.options)
     built = elfs[0].with_suffix('.3dsx')
     if (work / 'romfs').is_dir() and built.exists() and '--romfs' not in options:
         options += ['--romfs', built.name]      # the RomFS the .3dsx carries
-    code = run(['./run', *options, '--dump', 'frame.bmp'], work, work / 'run.log', 180)
-    log = (work / 'run.log').read_text(errors='replace')
+    code = run([f'./{exe.name}', *options, '--dump', frame.name], work, work / f'run{sfx}.log', 180)
+    log = (work / f'run{sfx}.log').read_text(errors='replace')
     r.status, r.detail = classify_run(code, log)
     r.notes = sorted(set(re.findall(r'GetServiceHandle\("([^"]+)"\)', log)))
     if frame.exists():
@@ -283,7 +300,12 @@ def main():
     ap.add_argument('--record', action='store_true',
                     help='after looking at the frames: make the outcomes and frame hashes of this run the expected ones')
     ap.add_argument('--keep-build', action='store_true', help='reuse already-built example .elf files')
+    ap.add_argument('--from-code', action='store_true',
+                    help='recompile each example from a symbol-less, compressed code.bin + exheader '
+                         '(tests/m11/mkcode.py) instead of its ELF; frames must match the same hashes')
     args = ap.parse_args()
+    if args.record and args.from_code:
+        ap.error("--record and --from-code don't mix: from-code frames must match the ELF ones")
 
     examples = load_examples()
     if args.only:
@@ -297,7 +319,7 @@ def main():
             print(f'{r.status:13} {r.example.path:40} {r.detail}', flush=True)
     results = [f.result() for f in futures]
     results.sort(key=lambda r: r.example.path)
-    if not args.only:
+    if not args.only and not args.from_code:
         write_report(results, hashes)
         print(f'wrote {REPORT.relative_to(ROOT)}')
 
