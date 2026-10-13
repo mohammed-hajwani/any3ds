@@ -35,6 +35,13 @@ void recomp_bad_jump(Ctx *ctx, uint32_t from, uint32_t value)
     abort();
 }
 
+void recomp_untranslated(Ctx *ctx, uint32_t addr, const char *why)
+{
+    fprintf(stderr, "recomp: function 0x%08" PRIx32 " was not translated (recompiled with --keep-going): %s"
+            " (lr = 0x%08" PRIx32 ")\n", addr, why, ctx->r[14]);
+    abort();
+}
+
 static void svc_unimplemented(Ctx *ctx, uint32_t number)
 {
     fprintf(stderr, "recomp: svc 0x%02" PRIx32 " is not implemented by the OS layer"

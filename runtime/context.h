@@ -217,6 +217,10 @@ void recomp_bad_return(Ctx *ctx, uint32_t got, uint32_t want) __attribute__((nor
    we recompiled for it. */
 void recomp_bad_jump(Ctx *ctx, uint32_t from, uint32_t value) __attribute__((noreturn));
 
+/* A function the recompiler couldn't translate (only with --keep-going):
+   stops loudly the moment it is called. */
+void recomp_untranslated(Ctx *ctx, uint32_t addr, const char *why) __attribute__((noreturn));
+
 /* Used inside generated functions, which keep their entry lr in `ret`. */
 #define RETURN_TO(addr) do {                                    \
         uint32_t to_ = (addr);                                  \
@@ -282,6 +286,33 @@ static inline uint32_t strex32(Ctx *ctx, uint32_t a, uint32_t v) { STREX_BODY(wr
 static inline uint32_t strex16(Ctx *ctx, uint32_t a, uint32_t v) { STREX_BODY(write16) }
 static inline uint32_t strex8(Ctx *ctx, uint32_t a, uint32_t v)  { STREX_BODY(write8) }
 #undef STREX_BODY
+static inline uint32_t strex64(Ctx *ctx, uint32_t a, uint32_t lo, uint32_t hi)
+{
+    if (!ctx->excl_valid || ctx->excl_addr != a) {
+        ctx->excl_valid = 0;
+        return 1;
+    }
+    ctx->excl_valid = 0;
+    write64(ctx, a, (uint64_t)hi << 32 | lo);       /* one doubleword access, as on hardware */
+    return 0;
+}
+
+/* smuad/smusd/smlad/smlsd: the two signed halfword products of a and b
+   (b's halves swapped first for the X forms), added or subtracted. */
+static inline uint32_t arm_dual_mul(uint32_t a, uint32_t b, int swap, int sub)
+{
+    if (swap)
+        b = (b >> 16) | (b << 16);
+    int32_t lo = (int32_t)(int16_t)a * (int16_t)b;
+    int32_t hi = (int32_t)(int16_t)(a >> 16) * (int16_t)(b >> 16);
+    return sub ? (uint32_t)lo - (uint32_t)hi : (uint32_t)lo + (uint32_t)hi;
+}
+
+/* sxtb16: sign-extend bytes 0 and 2 into the two halfwords. */
+static inline uint32_t arm_sxtb16(uint32_t x)
+{
+    return ((uint32_t)(int32_t)(int8_t)x & 0xffffu) | ((uint32_t)(int32_t)(int8_t)(x >> 16) << 16);
+}
 
 /* uadd8: four independent byte additions; GE[i] = carry out of byte i.
    sel: pick each byte from the first operand where GE[i] is set. */
@@ -294,6 +325,17 @@ static inline uint32_t arm_uadd8(Ctx *ctx, uint32_t a, uint32_t b)
         ge |= (sum >> 8) << i;
     }
     ctx->ge = ge;
+    return r;
+}
+
+/* uqsub8: each byte a - b, unsigned, saturating at 0 (no flags). */
+static inline uint32_t arm_uqsub8(uint32_t a, uint32_t b)
+{
+    uint32_t r = 0;
+    for (int i = 0; i < 4; i++) {
+        uint32_t x = (a >> (8 * i)) & 0xFF, y = (b >> (8 * i)) & 0xFF;
+        r |= (x > y ? x - y : 0) << (8 * i);
+    }
     return r;
 }
 

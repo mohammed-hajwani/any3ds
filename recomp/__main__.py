@@ -1,6 +1,7 @@
 """CLI: python -m recomp <input.elf> -o out/gen.c"""
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from .disasm import DisasmError, disassemble
 from .discover import discover
 from .elf_loader import Function, LoadError, load_program
 from .emit_c import c_name, emit
-from .translate import UnsupportedInstruction, direct_branch_target, translate_function
+from .translate import TranslatedFunction, UnsupportedInstruction, direct_branch_target, translate_function
 
 
 def _decode(fn):
@@ -116,6 +117,22 @@ def _load_without_symbols(args):
     return program, functions, decoded
 
 
+def _report_failures(path, failures):
+    """--keep-going: every untranslated function, grouped by the reason."""
+    by_reason = {}
+    for fn, e in failures:
+        text = str(e).split(': ', 1)[1]
+        key = re.sub(r'(0x)?[0-9a-f]{8}', 'X', text)
+        by_reason.setdefault(key, []).append((fn, e))
+    lines = [f'{len(failures)} functions not translated', '']
+    for key, items in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+        lines.append(f'{len(items):6}  {key}')
+        for fn, e in items[:3]:
+            lines.append(f'            e.g. {e}')
+    path.write_text('\n'.join(lines) + '\n', newline='\n')
+    print(f'{len(failures)} functions not translated (--keep-going): see {path}')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='python -m recomp',
                                      description='Recompile ARM code in an ELF file to C.')
@@ -128,6 +145,12 @@ def main(argv=None):
     parser.add_argument('--no-symbols', action='store_true',
                         help='ignore an ELF\'s symbols and find the functions by following the code '
                              '(always the case for a code.bin)')
+    parser.add_argument('--keep-going', action='store_true',
+                        help='a function that can\'t be translated becomes a stub that stops loudly when '
+                             'called, instead of failing the run; every failure is listed in OUTPUT.failures.txt')
+    parser.add_argument('--split', type=int, metavar='N',
+                        help='put the functions in extra files of N functions each (OUTPUT_001.c, ...) '
+                             'so a big program compiles in parallel')
     parser.add_argument('--entries', metavar='FILE',
                         help='extra function starts, one hex address per line (bit 0 = Thumb)')
     args = parser.parse_args(argv)
@@ -142,10 +165,22 @@ def main(argv=None):
                 raise LoadError(f'{args.input}: no function symbols found')
             functions, decoded = discover_functions(program)
         entries = {fn.addr: fn for fn in functions}
-        translated = [translate_function(fn, decoded[fn.addr], entries, program) for fn in functions]
+        translated, failures = [], []
+        for fn in functions:
+            try:
+                translated.append(translate_function(fn, decoded[fn.addr], entries, program))
+            except UnsupportedInstruction as e:
+                if not args.keep_going:
+                    raise
+                failures.append((fn, e))
+                why = str(e).replace('\\', '\\\\').replace('"', '\\"')
+                translated.append(TranslatedFunction(fn, [(fn.addr, f'not translated: {e}', [
+                    f'recomp_untranslated(ctx, {fn.addr:#010x}u, "{why}");'])], set(), False))
+        if failures:
+            _report_failures(args.output.with_suffix('.failures.txt'), failures)
 
         header = args.output.with_suffix('.h')
-        c_src, h_src = emit(translated, header.name, program, trace=args.trace)
+        c_src, h_src = emit(translated, header.name, program, trace=args.trace, split=args.split)
     except (LoadError, DisasmError, UnsupportedInstruction) as e:
         # Nothing has been written yet, so a failed run leaves no stale output.
         print(f'recomp: error: {e}', file=sys.stderr)
@@ -153,12 +188,18 @@ def main(argv=None):
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     header.write_text(h_src, newline='\n')
-    args.output.write_text(c_src, newline='\n')
+    if args.split:
+        args.output.write_text(c_src[0], newline='\n')
+        for i, chunk in enumerate(c_src[1:], 1):
+            args.output.with_name(f'{args.output.stem}_{i:03d}.c').write_text(chunk, newline='\n')
+    else:
+        args.output.write_text(c_src, newline='\n')
 
     for tf in translated:
         n = sum(1 for _, _, lines in tf.body if lines)
         print(f'  {c_name(tf.fn.addr)}  {tf.fn.name}  ({n} instructions)')
-    print(f'wrote {args.output} and {header.name}')
+    extra = f' (+ {len(c_src) - 1} files of functions)' if args.split else ''
+    print(f'wrote {args.output}{extra} and {header.name}')
     return 0
 
 

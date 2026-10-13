@@ -28,6 +28,9 @@ from capstone.arm import (
     ARM_INS_ORR, ARM_INS_POP, ARM_INS_PUSH, ARM_INS_ROR, ARM_INS_RRX,
     ARM_INS_REV, ARM_INS_REV16, ARM_INS_REVSH, ARM_INS_RSB, ARM_INS_RSC, ARM_INS_SBC, ARM_INS_SEL,
     ARM_INS_SMLAL, ARM_INS_STREX, ARM_INS_STREXB, ARM_INS_STREXH, ARM_INS_SVC, ARM_INS_UADD8, ARM_INS_UDF,
+    ARM_INS_UQSUB8, ARM_INS_PLD, ARM_INS_PKHBT, ARM_INS_PKHTB, ARM_INS_LDREXD, ARM_INS_STREXD,
+    ARM_INS_UXTB16, ARM_INS_SXTB16, ARM_INS_SMUAD, ARM_INS_SMUADX, ARM_INS_SMUSD, ARM_INS_SMUSDX,
+    ARM_INS_SMLAD, ARM_INS_SMLADX, ARM_INS_SMLSD, ARM_INS_SMLSDX,
     ARM_INS_SMULL, ARM_INS_STM, ARM_INS_STRD, ARM_INS_SXTB, ARM_INS_SXTH, ARM_INS_UMLAL, ARM_INS_UMULL,
     ARM_INS_UXTH, ARM_INS_STMDA, ARM_INS_STMDB, ARM_INS_UXTAB, ARM_INS_UXTAH, ARM_INS_SXTAB, ARM_INS_SXTAH,
     ARM_INS_SMULBB, ARM_INS_SMULBT, ARM_INS_SMULTB, ARM_INS_SMULTT, ARM_INS_SMULWB, ARM_INS_SMULWT,
@@ -431,6 +434,8 @@ _EXTENDS = {
     ARM_INS_UXTH: '{x} & 0xffffu',
     ARM_INS_SXTB: '(uint32_t)(int32_t)(int8_t){x}',
     ARM_INS_SXTH: '(uint32_t)(int32_t)(int16_t){x}',
+    ARM_INS_UXTB16: '{x} & 0x00ff00ffu',          # bytes 0 and 2, each into a halfword
+    ARM_INS_SXTB16: 'arm_sxtb16({x})',
 }
 
 # The extend-and-add forms: rd = rn + extend(rm).
@@ -809,13 +814,28 @@ def _load(insn, fc):
     addr = _address(insn)
 
     if rt == PC:
-        # `ldr pc, [sp], #4` is a single-register pop {pc}: a return.
+        # `ldr pc, [sp], #4` is a single-register pop {pc}: a return. ARMCC
+        # also writes `ldr pc, [sp], #0x14`: return and drop 16 more bytes.
         if (insn.id == ARM_INS_LDR and addr.rn == SP and addr.mode == 'post'
-                and addr.offset == ('+', '4u')):
+                and addr.offset is not None and addr.offset[0] == '+' and insn.operands[2].type == ARM_OP_IMM):
             fc.uses_ret = True
             fc.terminates = True
-            return ['{', '    uint32_t pc = read32(ctx, ctx->r[13]);', '    ctx->r[13] += 4u;',
+            return ['{', '    uint32_t pc = read32(ctx, ctx->r[13]);', f'    ctx->r[13] += {addr.offset[1]};',
                     '    RETURN_TO(pc);', '}']
+        targets = getattr(fc.program, 'jump_tables', {}).get(insn.address) if fc.program else None
+        if targets is not None:
+            return _address_switch(insn, fc, targets)
+        if insn.id == ARM_INS_LDR and addr.rn == PC and addr.const is not None and fc.program:
+            # A veneer, `ldr pc, [pc, #-4]` + .word target: a jump to a
+            # fixed address (bit 0 = Thumb), so a tail call to that function.
+            raw = fc.program.read(addr.const, 4)
+            target = int.from_bytes(raw, 'little') if raw else None
+            callee = fc.entries.get(target & ~1) if target is not None else None
+            if callee is None or callee.thumb != bool(target & 1):
+                where = f'{target:08x}' if target is not None else 'an unknown address'
+                raise UnsupportedInstruction(insn, f'jumps to {where}, which is not a function we recompiled')
+            fc.terminates = True
+            return _tail_call(fc, f'{c_name(target & ~1)}(ctx);  /* veneer to {callee.name} */')
         raise UnsupportedInstruction(insn, 'load into pc (indirect jumps come later)')
     if addr.mode != 'offset' and rt == addr.rn:
         raise UnsupportedInstruction(insn, 'writeback to the loaded register is unpredictable')
@@ -1117,6 +1137,27 @@ def _vmov(insn, fc):
     raise UnsupportedInstruction(insn, 'unexpected operand shape')
 
 
+def _address_switch(insn, fc, targets):
+    """ARMCC's switch, `ldrlo pc, [pc, rX, lsl #2]` over a table of absolute
+    addresses right after the following `b default` (discovery read the
+    table and bound): a C switch over the index."""
+    index = _read_reg(insn, insn.operands[1].mem.index)
+    lines = [f'switch ({index}) {{']
+    for i, target in enumerate(targets):
+        if target in fc.code_addrs:
+            fc.labels.add(target)
+            lines.append(f'case {i}: goto L_{target:08x};')
+        elif target in fc.entries:
+            lines.append(f'case {i}: {{ uint32_t to = ctx->r[14]; {c_name(target)}(ctx); '
+                         f'recomp_continue(ctx, to, ret); return; }}')
+            fc.uses_ret = True
+        else:
+            raise UnsupportedInstruction(insn, f'switch target {target:08x} is not code we recompiled')
+    lines += [f'default: recomp_bad_jump(ctx, {_imm(insn.address)}, {index});', '}']
+    fc.terminates = True
+    return lines
+
+
 def _vldr_vstr(insn, fc):
     k, n = _vreg(insn, insn.operands[0])
     addr = _address(insn)
@@ -1232,17 +1273,31 @@ def _coproc(insn, fc):
     raise UnsupportedInstruction(insn, f'coprocessor p{coproc} c{crn} c{crm} op {opc1}/{opc2}')
 
 
-_EXCL_LOADS = {ARM_INS_LDREX: 'ldrex32', ARM_INS_LDREXH: 'ldrex16', ARM_INS_LDREXB: 'ldrex8'}
-_EXCL_STORES = {ARM_INS_STREX: 'strex32', ARM_INS_STREXH: 'strex16', ARM_INS_STREXB: 'strex8'}
+_EXCL_LOADS = {ARM_INS_LDREX: 'ldrex32', ARM_INS_LDREXH: 'ldrex16', ARM_INS_LDREXB: 'ldrex8',
+               ARM_INS_LDREXD: None}
+_EXCL_STORES = {ARM_INS_STREX: 'strex32', ARM_INS_STREXH: 'strex16', ARM_INS_STREXB: 'strex8',
+                ARM_INS_STREXD: None}
 
 
 def _exclusive(insn, fc):
-    """ldrex/strex (atomics): see the exclusive monitor in context.h."""
+    """ldrex/strex (atomics): see the exclusive monitor in context.h.
+    ldrexd/strexd move a doubleword through an even/odd register pair."""
     ops = insn.operands
     mem = ops[-1]
     if mem.type != ARM_OP_MEM or mem.mem.index or mem.mem.disp:
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
     base = _read_reg(insn, mem.mem.base)
+    if insn.id == ARM_INS_LDREXD:
+        rt, rt2 = _dest_reg(insn, ops[0]), _dest_reg(insn, ops[1])
+        if rt % 2 or rt2 != rt + 1 or rt2 == PC:
+            raise UnsupportedInstruction(insn, 'ldrexd needs an even/odd register pair (not lr/pc)')
+        return ['{', f'    uint32_t a = {base};', f'    ctx->r[{rt}] = ldrex32(ctx, a);',
+                f'    ctx->r[{rt2}] = read32(ctx, a + 4u);', '}']
+    if insn.id == ARM_INS_STREXD:
+        rd, rt, rt2 = _dest_reg(insn, ops[0]), _reg_num(insn, ops[1].reg), _reg_num(insn, ops[2].reg)
+        if rt % 2 or rt2 != rt + 1 or rt2 == PC or rd in (rt, rt2, _reg_num(insn, mem.mem.base)):
+            raise UnsupportedInstruction(insn, 'strexd needs an even/odd pair and a separate status register')
+        return [f'ctx->r[{rd}] = strex64(ctx, {base}, ctx->r[{rt}], ctx->r[{rt2}]);  /* 0 = stored */']
     if insn.id in _EXCL_LOADS:
         rt = _dest_reg(insn, ops[0])
         return [f'ctx->r[{rt}] = {_EXCL_LOADS[insn.id]}(ctx, {base});']
@@ -1262,13 +1317,60 @@ def _svc(insn, fc):
     return [f'recomp_svc(ctx, {_imm(op.imm)});']
 
 
+# Dual 16 x 16 multiplies: (subtract the second product?, accumulate?).
+# The X forms swap rm's halves first. Q (overflow) isn't modelled.
+_DUAL_MULS = {
+    ARM_INS_SMUAD: (False, False), ARM_INS_SMUADX: (False, False),
+    ARM_INS_SMUSD: (True, False), ARM_INS_SMUSDX: (True, False),
+    ARM_INS_SMLAD: (False, True), ARM_INS_SMLADX: (False, True),
+    ARM_INS_SMLSD: (True, True), ARM_INS_SMLSDX: (True, True),
+}
+_DUAL_SWAP = {ARM_INS_SMUADX, ARM_INS_SMUSDX, ARM_INS_SMLADX, ARM_INS_SMLSDX}
+
+
+def _dual_mul(insn, fc):
+    """smuad/smusd/smlad/smlsd (+x): rn.lo * rm.lo +/- rn.hi * rm.hi, all
+    signed halfwords, plus ra for the accumulating forms (32-bit wrap)."""
+    sub, acc = _DUAL_MULS[insn.id]
+    ops = insn.operands
+    if len(ops) != (4 if acc else 3) or any(op.type != ARM_OP_REG for op in ops):
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    rd = _dest_reg(insn, ops[0])
+    n, m = _read_reg(insn, ops[1].reg), _read_reg(insn, ops[2].reg)
+    value = f'arm_dual_mul({n}, {m}, {int(insn.id in _DUAL_SWAP)}, {int(sub)})'
+    if acc:
+        value = f'{value} + {_read_reg(insn, ops[3].reg)}'
+    return [f'ctx->r[{rd}] = {value};']
+
+
+def _pack(insn, fc):
+    """pkhbt rd, rn, rm, lsl #s: low half from rn, high half from rm << s.
+    pkhtb rd, rn, rm, asr #s: high half from rn, low half from rm >> s
+    (arithmetic; s = 0 in the encoding means 32). Shift from the encoding."""
+    ops = insn.operands
+    if _is_thumb(insn) or len(ops) != 3 or any(op.type != ARM_OP_REG for op in ops):
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    rd = _dest_reg(insn, ops[0])
+    n, m = _read_reg(insn, ops[1].reg), _read_reg(insn, ops[2].reg)
+    w = _encoding(insn)
+    imm = (w >> 7) & 31
+    if not (w >> 6) & 1:            # pkhbt
+        return [f'ctx->r[{rd}] = ({n} & 0xffffu) | (({m} << {imm}) & 0xffff0000u);']
+    sh = imm or 32
+    low = f'(uint32_t)((int32_t){m} >> 31)' if sh == 32 else f'(uint32_t)((int32_t){m} >> {sh})'
+    return [f'ctx->r[{rd}] = ({n} & 0xffff0000u) | ({low} & 0xffffu);']
+
+
 def _simd8(insn, fc):
-    """uadd8 (sets the GE flags) and sel (uses them), as newlib's strcmp does."""
+    """uadd8 (sets the GE flags) and sel (uses them), as newlib's strcmp does;
+    uqsub8 (each byte a - b, saturating at 0)."""
     ops = insn.operands
     if len(ops) != 3 or any(op.type != ARM_OP_REG for op in ops):
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
     rd = _dest_reg(insn, ops[0])
     n, m = _read_reg(insn, ops[1].reg), _read_reg(insn, ops[2].reg)
+    if insn.id == ARM_INS_UQSUB8:
+        return [f'ctx->r[{rd}] = arm_uqsub8({n}, {m});']
     helper = 'arm_uadd8' if insn.id == ARM_INS_UADD8 else 'arm_sel'
     return [f'ctx->r[{rd}] = {helper}(ctx, {n}, {m});']
 
@@ -1284,6 +1386,12 @@ def _nop(insn, fc):
     if insn.mnemonic != 'nop':
         raise UnsupportedInstruction(insn, 'hint instruction')
     return ['/* nop */']
+
+
+def _preload(insn, fc):
+    """pld: tells the cache an address will be read soon. No effect on
+    registers, flags or memory (it never faults), so nothing to do."""
+    return ['/* preload hint */']
 
 
 # ---------------------------------------------------------------- dispatch
@@ -1322,6 +1430,11 @@ _HANDLERS = {
     ARM_INS_CLREX: _clrex,
     ARM_INS_SVC: _svc,
     ARM_INS_UADD8: _simd8,
+    ARM_INS_UQSUB8: _simd8,
+    ARM_INS_PKHBT: _pack,
+    **{op: _dual_mul for op in _DUAL_MULS},
+    ARM_INS_PKHTB: _pack,
+    ARM_INS_PLD: _preload,
     ARM_INS_SEL: _simd8,
     ARM_INS_UDF: _udf,
     ARM_INS_HINT: _nop,

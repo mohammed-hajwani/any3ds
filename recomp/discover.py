@@ -30,10 +30,11 @@ call that never returns.
 """
 
 from bisect import bisect_right
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from capstone.arm import (
-    ARM_CC_AL, ARM_CC_LS, ARM_INS_ADD, ARM_INS_B, ARM_INS_BL, ARM_INS_BLX, ARM_INS_BX, ARM_INS_CMP,
+    ARM_CC_AL, ARM_CC_LO, ARM_CC_LS, ARM_INS_ADD, ARM_INS_B, ARM_INS_BL, ARM_INS_BLX, ARM_INS_BX, ARM_INS_CMP,
+    ARM_INS_CMN, ARM_INS_TEQ, ARM_INS_TST, ARM_INS_ADR,
     ARM_INS_LDM, ARM_INS_LDMDA, ARM_INS_LDMDB, ARM_INS_LDMIB, ARM_INS_LDR, ARM_INS_LDRB, ARM_INS_LDRD,
     ARM_INS_LDRH, ARM_INS_LDRSB, ARM_INS_LDRSH, ARM_INS_LSL, ARM_INS_MOV, ARM_INS_POP, ARM_INS_UDF, ARM_INS_VLDR,
     ARM_OP_IMM, ARM_OP_MEM, ARM_OP_REG,
@@ -71,6 +72,7 @@ class Explored:
     pointers: set = field(default_factory=set)      # literal values that point into code
     root: tuple = None                              # the start whose exploration found this one
     falls_into: set = field(default_factory=set)    # other function starts this code runs straight into
+    deps: dict = field(default_factory=dict)        # address -> (is a start, is data) as seen while exploring
 
 
 class Discovery:
@@ -82,8 +84,13 @@ class Discovery:
         self.text = code[0]
         self.text_end = self.text.vaddr + len(self.text.data)
         self._cache = {}
+        self._explored = {}         # (addr, thumb) -> Explored, reused while its deps still hold
+        self._translatable = {}     # function shape -> whether the translator accepts it
         self.unresolved = set()     # jump tables whose targets we couldn't find
+        self.jump_tables = {}       # address of a `ldr pc` switch -> its targets, for the translator
+        program.jump_tables = self.jump_tables
         self._added = None          # starts added while trying a guess, to undo if it fails
+        self._start_info = {}       # start -> (thumb, root) when it was last explored
 
     # ------------------------------------------------------------ decoding
 
@@ -110,10 +117,28 @@ class Discovery:
 
     # ------------------------------------------------------------ one function
 
+    def _status(self, fn, a):
+        """(is a function start, is literal data) for address a, remembered
+        in fn.deps: the result of exploring fn depends only on these."""
+        st = (a in self.starts_set, a in self._cur_data or a in self._cur_own)
+        fn.deps[a] = st
+        return st
+
     def explore(self, addr, thumb, starts, data_words, own=frozenset()):
         """Recursive descent through one function. `starts` is the sorted
         list of known function starts, `data_words` the known literal data.
-        Raises Rejected if code it reaches can't be decoded."""
+        Raises Rejected if code it reaches can't be decoded.
+
+        Discovery explores the same functions over and over as it learns
+        more; a function is only explored again if one of the addresses it
+        looked at changed status (became a function start, or data)."""
+        key = (addr, thumb)
+        hit = self._explored.get(key)
+        if hit is not None:
+            starts_set = self.starts_set
+            if all((a in starts_set, a in data_words or a in own) == st for a, st in hit.deps.items()):
+                return hit
+        self._cur_data, self._cur_own = data_words, own
         fn = Explored(addr, thumb)
         limit = self.text_end
         work = [(addr, False)]
@@ -121,14 +146,15 @@ class Discovery:
             a, after_call = work.pop()
             if a in fn.insns:
                 continue
-            if a != addr and a in self.starts_set:
+            is_start, is_data = self._status(fn, a)
+            if a != addr and is_start:
                 fn.falls_into.add(a)
                 continue            # runs on into another function: a tail call (the translator's job)
             if a >= limit:
                 if after_call:
                     continue
                 raise Rejected(f'{a:08x}: code runs off the end of the code segment')
-            if a in data_words or a in own:
+            if is_data:
                 if after_call:
                     continue        # a call that never returns, followed by data
                 raise Rejected(f'{a:08x}: code runs into literal data')
@@ -140,6 +166,7 @@ class Discovery:
             fn.insns[a] = insn
             nxt = a + insn.size
             self._analyse(fn, insn, thumb, work, nxt, limit)
+        self._explored[key] = fn
         return fn
 
     def _analyse(self, fn, insn, thumb, work, nxt, limit):
@@ -158,7 +185,7 @@ class Discovery:
 
         if iid == ARM_INS_B and len(ops) == 1 and ops[0].type == ARM_OP_IMM:
             target = ops[0].imm & 0xFFFFFFFF
-            if target in self.starts_set and target != fn.addr:
+            if self._status(fn, target)[0] and target != fn.addr:
                 self._call(fn, target, thumb, insn)         # a tail call
             elif fn.addr <= target < limit:
                 work.append((target, False))                # inside this function
@@ -184,9 +211,17 @@ class Discovery:
         writes_pc = bool(ops) and ops[0].type == ARM_OP_REG and _reg_num(insn, ops[0].reg) == PC
         if iid in _LOAD_SIZES or iid == ARM_INS_VLDR:
             self._literal(fn, insn, iid)
+        if iid in (ARM_INS_ADD, ARM_INS_ADR) and not writes_pc:
+            self._pc_relative_address(fn, insn, thumb)
         if writes_pc:
             if iid == ARM_INS_ADD and not thumb:
                 self._jump_table(fn, insn, work, nxt, limit)
+                return
+            if iid == ARM_INS_LDR and not thumb and self._address_table(fn, insn, work, nxt):
+                return
+            if iid == ARM_INS_LDR and self._veneer(fn, insn):
+                if cond:
+                    work.append((nxt, False))
                 return
             if cond:
                 work.append((nxt, False))
@@ -233,10 +268,9 @@ class Discovery:
             return                  # some other computed jump: the translator will say so
         index = _reg_num(insn, ops[2].reg)
         bound = None
-        prev = fn.insns.get(insn.address - 4)
-        if (prev is not None and prev.id == ARM_INS_CMP and prev.operands[1].type == ARM_OP_IMM
-                and _reg_num(prev, prev.operands[0].reg) == index and insn.cc == ARM_CC_LS):
-            bound = prev.operands[1].imm + 1
+        cmp = self._bound_check(fn, insn, index)
+        if cmp is not None and insn.cc == ARM_CC_LS:
+            bound = cmp + 1
         if insn.cc != ARM_CC_AL:
             work.append((nxt, False))
         offsets = self._offset_table(fn, insn, index)
@@ -253,13 +287,100 @@ class Discovery:
             self.unresolved.add(insn.address)       # neither a row of branches nor a table we can read
             return
         a, n = insn.address + 8, 0
-        while a < limit and a not in self.starts_set and (bound is None or n < bound):
+        while a < limit and not self._status(fn, a)[0] and (bound is None or n < bound):
             entry = self.decode(a, False)
             if entry is None or entry.id != ARM_INS_B or entry.cc != ARM_CC_AL:
                 if bound is None:
                     break
             work.append((a, False))
             a, n = a + 4, n + 1
+
+    def _pc_relative_address(self, fn, insn, thumb):
+        """`add rX, pc, #n` / `adr rX, label`: an address next to the code.
+        If it points at code, it may be called: ARMCC's interworking veneer
+        `add ip, pc, #1; bx ip` enters the Thumb function right after it."""
+        ops = insn.operands
+        if insn.id == ARM_INS_ADR:          # Capstone's Thumb form: the offset from Align(pc, 4)
+            if len(ops) != 2 or ops[1].type != ARM_OP_IMM:
+                return
+            imm = ops[1].imm
+        else:                               # ARM: add rX, pc, #n
+            if len(ops) != 3 or ops[1].type != ARM_OP_REG or _reg_num(insn, ops[1].reg) != PC \
+                    or ops[2].type != ARM_OP_IMM:
+                return
+            imm = ops[2].imm
+        base = (insn.address + 4) & ~3 if thumb else insn.address + 8
+        value = (base + imm) & 0xFFFFFFFF
+        if self.in_text(value & ~1):
+            fn.pointers.add(value)
+
+    def _bound_check(self, fn, insn, index):
+        """N from the `cmp rIndex, #N` whose flags insn's condition uses:
+        compilers schedule other instructions in between (ARMCC puts a
+        `push` or `strb` there), so look back past any that leave both the
+        index register and the flags alone."""
+        for p in self._back(fn, insn.address, 8):
+            if p.id == ARM_INS_CMP:
+                ops = p.operands
+                if ops[1].type == ARM_OP_IMM and _reg_num(p, ops[0].reg) == index:
+                    return ops[1].imm
+                return None
+            if self._writes(p, index) or p.update_flags or p.id in (ARM_INS_CMN, ARM_INS_TST, ARM_INS_TEQ):
+                return None
+            if p.id in (ARM_INS_B, ARM_INS_BL, ARM_INS_BLX, ARM_INS_BX):
+                return None
+        return None
+
+    def _veneer(self, fn, insn):
+        """`ldr pc, [pc, #-4]` and a word: a jump to that absolute address
+        (linker veneers for far branches). Bit 0 of the word selects Thumb.
+        Returns False if insn isn't a pc-relative literal load."""
+        mem = insn.operands[1]
+        if mem.type != ARM_OP_MEM or _reg_num(insn, mem.mem.base) != PC or mem.mem.index:
+            return False
+        raw = self.program.read(_address(insn).const, 4)
+        if raw is None:
+            return False
+        target = int.from_bytes(raw, 'little')
+        if self.in_text(target & ~1):
+            self._call(fn, target & ~1, bool(target & 1), insn)
+        else:
+            self.unresolved.add(insn.address)       # e.g. into a CRO module: not ours
+        return True
+
+    def _address_table(self, fn, insn, work, nxt):
+        """ARMCC's switch: `cmp rX, #N; ldrlo pc, [pc, rX, lsl #2]; b default`
+        followed by N absolute addresses. Returns False if insn isn't that."""
+        mem = insn.operands[1]
+        if (len(insn.operands) != 2 or mem.type != ARM_OP_MEM or _reg_num(insn, mem.mem.base) != PC
+                or not mem.mem.index or mem.subtracted or mem.shift.value != 2 or insn.writeback):
+            return False
+        index = _reg_num(insn, mem.mem.index)
+        bound = None
+        cmp = self._bound_check(fn, insn, index)
+        if cmp is not None:
+            bound = {ARM_CC_LO: cmp, ARM_CC_LS: cmp + 1}.get(insn.cc)
+        if insn.cc != ARM_CC_AL:
+            work.append((nxt, False))
+        if bound is None:
+            self.unresolved.add(insn.address)
+            return True
+        table = insn.address + 8
+        raw = self.program.read(table, 4 * bound)
+        if raw is None:
+            self.unresolved.add(insn.address)
+            return True
+        targets = [int.from_bytes(raw[4 * i:4 * i + 4], 'little') for i in range(bound)]
+        fn.data.update((table + 4 * i, 4) for i in range(bound))
+        self.jump_tables[insn.address] = targets
+        for t in targets:
+            if t & 1 or not self.in_text(t):
+                raise Rejected(f'{insn.address:08x}: switch table entry {t:08x} is not ARM code')
+            if fn.addr <= t:
+                work.append((t, False))
+            else:
+                self._call(fn, t, False, insn)
+        return True
 
     def _offset_table(self, fn, insn, index):
         """The entries of the table an `add pc, pc, rI, lsl #2` index was
@@ -368,7 +489,17 @@ class Discovery:
         # A stack: the last root's whole call tree is explored before the
         # next root is looked at, so put the roots you trust most last.
         work = [(addr, thumb, None, (addr, thumb)) for addr, thumb in roots]
-        while work:
+        while True:
+            if not work:
+                # A start registered in an earlier round whose caller no
+                # longer calls it (that caller's extent changed) still cuts
+                # its neighbour short; so explore it too, as the function the
+                # translator will see falling into it.
+                work = [(a, *self._start_info[a], None) for a in self.starts
+                        if a not in new and a not in known and a in self._start_info]
+                work = [(a, thumb, None, root) for a, thumb, root, _ in work]
+                if not work:
+                    break
             addr, thumb, caller, root = work.pop()
             if addr in known or addr in new:
                 have = known.get(addr) or new.get(addr)
@@ -382,13 +513,15 @@ class Discovery:
                 continue
             if addr not in self.starts_set:
                 self._add_start(addr)
+            self._start_info[addr] = (thumb, root)
             try:
                 own = own_data.get(root, frozenset()) if own_data else frozenset()
                 fn = self.explore(addr, thumb, self.starts, data_words, own)
             except Rejected as e:
                 e.root = root
                 raise
-            fn.root = root
+            if fn.root != root:
+                fn = replace(fn, root=root)
             new[addr] = fn
             work.extend((t, th, a, root) for t, th, a in fn.call_sites)
         return new
@@ -418,6 +551,16 @@ class Discovery:
             # guess is the middle of a function (a data word that only looks
             # like an address, e.g. in a font bitmap). Splitting there would
             # break that function's returns.
+            # A guess starting inside some function's literal pool is data.
+            # Drop those first: decoding a pool, they would "run into" the
+            # real function after it.
+            pools = self._data_words(fns)
+            in_pool = {g for g in accepted if g[0] in pools}
+            if in_pool:
+                for g in in_pool:
+                    accepted.discard(g)
+                    rejected[g[0] | g[1]] = 'inside the literal data of another function'
+                continue
             falls = {a for fn in fns.values() for a in fn.falls_into}
             middle = {g for g in accepted if g[0] in falls}
             if middle:
@@ -499,12 +642,17 @@ class Discovery:
         for fn in fns.values():
             if fn.root in roots or fn.root in bad:
                 continue
-            func = _function(self.program, fn)
-            insns = [fn.insns[a] for a in sorted(fn.insns)]
-            try:
-                translate_function(func, insns, entries, None)
-            except (UnsupportedInstruction, ValueError) as e:
-                bad[fn.root] = str(e)
+            shape = (fn.addr, fn.thumb, len(fn.insns), max(fn.insns), frozenset(fn.calls), frozenset(fn.falls_into))
+            if shape not in self._translatable:
+                func = _function(self.program, fn)
+                insns = [fn.insns[a] for a in sorted(fn.insns)]
+                try:
+                    translate_function(func, insns, entries, self.program)
+                    self._translatable[shape] = None
+                except (UnsupportedInstruction, ValueError) as e:
+                    self._translatable[shape] = str(e)
+            if self._translatable[shape] is not None:
+                bad[fn.root] = self._translatable[shape]
         return bad
 
     def _fixpoint(self, roots, guesses=()):
@@ -548,10 +696,23 @@ class Discovery:
             if seg is self.text:
                 continue
             data = seg.data
+            run = []
             for off in range(0, len(data) - 3, 4):
                 value = int.from_bytes(data[off:off + 4], 'little')
                 if self.in_text(value & ~1):
                     out.add(value)
+                # ARMCC keeps its table of C++ static constructors as offsets
+                # from each entry's own address (position-independent). One
+                # such word is likely chance; a run of them is that table.
+                target = (seg.vaddr + off + value) & 0xFFFFFFFF
+                if self.in_text(target & ~1):
+                    run.append(target)
+                else:
+                    if len(run) >= 4:
+                        out.update(run)
+                    run = []
+            if len(run) >= 4:
+                out.update(run)
         return out
 
 
@@ -592,6 +753,7 @@ def discover(program, extra=()):
     functions, data_ranges = to_functions(program, fns)
     program.functions = functions
     program.data_ranges = data_ranges
+    program.jump_tables = d.jump_tables
     report['functions'] = len(functions)
     report['instructions'] = sum(len(f.insns) for f in fns.values())
     return functions, report

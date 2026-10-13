@@ -7,6 +7,7 @@
 @   mov pc, lr        the pre-interworking return (newlib's camera code)
 @   fall-through      a function that runs straight on into the next one
 @                     (libgcc's __aeabi_dsub does this into __adddf3)
+@   uqsub8, pld, ldr pc, [sp], #N (see the end of the file)
 @ The accumulating forms set the sticky Q flag on signed overflow; we don't
 @ model Q, and nothing we recompile reads it (mrs is a hard error).
 
@@ -144,3 +145,70 @@ FUNC absent_coprocessor
     vldmia r0, {d16-d17}
     bx lr
     .size absent_coprocessor, . - absent_coprocessor
+
+@ Found in a commercial (ARMCC-built) program:
+@   uqsub8            each byte a - b, unsigned, saturating at 0
+@   pkhbt / pkhtb     pack a halfword from each of two registers
+@   smuad/smusd/smlad/smlsd (+x)   dual signed 16 x 16 multiplies
+@   uxtb16 / sxtb16   bytes 0 and 2 into the two halfwords
+@   ldrexd / strexd   64-bit exclusive access
+@   pld               a cache preload hint: no architectural effect
+@   ldr pc, [sp], #N  a return that also drops N - 4 more bytes of stack
+    MUL3 uqsub8
+
+FUNC preload
+    pld [r1, #0x40]
+    add r0, r1, #1
+END preload
+
+FUNC pop_pc_and_drop
+    sub sp, sp, #16             @ 16 bytes the return then drops
+    push {lr}
+    add r0, r1, r2
+    ldr pc, [sp], #0x14
+    .size pop_pc_and_drop, . - pop_pc_and_drop
+
+FUNC pkhbt_0
+    pkhbt r0, r1, r2
+END pkhbt_0
+
+FUNC pkhbt_16
+    pkhbt r0, r1, r2, lsl #16
+END pkhbt_16
+
+FUNC pkhtb_16
+    pkhtb r0, r1, r2, asr #16
+END pkhtb_16
+
+FUNC pkhtb_32
+    pkhtb r0, r1, r2, asr #32
+END pkhtb_32
+
+    MUL3 smuad
+    MUL3 smuadx
+    MUL3 smusd
+    MUL3 smusdx
+    MUL4 smlad
+    MUL4 smladx
+    MUL4 smlsd
+    MUL4 smlsdx
+
+FUNC uxtb16_ror8
+    uxtb16 r0, r1, ror #8
+END uxtb16_ror8
+
+FUNC sxtb16_
+    sxtb16 r0, r1
+END sxtb16_
+
+@ r0 = pointer to 8 bytes: read them exclusively, add r2 to the low word,
+@ store back exclusively; r0 = status (0), r1 = the old low word.
+FUNC exclusive64
+    push {r4, r5}
+    mov r12, r0
+    ldrexd r4, r5, [r12]
+    mov r1, r4
+    add r4, r4, r2
+    strexd r0, r4, r5, [r12]
+    pop {r4, r5}
+END exclusive64
