@@ -363,6 +363,50 @@ static inline uint32_t arm_uadd8(Ctx *ctx, uint32_t a, uint32_t b)
     return r;
 }
 
+/* The ARMv6 parallel add/subtract family. bits: 16 (two lanes) or 8 (four
+   lanes). op: 0 add, 1 sub, 2 asx (high = a.hi + b.lo, low = a.lo - b.hi),
+   3 sax (high = a.hi - b.lo, low = a.lo + b.hi). mode: 0 signed, 1 signed
+   saturating, 2 signed halving, 3 unsigned, 4 unsigned saturating, 5
+   unsigned halving. Modes 0 and 3 set the GE flags of each lane's bytes:
+   signed, when the result is >= 0; unsigned, on a carry out of an add or
+   no borrow in a subtract. */
+static inline uint32_t arm_parallel(Ctx *ctx, uint32_t a, uint32_t b, int bits, int op, int mode)
+{
+    int lanes = 32 / bits, is_signed = mode <= 2;
+    uint32_t mask = bits == 16 ? 0xFFFFu : 0xFFu, r = 0, ge = 0;
+    for (int i = 0; i < lanes; i++) {
+        int j = op >= 2 ? 1 - i : i;                /* asx/sax cross the halves */
+        uint32_t ua = (a >> (bits * i)) & mask, ub = (b >> (bits * j)) & mask;
+        int32_t x = is_signed ? (bits == 16 ? (int16_t)ua : (int8_t)ua) : (int32_t)ua;
+        int32_t y = is_signed ? (bits == 16 ? (int16_t)ub : (int8_t)ub) : (int32_t)ub;
+        int sub = op == 1 || (op == 2 && i == 0) || (op == 3 && i == 1);
+        int32_t v = sub ? x - y : x + y;
+        int lane_ge;
+        switch (mode) {
+        case 1: {                                   /* signed saturating */
+            int32_t lo = -(1 << (bits - 1)), hi = (1 << (bits - 1)) - 1;
+            v = v < lo ? lo : v > hi ? hi : v;
+            break;
+        }
+        case 4: {                                   /* unsigned saturating */
+            int32_t hi = (int32_t)mask;
+            v = v < 0 ? 0 : v > hi ? hi : v;
+            break;
+        }
+        case 2: case 5:                             /* halving */
+            v >>= 1;                                /* (arithmetic: the sum is exact) */
+            break;
+        }
+        lane_ge = mode == 0 ? v >= 0 : mode == 3 ? (sub ? v >= 0 : v > (int32_t)mask) : 0;
+        if (mode == 0 || mode == 3)
+            ge |= (lane_ge ? (bits == 16 ? 3u : 1u) : 0u) << (i * bits / 8);
+        r |= ((uint32_t)v & mask) << (bits * i);
+    }
+    if (mode == 0 || mode == 3)
+        ctx->ge = ge;
+    return r;
+}
+
 /* uqsub8: each byte a - b, unsigned, saturating at 0 (no flags). */
 static inline uint32_t arm_uqsub8(uint32_t a, uint32_t b)
 {

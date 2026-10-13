@@ -148,13 +148,14 @@ FUNC absent_coprocessor
 
 @ Found in a commercial (ARMCC-built) program:
 @   uqsub8            each byte a - b, unsigned, saturating at 0
+@   the parallel family: {s,q,sh,u,uq,uh}{add16,sub16,asx,sax,add8,sub8};
+@   the S and U forms set GE, checked through sel
 @   pkhbt / pkhtb     pack a halfword from each of two registers
 @   smuad/smusd/smlad/smlsd (+x)   dual signed 16 x 16 multiplies
 @   uxtb16 / sxtb16   bytes 0 and 2 into the two halfwords
 @   ldrexd / strexd   64-bit exclusive access
 @   pld               a cache preload hint: no architectural effect
 @   ldr pc, [sp], #N  a return that also drops N - 4 more bytes of stack
-    MUL3 uqsub8
 
 FUNC preload
     pld [r1, #0x40]
@@ -212,3 +213,26 @@ FUNC exclusive64
     strexd r0, r4, r5, [r12]
     pop {r4, r5}
 END exclusive64
+
+@ The parallel add/subtract family. For the GE-setting S and U forms, a
+@ second function feeds the GE flags through sel so they are checked too.
+    .macro PAR op
+FUNC \op\()_
+    \op r0, r1, r2
+END \op\()_
+    .endm
+    .macro PARGE op
+FUNC \op\()_ge
+    \op r0, r1, r2
+    sel r0, r0, r3
+END \op\()_ge
+    .endm
+    .irp mode, s, q, sh, u, uq, uh
+    .irp op, add16, sub16, asx, sax, add8, sub8
+    PAR \mode\op
+    .endr
+    .endr
+    .irp op, add16, sub16, asx, sax, add8, sub8
+    PARGE s\op
+    PARGE u\op
+    .endr

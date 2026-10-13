@@ -51,6 +51,8 @@ from capstone.arm import (
     ARM_SFT_LSR, ARM_SFT_LSR_REG, ARM_SFT_ROR, ARM_SFT_ROR_REG, ARM_SFT_RRX,
 )
 
+import capstone.arm as capstone_arm
+
 from .emit_c import c_name
 
 
@@ -1387,18 +1389,34 @@ def _pack(insn, fc):
     return [f'ctx->r[{rd}] = ({n} & 0xffff0000u) | ({low} & 0xffffu);']
 
 
+# The ARMv6 parallel ("SIMD") add/subtract family: a prefix for how each
+# lane is treated (S/U: signed/unsigned, setting the GE flags; Q/UQ:
+# saturating; SH/UH: halving) and an operation on two 16-bit lanes (ADD16,
+# SUB16, ASX: high = a.hi + b.lo and low = a.lo - b.hi, SAX the other way)
+# or four 8-bit lanes (ADD8, SUB8). arm_parallel in context.h does the work.
+_PARALLEL_MODES = {'s': 0, 'q': 1, 'sh': 2, 'u': 3, 'uq': 4, 'uh': 5}
+_PARALLEL_OPS = {'add16': (16, 0), 'sub16': (16, 1), 'asx': (16, 2), 'sax': (16, 3),
+                 'add8': (8, 0), 'sub8': (8, 1)}
+_PARALLEL = {}
+for _mode in _PARALLEL_MODES:
+    for _op in _PARALLEL_OPS:
+        _PARALLEL[getattr(capstone_arm, f'ARM_INS_{(_mode + _op).upper()}')] = (_mode, _op)
+
+
 def _simd8(insn, fc):
-    """uadd8 (sets the GE flags) and sel (uses them), as newlib's strcmp does;
-    uqsub8 (each byte a - b, saturating at 0)."""
+    """The parallel add/subtract family (see _PARALLEL), and sel, which
+    picks each byte from rn where its GE flag is set, else from rm."""
     ops = insn.operands
     if len(ops) != 3 or any(op.type != ARM_OP_REG for op in ops):
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
     rd = _dest_reg(insn, ops[0])
     n, m = _read_reg(insn, ops[1].reg), _read_reg(insn, ops[2].reg)
-    if insn.id == ARM_INS_UQSUB8:
-        return [f'ctx->r[{rd}] = arm_uqsub8({n}, {m});']
-    helper = 'arm_uadd8' if insn.id == ARM_INS_UADD8 else 'arm_sel'
-    return [f'ctx->r[{rd}] = {helper}(ctx, {n}, {m});']
+    if insn.id == ARM_INS_SEL:
+        return [f'ctx->r[{rd}] = arm_sel(ctx, {n}, {m});']
+    mode, op = _PARALLEL[insn.id]
+    bits, kind = _PARALLEL_OPS[op]
+    return [f'ctx->r[{rd}] = arm_parallel(ctx, {n}, {m}, {bits}, {kind}, {_PARALLEL_MODES[mode]});'
+            f'  /* {insn.mnemonic} */']
 
 
 def _udf(insn, fc):
@@ -1455,8 +1473,7 @@ _HANDLERS = {
     **{op: _exclusive for op in (*_EXCL_LOADS, *_EXCL_STORES)},
     ARM_INS_CLREX: _clrex,
     ARM_INS_SVC: _svc,
-    ARM_INS_UADD8: _simd8,
-    ARM_INS_UQSUB8: _simd8,
+    **{op: _simd8 for op in _PARALLEL},
     ARM_INS_PKHBT: _pack,
     **{op: _dual_mul for op in _DUAL_MULS},
     ARM_INS_PKHTB: _pack,

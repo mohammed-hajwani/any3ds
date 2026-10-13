@@ -3,11 +3,11 @@
 <rect x="10" y="10" width="80" height="26" fill="#30363d"/>
 <text x="50.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">services</text>
 <rect x="90" y="10" width="48" height="26" fill="#b62324"/>
-<text x="114.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">8.5%</text>
+<text x="114.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">8.6%</text>
 <rect x="148" y="10" width="40" height="26" fill="#30363d"/>
 <text x="168.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">CPU</text>
 <rect x="188" y="10" width="56" height="26" fill="#9a6700"/>
-<text x="216.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">64.1%</text>
+<text x="216.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">78.8%</text>
 <rect x="254" y="10" width="72" height="26" fill="#30363d"/>
 <text x="290.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">shaders</text>
 <rect x="326" y="10" width="64" height="26" fill="#2ea043"/>
@@ -16,7 +16,7 @@
 <text x="472.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">examples running</text>
 <rect x="544" y="10" width="56" height="26" fill="#9a6700"/>
 <text x="572.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">49/62</text>
-<text x="10" y="66" fill="#ffffff" font-size="16">OS services: 8.5% (127/1501)</text>
+<text x="10" y="66" fill="#ffffff" font-size="16">OS services: 8.6% (129/1501)</text>
 <rect x="10.0" y="76.0" width="181.9" height="150.2" fill="#0d1117"/>
 <rect x="11.5" y="77.5" width="10.9" height="11.3" fill="#5b636e"><title>AC 0x0001 CreateDefaultConfig (not yet)</title></rect>
 <rect x="23.4" y="77.5" width="10.9" height="11.3" fill="#5b636e"><title>AC 0x0002 DebugSetApType (not yet)</title></rect>
@@ -423,8 +423,8 @@
 <rect x="59.2" y="402.6" width="10.9" height="10.2" fill="#5b636e"><title>FS 0x084e UpdateSha256Context (not yet)</title></rect>
 <rect x="71.1" y="402.6" width="10.9" height="10.2" fill="#5b636e"><title>FS 0x084f ReadSpecialFile (not yet)</title></rect>
 <rect x="83.1" y="402.6" width="10.9" height="10.2" fill="#5b636e"><title>FS 0x0850 GetSpecialFileSize (not yet)</title></rect>
-<rect x="95.0" y="402.6" width="10.9" height="10.2" fill="#5b636e"><title>FS 0x0851 CreateExtSaveData (not yet)</title></rect>
-<rect x="106.9" y="402.6" width="10.9" height="10.2" fill="#5b636e"><title>FS 0x0852 DeleteExtSaveData (not yet)</title></rect>
+<rect x="95.0" y="402.6" width="10.9" height="10.2" fill="#2ea043"><title>FS 0x0851 CreateExtSaveData</title></rect>
+<rect x="106.9" y="402.6" width="10.9" height="10.2" fill="#2ea043"><title>FS 0x0852 DeleteExtSaveData</title></rect>
 <rect x="118.8" y="402.6" width="10.9" height="10.2" fill="#5b636e"><title>FS 0x0853 ReadExtSaveDataIcon (not yet)</title></rect>
 <rect x="130.8" y="402.6" width="10.9" height="10.2" fill="#5b636e"><title>FS 0x0854 GetExtDataBlockSize (not yet)</title></rect>
 <rect x="142.7" y="402.6" width="10.9" height="10.2" fill="#5b636e"><title>FS 0x0855 EnumerateExtSaveData (not yet)</title></rect>
@@ -1569,44 +1569,44 @@
 <rect x="596.5" y="442.4" width="11.0" height="7.0" fill="#2ea043"><title>RO 0x0008 Shutdown</title></rect>
 <rect x="560.6" y="450.5" width="11.0" height="7.0" fill="#2ea043"><title>RO 0x0009 LoadCRO_New</title></rect>
 <text x="563.1" y="446.9" fill="#ffffff" font-size="11" style="paint-order:stroke" stroke="#0d1117" stroke-width="2.5">RO</text>
-<text x="625" y="66" fill="#ffffff" font-size="16">CPU instructions: 64.1% (148/231)</text>
+<text x="625" y="66" fill="#ffffff" font-size="16">CPU instructions: 78.8% (182/231)</text>
 <rect x="625.0" y="76.0" width="139.4" height="154.6" fill="#0d1117"/>
-<rect x="626.5" y="77.5" width="21.7" height="24.3" fill="#5b636e"><title>sadd16 (not yet)</title></rect>
-<rect x="649.2" y="77.5" width="21.7" height="24.3" fill="#5b636e"><title>sadd8 (not yet)</title></rect>
-<rect x="672.0" y="77.5" width="21.7" height="24.3" fill="#5b636e"><title>ssub16 (not yet)</title></rect>
-<rect x="694.7" y="77.5" width="21.7" height="24.3" fill="#5b636e"><title>ssub8 (not yet)</title></rect>
-<rect x="717.4" y="77.5" width="21.7" height="24.3" fill="#5b636e"><title>sasx (not yet)</title></rect>
-<rect x="740.1" y="77.5" width="21.7" height="24.3" fill="#5b636e"><title>ssax (not yet)</title></rect>
-<rect x="626.5" y="102.8" width="21.7" height="24.3" fill="#5b636e"><title>qadd16 (not yet)</title></rect>
-<rect x="649.2" y="102.8" width="21.7" height="24.3" fill="#5b636e"><title>qadd8 (not yet)</title></rect>
-<rect x="672.0" y="102.8" width="21.7" height="24.3" fill="#5b636e"><title>qsub16 (not yet)</title></rect>
-<rect x="694.7" y="102.8" width="21.7" height="24.3" fill="#5b636e"><title>qsub8 (not yet)</title></rect>
-<rect x="717.4" y="102.8" width="21.7" height="24.3" fill="#5b636e"><title>qasx (not yet)</title></rect>
-<rect x="740.1" y="102.8" width="21.7" height="24.3" fill="#5b636e"><title>qsax (not yet)</title></rect>
-<rect x="626.5" y="128.0" width="21.7" height="24.3" fill="#5b636e"><title>shadd16 (not yet)</title></rect>
-<rect x="649.2" y="128.0" width="21.7" height="24.3" fill="#5b636e"><title>shadd8 (not yet)</title></rect>
-<rect x="672.0" y="128.0" width="21.7" height="24.3" fill="#5b636e"><title>shsub16 (not yet)</title></rect>
-<rect x="694.7" y="128.0" width="21.7" height="24.3" fill="#5b636e"><title>shsub8 (not yet)</title></rect>
-<rect x="717.4" y="128.0" width="21.7" height="24.3" fill="#5b636e"><title>shasx (not yet)</title></rect>
-<rect x="740.1" y="128.0" width="21.7" height="24.3" fill="#5b636e"><title>shsax (not yet)</title></rect>
-<rect x="626.5" y="153.3" width="21.7" height="24.3" fill="#5b636e"><title>uadd16 (not yet)</title></rect>
+<rect x="626.5" y="77.5" width="21.7" height="24.3" fill="#2ea043"><title>sadd16</title></rect>
+<rect x="649.2" y="77.5" width="21.7" height="24.3" fill="#2ea043"><title>sadd8</title></rect>
+<rect x="672.0" y="77.5" width="21.7" height="24.3" fill="#2ea043"><title>ssub16</title></rect>
+<rect x="694.7" y="77.5" width="21.7" height="24.3" fill="#2ea043"><title>ssub8</title></rect>
+<rect x="717.4" y="77.5" width="21.7" height="24.3" fill="#2ea043"><title>sasx</title></rect>
+<rect x="740.1" y="77.5" width="21.7" height="24.3" fill="#2ea043"><title>ssax</title></rect>
+<rect x="626.5" y="102.8" width="21.7" height="24.3" fill="#2ea043"><title>qadd16</title></rect>
+<rect x="649.2" y="102.8" width="21.7" height="24.3" fill="#2ea043"><title>qadd8</title></rect>
+<rect x="672.0" y="102.8" width="21.7" height="24.3" fill="#2ea043"><title>qsub16</title></rect>
+<rect x="694.7" y="102.8" width="21.7" height="24.3" fill="#2ea043"><title>qsub8</title></rect>
+<rect x="717.4" y="102.8" width="21.7" height="24.3" fill="#2ea043"><title>qasx</title></rect>
+<rect x="740.1" y="102.8" width="21.7" height="24.3" fill="#2ea043"><title>qsax</title></rect>
+<rect x="626.5" y="128.0" width="21.7" height="24.3" fill="#2ea043"><title>shadd16</title></rect>
+<rect x="649.2" y="128.0" width="21.7" height="24.3" fill="#2ea043"><title>shadd8</title></rect>
+<rect x="672.0" y="128.0" width="21.7" height="24.3" fill="#2ea043"><title>shsub16</title></rect>
+<rect x="694.7" y="128.0" width="21.7" height="24.3" fill="#2ea043"><title>shsub8</title></rect>
+<rect x="717.4" y="128.0" width="21.7" height="24.3" fill="#2ea043"><title>shasx</title></rect>
+<rect x="740.1" y="128.0" width="21.7" height="24.3" fill="#2ea043"><title>shsax</title></rect>
+<rect x="626.5" y="153.3" width="21.7" height="24.3" fill="#2ea043"><title>uadd16</title></rect>
 <rect x="649.2" y="153.3" width="21.7" height="24.3" fill="#2ea043"><title>uadd8</title></rect>
-<rect x="672.0" y="153.3" width="21.7" height="24.3" fill="#5b636e"><title>usub16 (not yet)</title></rect>
-<rect x="694.7" y="153.3" width="21.7" height="24.3" fill="#5b636e"><title>usub8 (not yet)</title></rect>
-<rect x="717.4" y="153.3" width="21.7" height="24.3" fill="#5b636e"><title>uasx (not yet)</title></rect>
-<rect x="740.1" y="153.3" width="21.7" height="24.3" fill="#5b636e"><title>usax (not yet)</title></rect>
-<rect x="626.5" y="178.6" width="21.7" height="24.3" fill="#5b636e"><title>uqadd16 (not yet)</title></rect>
-<rect x="649.2" y="178.6" width="21.7" height="24.3" fill="#5b636e"><title>uqadd8 (not yet)</title></rect>
-<rect x="672.0" y="178.6" width="21.7" height="24.3" fill="#5b636e"><title>uqsub16 (not yet)</title></rect>
+<rect x="672.0" y="153.3" width="21.7" height="24.3" fill="#2ea043"><title>usub16</title></rect>
+<rect x="694.7" y="153.3" width="21.7" height="24.3" fill="#2ea043"><title>usub8</title></rect>
+<rect x="717.4" y="153.3" width="21.7" height="24.3" fill="#2ea043"><title>uasx</title></rect>
+<rect x="740.1" y="153.3" width="21.7" height="24.3" fill="#2ea043"><title>usax</title></rect>
+<rect x="626.5" y="178.6" width="21.7" height="24.3" fill="#2ea043"><title>uqadd16</title></rect>
+<rect x="649.2" y="178.6" width="21.7" height="24.3" fill="#2ea043"><title>uqadd8</title></rect>
+<rect x="672.0" y="178.6" width="21.7" height="24.3" fill="#2ea043"><title>uqsub16</title></rect>
 <rect x="694.7" y="178.6" width="21.7" height="24.3" fill="#2ea043"><title>uqsub8</title></rect>
-<rect x="717.4" y="178.6" width="21.7" height="24.3" fill="#5b636e"><title>uqasx (not yet)</title></rect>
-<rect x="740.1" y="178.6" width="21.7" height="24.3" fill="#5b636e"><title>uqsax (not yet)</title></rect>
-<rect x="626.5" y="203.8" width="21.7" height="24.3" fill="#5b636e"><title>uhadd16 (not yet)</title></rect>
-<rect x="649.2" y="203.8" width="21.7" height="24.3" fill="#5b636e"><title>uhadd8 (not yet)</title></rect>
-<rect x="672.0" y="203.8" width="21.7" height="24.3" fill="#5b636e"><title>uhsub16 (not yet)</title></rect>
-<rect x="694.7" y="203.8" width="21.7" height="24.3" fill="#5b636e"><title>uhsub8 (not yet)</title></rect>
-<rect x="717.4" y="203.8" width="21.7" height="24.3" fill="#5b636e"><title>uhasx (not yet)</title></rect>
-<rect x="740.1" y="203.8" width="21.7" height="24.3" fill="#5b636e"><title>uhsax (not yet)</title></rect>
+<rect x="717.4" y="178.6" width="21.7" height="24.3" fill="#2ea043"><title>uqasx</title></rect>
+<rect x="740.1" y="178.6" width="21.7" height="24.3" fill="#2ea043"><title>uqsax</title></rect>
+<rect x="626.5" y="203.8" width="21.7" height="24.3" fill="#2ea043"><title>uhadd16</title></rect>
+<rect x="649.2" y="203.8" width="21.7" height="24.3" fill="#2ea043"><title>uhadd8</title></rect>
+<rect x="672.0" y="203.8" width="21.7" height="24.3" fill="#2ea043"><title>uhsub16</title></rect>
+<rect x="694.7" y="203.8" width="21.7" height="24.3" fill="#2ea043"><title>uhsub8</title></rect>
+<rect x="717.4" y="203.8" width="21.7" height="24.3" fill="#2ea043"><title>uhasx</title></rect>
+<rect x="740.1" y="203.8" width="21.7" height="24.3" fill="#2ea043"><title>uhsax</title></rect>
 <text x="629.0" y="90.0" fill="#ffffff" font-size="11" style="paint-order:stroke" stroke="#0d1117" stroke-width="2.5">SIMD</text>
 <rect x="764.4" y="76.0" width="120.0" height="154.6" fill="#0d1117"/>
 <rect x="765.9" y="77.5" width="22.4" height="20.7" fill="#2ea043"><title>vabs</title></rect>
