@@ -62,7 +62,8 @@ static KObj *get(Ctx *ctx, uint32_t h, KType type)
    handing out addresses. But the app can ask what is where
    (svcQueryMemory: libctru uses it to find free room for shared memory),
    so we keep a map of what is in use. */
-enum { MEMSTATE_FREE = 0, MEMSTATE_CODE = 4, MEMSTATE_PRIVATE = 5, MEMSTATE_SHARED = 6, MEMSTATE_CONTINUOUS = 7 };
+enum { MEMSTATE_FREE = 0, MEMSTATE_CODE = 4, MEMSTATE_PRIVATE = 5, MEMSTATE_SHARED = 6, MEMSTATE_CONTINUOUS = 7,
+       MEMSTATE_ALIAS = 9 };
 enum { PERM_R = 1, PERM_W = 2, PERM_X = 4 };
 
 typedef struct { uint32_t base, size, perm, state; } Region;
@@ -157,6 +158,38 @@ static void control_memory(Ctx *ctx)
     }
     if (op == 1) {                  /* MEMOP_FREE */
         region_remove(ctx->r[1]);
+        ctx->r[0] = RES_OK;
+        return;
+    }
+    if (op == 4 || op == 5) {
+        /* MEMOP_MAP: mirror heap at addr1 to addr0; MEMOP_UNMAP undoes it.
+           While mapped, the original is no-access (3dbrew: Memory
+           Management), so the app only ever sees the memory at addr0: with
+           one flat guest space we move the bytes there, and back. */
+        uint32_t dst = ctx->r[1], src = ctx->r[2];
+        uint8_t *mem = kernel_mem();
+        if (op == 4) {
+            memmove(mem + dst, mem + src, size);
+            region_add(dst, size, ctx->r[4] & (PERM_R | PERM_W), MEMSTATE_ALIAS);
+        } else {
+            memmove(mem + src, mem + dst, size);
+            region_remove(dst);
+        }
+        if (hle_trace)
+            fprintf(stderr, "    -> %s %" PRIu32 " KiB: %08" PRIx32 " %s %08" PRIx32 "\n", op == 4 ? "mapped" : "unmapped",
+                    size / 1024, src, op == 4 ? "->" : "<-", dst);
+        ctx->r[0] = RES_OK;
+        ctx->r[1] = dst;
+        return;
+    }
+    if (op == 6 || op == 2) {
+        /* MEMOP_PROTECT: new permissions for mapped memory. Our guest
+           memory has no page protection; QueryMemory reports them. (The
+           app only notices protection by faulting.) MEMOP_RESERVE: address
+           space only. */
+        for (int i = 0; op == 6 && i < nregions; i++)
+            if (regions[i].base == (ctx->r[1] & ~0xFFFu))
+                regions[i].perm = ctx->r[4] & (PERM_R | PERM_W | PERM_X);
         ctx->r[0] = RES_OK;
         return;
     }

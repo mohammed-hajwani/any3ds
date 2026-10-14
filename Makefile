@@ -38,11 +38,11 @@ ifdef DEVKITARM
 export PATH := $(DEVKITARM)/bin:$(PATH)
 endif
 
-.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-m13 test-dsp test-compat-quick venv clean
+.PHONY: test test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-m13 test-dsp test-y2r test-compat-quick venv clean
 .SECONDARY:          # keep intermediate .o / .elf / generated .c for inspection
 .DELETE_ON_ERROR:
 
-test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-m13 test-dsp test-compat-quick
+test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6 test-m11 test-m13 test-dsp test-y2r test-compat-quick
 
 venv: $(VENV)/.installed
 
@@ -150,7 +150,7 @@ M3_PROGS := m1/funcs m1/flags m2/mem m2/addr
 
 define m3_prog
 $(M3)/gen_$(notdir $(1)).c: out/$(1).elf $(RECOMP_DEP) | $(M3)
-	$$(PYTHON) -m recomp --trace $$< -o $$@
+	$$(PYTHON) -m recomp --trace $$(RECOMP_FLAGS_$(notdir $(1))) $$< -o $$@
 
 $(M3)/$(notdir $(1))_diff: tests/m3/diff.c $(M3)/gen_$(notdir $(1)).c $$(RUNTIME_DEP)
 	$$(HOST_CC) $$(HOST_FLAGS) -DRECOMP_TRACING=1 $$< $(M3)/gen_$(notdir $(1)).c $$(RUNTIME_SRC) -lunicorn -o $$@
@@ -305,10 +305,11 @@ $(REAL)/gen_%.c: $(REAL)/%.elf $(RECOMP_DEP)
 $(REAL)/%_harness: tests/real/harness.c tests/real/real.c $(REAL)/gen_%.c $(RUNTIME_DEP)
 	$(HOST_CC) $(HOST_FLAGS) $< $(REAL)/gen_$*.c $(RUNTIME_SRC) -o $@
 
-REAL_PROGS := real/real_arm real/real_thumb real/extend real/dsp
+REAL_PROGS := real/real_arm real/real_thumb real/extend real/dsp real/tables
+RECOMP_FLAGS_tables := --no-symbols    # discovery has to find its jump tables
 $(foreach p,$(REAL_PROGS),$(eval $(call m3_prog,$(p))))
 REAL_DIFFS := $(foreach p,$(REAL_PROGS),$(M3)/$(notdir $(p))_diff)
-REAL_SKIP := isort,shape_total
+REAL_SKIP := isort,shape_total,shared_exit
 
 test-real: $(REAL)/real_arm_harness $(REAL)/real_thumb_harness $(REAL_DIFFS) $(REAL)/real_arm.dis $(REAL)/real_thumb.dis
 	@for h in $(REAL)/real_arm_harness $(REAL)/real_thumb_harness; do \
@@ -496,6 +497,29 @@ test-dsp: $(DSPT)/run_dsp_test
 	@timeout 120 ./$(DSPT)/run_dsp_test --sdmc tests/dsp/sdmc > $(DSPT)/dsp_test.out 2> $(DSPT)/dsp_test.log \
 	  || { cat $(DSPT)/dsp_test.log; echo "the DSP test did not exit cleanly"; exit 1; }
 	@diff -u tests/dsp/dsp_test.expected $(DSPT)/dsp_test.out && echo "    output matches dsp_test.expected"
+
+# ---------------------------------------------------------------- Y2R
+#
+# libctru's y2r client against our YUV-to-RGB converter (hle/y2r.c): the
+# documented formula pixel by pixel, the standard presets, transfer gaps,
+# 8x8 Morton output, 16-bit inputs, the transfer-end event.
+Y2RT := out/y2r
+
+$(Y2RT)/y2r_test.elf: tests/y2r/y2r_test.c
+	@mkdir -p $(Y2RT)
+	$(ARM_CC) $(CTRU_FLAGS) -specs=3dsx.specs -L$(CTRU)/lib $< -lctru -lm -o $@
+
+$(Y2RT)/gen_y2r_test.c: $(Y2RT)/y2r_test.elf $(RECOMP_DEP)
+	$(PYTHON) -m recomp $< -o $@ > $(Y2RT)/recomp.log
+
+$(Y2RT)/run_y2r_test: tests/m6/runner.c $(Y2RT)/gen_y2r_test.c $(RUNTIME_DEP) $(HLE_DEP) $(GPU_DEP)
+	$(HOST_CC) $(HOST_FLAGS) -O0 -Ihle -Igpu -pthread $< $(Y2RT)/gen_y2r_test.c $(RUNTIME_SRC) $(HLE_SRC) $(GPU_SRC) -lm -o $@
+
+test-y2r: $(Y2RT)/run_y2r_test
+	@echo '=== Y2R: libctru y2r on our YUV-to-RGB converter (tests/y2r/y2r_test.c) ==='
+	@timeout 120 ./$(Y2RT)/run_y2r_test > $(Y2RT)/y2r_test.out 2> $(Y2RT)/y2r_test.log \
+	  || { cat $(Y2RT)/y2r_test.log; echo "the Y2R test did not exit cleanly"; exit 1; }
+	@diff -u tests/y2r/y2r_test.expected $(Y2RT)/y2r_test.out && echo "    output matches y2r_test.expected"
 
 # ---------------------------------------------------------------- M11
 #

@@ -85,8 +85,17 @@
       note = '';
     }).catch(() => { note = ' — buttons need tools/live_server.py'; });
   }
+  /* The game runs slower than real time, so a quick click could start and
+     end between two of its frames: every press is held at least MIN_HOLD ms. */
+  const MIN_HOLD = 350, pressedAt = new Map();
   function setKey(bit, down) {
     if (down === held.has(bit)) return;
+    if (!down) {
+      const left = MIN_HOLD - (performance.now() - pressedAt.get(bit));
+      if (left > 0) { setTimeout(() => setKey(bit, false), left); return; }
+    } else {
+      pressedAt.set(bit, performance.now());
+    }
     down ? held.add(bit) : held.delete(bit);
     for (const b of document.querySelectorAll(`[data-key="${bit.toString(16)}"]`)) b.classList.toggle('on', down);
     send();

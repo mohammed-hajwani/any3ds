@@ -149,7 +149,8 @@ def _static_entry_hints(path):
     static.crs, and every address a module imports from the main program
     (by name or as an anonymous offset). Nothing else in the main program
     may point at those functions; they still have to pass discovery's
-    checks like any other guess."""
+    checks like any other guess, except that code running into one doesn't
+    make it the middle of a function."""
     from .romfs import RomFS
     crs = _static_crs(path)
     if crs is None:

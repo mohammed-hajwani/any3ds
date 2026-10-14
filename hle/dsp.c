@@ -94,9 +94,11 @@ typedef struct {
 } Input;
 
 static Input inputs[NINPUTS];
-static KObj *pipe_event, *sem_event;
+static KObj *pipe_event, *sem_event, *binary_event;
 static uint8_t pipe[64];
 static uint32_t pipe_len;
+static uint8_t binary[256];     /* the binary pipe (3): codec replies */
+static uint32_t binary_len;
 static int running, timer_added;
 static uint16_t recv0;          /* reply register 0: 1 once a shutdown/sleep completed */
 static int recv0_ready;
@@ -219,6 +221,29 @@ static void dsp_frame(void *arg)
     raise_pipe_interrupt();
 }
 
+/* WriteProcessPipe on the binary pipe: a request for one of the DSP's
+   codecs (3dbrew: DSP:WriteProcessPipe; u16 codec, u16 command, u32
+   result, 24 bytes of arguments, not documented further). Our DSP has no
+   codecs: it answers each request with the same message, result 1
+   ("failed"), on the same pipe, and raises its interrupt. An app is left
+   to go on without (a movie without its soundtrack, say). */
+static void binary_pipe_request(const uint8_t *req, uint32_t size)
+{
+    static int told;
+    if (size < 8 || binary_len + size > sizeof binary) {
+        fprintf(stderr, "hle: DSP binary pipe: a %" PRIu32 "-byte request is not modelled\n", size);
+        exit(3);
+    }
+    if (!told++)
+        fprintf(stderr, "hle: DSP codec %u command %u: no codecs here, answering \"failed\"\n",
+                r16(req), r16(req + 2));
+    memcpy(binary + binary_len, req, size);
+    w32(binary + binary_len + 4, 1);
+    binary_len += size;
+    if (binary_event)
+        kevent_signal(binary_event);
+}
+
 /* WriteProcessPipe on the audio pipe: the first halfword is the new state. */
 static void audio_pipe_command(uint16_t state)
 {
@@ -283,6 +308,11 @@ void dsp_handle(KObj *session, uint32_t *cmd)
         return;
     case 0x0D: {    /* WriteProcessPipe(channel, size; static buffer) */
         uint32_t channel = cmd[1], size = cmd[2], addr = cmd[4];
+        if (channel == 3) {
+            binary_pipe_request(kernel_mem() + addr, size);
+            ipc_reply(cmd, RES_OK);
+            return;
+        }
         if (channel != 2 || size < 2) {
             fprintf(stderr, "hle: DSP WriteProcessPipe(channel %" PRIu32 ", %" PRIu32 " bytes) not modelled\n",
                     channel, size);
@@ -294,17 +324,19 @@ void dsp_handle(KObj *session, uint32_t *cmd)
     }
     case 0x0F:      /* GetPipeReadableSize(channel, peer) -> size */
         cmd[0] = ipc_header(id, 2, 0);
-        cmd[2] = cmd[1] == 2 ? pipe_len : 0;
+        cmd[2] = cmd[1] == 2 ? pipe_len : cmd[1] == 3 ? binary_len : 0;
         cmd[1] = RES_OK;
         return;
     case 0x10: {    /* ReadPipeIfPossible(channel, peer, size) -> size read; static buffer 0 */
         uint32_t channel = cmd[1], want = cmd[3] & 0xFFFF, got = 0;
         uint32_t dest = ipc_static_buffer(0, NULL);
-        if (channel == 2) {
-            got = want < pipe_len ? want : pipe_len;
-            memcpy(kernel_mem() + dest, pipe, got);
-            memmove(pipe, pipe + got, pipe_len - got);
-            pipe_len -= got;
+        if (channel == 2 || channel == 3) {
+            uint8_t *buf = channel == 2 ? pipe : binary;
+            uint32_t *len = channel == 2 ? &pipe_len : &binary_len;
+            got = want < *len ? want : *len;
+            memcpy(kernel_mem() + dest, buf, got);
+            memmove(buf, buf + got, *len - got);
+            *len -= got;
         }
         cmd[0] = ipc_header(id, 2, 2);
         cmd[1] = RES_OK;
@@ -327,6 +359,8 @@ void dsp_handle(KObj *session, uint32_t *cmd)
         KObj *ev = cmd[4] ? handle_get(cmd[4]) : NULL;
         if (interrupt == 2 && channel == 2)
             pipe_event = ev;
+        else if (interrupt == 2 && channel == 3)
+            binary_event = ev;
         else if (ev)
             fprintf(stderr, "hle: DSP interrupt %" PRIu32 "/%" PRIu32 " registered; it never fires\n",
                     interrupt, channel);

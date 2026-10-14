@@ -28,6 +28,7 @@ typedef struct {
     uint32_t excl_addr;    // ldrex/strex exclusive monitor: the address ldrex marked,
     uint32_t excl_valid;   //   and whether the monitor is armed
     int32_t budget;        // loop iterations left before the next tick (RECOMP_BACKEDGE)
+    uint32_t ret_override; // where a tail-called function returns, if not lr (recomp_tail_ret); 0 = lr
 } Ctx;
 
 /* ---- Tracing (M3 differential testing) ----
@@ -228,6 +229,16 @@ void recomp_untranslated(Ctx *ctx, uint32_t addr, const char *why) __attribute__
         if (to_ != ret) recomp_bad_return(ctx, to_, ret);       \
         return;                                                 \
     } while (0)
+
+/* A function's entry: the address it returns to. That is lr, unless the
+   tail call that got here said otherwise (recomp_tail_ret); either way that
+   note is used up here. */
+static inline uint32_t recomp_entry_ret(Ctx *ctx)
+{
+    uint32_t r = ctx->ret_override ? ctx->ret_override : ctx->r[14];
+    ctx->ret_override = 0;
+    return r;
+}
 
 /* ---- Symbol table emitted alongside the generated functions ---- */
 
@@ -440,6 +451,18 @@ static inline uint32_t arm_ssat(uint32_t x, uint32_t n)
     return (uint32_t)(int32_t)(v < min ? min : v > max ? max : v);
 }
 
+/* usat16 / ssat16: the same for each signed halfword on its own. */
+static inline uint32_t arm_usat16(uint32_t x, uint32_t n)
+{
+    return arm_usat((uint32_t)(int32_t)(int16_t)x, n) | arm_usat((uint32_t)(int32_t)(int16_t)(x >> 16), n) << 16;
+}
+
+static inline uint32_t arm_ssat16(uint32_t x, uint32_t n)
+{
+    return (arm_ssat((uint32_t)(int32_t)(int16_t)x, n) & 0xFFFFu)
+         | arm_ssat((uint32_t)(int32_t)(int16_t)(x >> 16), n) << 16;
+}
+
 /* An indirect call/jump to an address no recompiled function starts at. */
 void recomp_bad_call(Ctx *ctx, uint32_t addr) __attribute__((noreturn));
 
@@ -468,6 +491,25 @@ static inline void recomp_continue(Ctx *ctx, uint32_t to, uint32_t ret)
         to = ctx->r[14];
         fn(ctx);
     }
+}
+
+/* Before a tail call from the function at [lo, hi): where the code jumped
+   to returns. Normally that is lr: our own caller's address, or a function
+   elsewhere that lr was pointed at on purpose (crt0, above). Anything else
+   is a stale lr, still holding the return address of a call this function
+   made (an address inside it): the code jumped to can't mean to return
+   there. It is an exit shared by several paths that returns through the
+   stack to our caller (ARMCC: a switch-table entry and two dozen `b`s all
+   going to one `add sp, sp, #12; pop {r4-r11, pc}`, which discovery made a
+   function of its own). So it is told it returns to `ret`
+   (recomp_entry_ret), while lr keeps its stale value, as on the CPU. */
+static inline uint32_t recomp_tail_ret(Ctx *ctx, uint32_t ret, uint32_t lo, uint32_t hi)
+{
+    uint32_t lr = ctx->r[14];
+    if (lr == ret || (lr - lo >= hi - lo && recomp_find(lr)))
+        return lr;
+    ctx->ret_override = ret;
+    return ret;
 }
 
 /* Copy the program's segments (code, .rodata, .data; zeroed .bss) into

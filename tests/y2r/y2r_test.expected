@@ -1,0 +1,8 @@
+PASS: 4:2:0 planes (Y with a gap) -> RGBA8888, every pixel by the formula
+PASS: packed YUYV -> RGB565 in 8x8 Morton tiles
+PASS: 4:2:2 planes with 16-bit samples -> RGB888
+PASS: BT.601 preset: grey, black and white come out right
+PASS: BT.709 preset: grey, black and white come out right
+PASS: BT.601 TV range preset: grey, black and white come out right
+PASS: BT.709 TV range preset: grey, black and white come out right
+done

@@ -35,7 +35,8 @@ from capstone.arm import (
     ARM_INS_UXTH, ARM_INS_STMDA, ARM_INS_STMDB, ARM_INS_UXTAB, ARM_INS_UXTAH, ARM_INS_SXTAB, ARM_INS_SXTAH,
     ARM_INS_SMULBB, ARM_INS_SMULBT, ARM_INS_SMULTB, ARM_INS_SMULTT, ARM_INS_SMULWB, ARM_INS_SMULWT,
     ARM_INS_SMLABB, ARM_INS_SMLABT, ARM_INS_SMLATB, ARM_INS_SMLATT, ARM_INS_SMLAWB, ARM_INS_SMLAWT,
-    ARM_INS_USAT, ARM_INS_SSAT, ARM_INS_LDC, ARM_INS_LDCL, ARM_INS_STC, ARM_INS_STCL, ARM_INS_CDP,
+    ARM_INS_USAT, ARM_INS_SSAT, ARM_INS_USAT16, ARM_INS_SSAT16,
+    ARM_INS_LDC, ARM_INS_LDCL, ARM_INS_STC, ARM_INS_STCL, ARM_INS_CDP,
     ARM_INS_MCRR, ARM_INS_MRRC, ARM_INS_LDC2, ARM_INS_LDC2L, ARM_INS_STC2, ARM_INS_STC2L, ARM_INS_CDP2,
     ARM_INS_MCR2, ARM_INS_MRC2, ARM_INS_MCRR2, ARM_INS_MRRC2, ARM_INS_FLDMIAX, ARM_INS_FLDMDBX, ARM_INS_FSTMIAX, ARM_INS_FSTMDBX,
     ARM_INS_STMIB, ARM_INS_STR, ARM_INS_STRB, ARM_INS_STRH, ARM_INS_SUB,
@@ -374,6 +375,19 @@ def _unary(insn, fc):
         fc.uses_ret = True
         fc.terminates = True
         return ['RETURN_TO(ctx->r[14] & ~1u);']
+    targets = getattr(fc.program, 'jump_tables', {}).get(insn.address) if fc.program else None
+    if targets is not None and not _is_thumb(insn) and insn.id == ARM_INS_MOV and ops[1].type == ARM_OP_REG \
+            and not ops[1].shift.value and not _sets_flags(insn):
+        # `mov pc, rX` to a table's address plus an offset from the table
+        # (hand-written assembly; discovery found the targets).
+        value = _read_reg(insn, ops[1].reg) + (' - RB' if RELOCATABLE else '')
+        return _target_switch(insn, fc, value, [(_imm(t), t) for t in targets])
+    if not _is_thumb(insn) and insn.id == ARM_INS_MOV and ops[0].type == ARM_OP_REG \
+            and _reg_num(insn, ops[0].reg) == PC and ops[1].type == ARM_OP_REG \
+            and _reg_num(insn, ops[1].reg) != PC and not ops[1].shift.value and not _sets_flags(insn):
+        # Any other ARM `mov pc, rX`: a return through a copy of lr, or an
+        # indirect jump. (No interworking: an ARMv6 `mov pc` stays in ARM.)
+        return _indirect_jump(insn, fc, f'{_read_reg(insn, ops[1].reg)} & ~1u')
     rd = _dest_reg(insn, ops[0])
     setflags = _sets_flags(insn)
     m, carry = _pick_carry(*_operand2(insn, ops[1]), setflags)
@@ -553,8 +567,9 @@ def _half_mul(insn, fc):
 
 def _saturate(insn, fc):
     """usat rd, #n, rm{, lsl/asr #k}: clamp the (shifted) signed value to
-    0 .. 2^n - 1; ssat: to -2^(n-1) .. 2^(n-1) - 1. The sticky Q flag they
-    set when clamping isn't modelled (nothing we recompile can read it)."""
+    0 .. 2^n - 1; ssat: to -2^(n-1) .. 2^(n-1) - 1. usat16/ssat16 clamp each
+    signed halfword the same way (no shift). The sticky Q flag they set when
+    clamping isn't modelled (nothing we recompile can read it)."""
     ops = insn.operands
     if len(ops) != 3 or ops[0].type != ARM_OP_REG or ops[1].type != ARM_OP_IMM or ops[2].type != ARM_OP_REG:
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
@@ -562,7 +577,8 @@ def _saturate(insn, fc):
         raise UnsupportedInstruction(insn, 'pc as an operand is unpredictable')
     rd = _dest_reg(insn, ops[0])
     x, _ = _shift_imm(insn, _read_reg(insn, ops[2].reg), ops[2].shift.type, ops[2].shift.value)
-    helper = 'arm_usat' if insn.id == ARM_INS_USAT else 'arm_ssat'
+    helper = {ARM_INS_USAT: 'arm_usat', ARM_INS_SSAT: 'arm_ssat',
+              ARM_INS_USAT16: 'arm_usat16', ARM_INS_SSAT16: 'arm_ssat16'}[insn.id]
     return [f'ctx->r[{rd}] = {helper}({x}, {ops[1].imm});']
 
 
@@ -606,21 +622,50 @@ def direct_branch_target(insn):
     return None
 
 
+def _tail_ret(fc):
+    """Where a tail call's target returns, as C (see recomp_tail_ret)."""
+    return f'recomp_tail_ret(ctx, ret, {_code_addr(fc.start)}, {_code_addr(fc.end)})'
+
+
 def _tail_call(fc, call):
     """A tail call jumps to another function, which then returns to whatever
     lr holds at the jump. Usually that is our own caller (lr untouched), so
     in C it's a call followed by `return`. But code may point lr elsewhere
     first: crt0 does `ldr lr, =exit; bx r3` to run main and then exit. So
     recomp_continue carries on at that address (one more function) until
-    control is back at our caller's return address."""
+    control is back at our caller's return address.
+
+    lr may also be stale: still the return address of a call this function
+    made. Then the code jumped to is an exit shared by several paths that
+    returns through the stack to our caller (see recomp_tail_ret)."""
     fc.uses_ret = True
-    return ['{', '    uint32_t to = ctx->r[14];', f'    {call}', '    recomp_continue(ctx, to, ret);', '}', 'return;']
+    return ['{', f'    uint32_t to = {_tail_ret(fc)};', f'    {call}', '    recomp_continue(ctx, to, ret);',
+            '}', 'return;']
+
+
+def _call_cont(insn, fc):
+    """Where a jump that is a call in disguise returns (discovery saw lr
+    pointed into this function just before it), if that is code here."""
+    cont = getattr(fc.program, 'jump_returns', {}).get(insn.address) if fc.program else None
+    if cont is None or cont not in fc.code_addrs:
+        return None
+    fc.labels.add(cont)
+    return cont
+
+
+def _continue_at(insn, cont):
+    """After such a call: carry on where it returned (a loop if backwards)."""
+    return ['RECOMP_BACKEDGE();', f'goto L_{cont:08x};'] if cont <= insn.address else [f'goto L_{cont:08x};']
 
 
 def _b(insn, fc):
     target = _branch_target(insn)
     fc.terminates = True
     callee = fc.entries.get(target)
+    cont = _call_cont(insn, fc)
+    if cont is not None and callee is not None and callee.thumb == _is_thumb(insn):
+        # `add lr, pc, #n; b sub`: a call that returns to lr.
+        return [f'{c_name(target)}(ctx);  /* a call: lr was pointed at {cont:08x} */', *_continue_at(insn, cont)]
     if target in fc.code_addrs or (fc.start <= target < fc.end and callee is None):
         fc.labels.add(target)
         if target <= insn.address:
@@ -675,19 +720,28 @@ def _bx(insn, fc):
         fc.terminates = True
         return ['RETURN_TO(ctx->r[14]);']
     if op.type == ARM_OP_REG and _reg_num(insn, op.reg) != PC:
-        # An indirect tail call (e.g. through a function pointer): look the
-        # target up and call it (see _tail_call). Unless it goes where we
-        # were called from: that is a return through another register
-        # (ARMCC: `pop {r3}; add sp, #16; bx r3`).
-        fc.terminates = True
-        fc.uses_ret = True
-        target = _read_reg(insn, op.reg)
-        return ['{', f'    uint32_t target = {target};',
-                '    if (target == ret) return;   /* a return through a register */',
-                '    uint32_t to = ctx->r[14];',
-                '    recomp_call(ctx, target);  /* indirect tail call */',
-                '    recomp_continue(ctx, to, ret);', '}', 'return;']
+        return _indirect_jump(insn, fc, _read_reg(insn, op.reg))
     raise UnsupportedInstruction(insn, 'bx pc')
+
+
+def _indirect_jump(insn, fc, target):
+    """A jump to an address in a register: an indirect tail call (e.g.
+    through a function pointer), looked up and called (see _tail_call).
+    Unless it goes where we were called from: that is a return through
+    another register (ARMCC: `pop {r3}; add sp, #16; bx r3`; hand-written
+    assembly: `mov r6, lr; bl ...; mov pc, r6`). With lr just pointed into
+    this function, it is a call that returns there."""
+    fc.terminates = True
+    cont = _call_cont(insn, fc)
+    if cont is not None:
+        return [f'recomp_call(ctx, {target});  /* a call: lr was pointed at {cont:08x} */',
+                *_continue_at(insn, cont)]
+    fc.uses_ret = True
+    return ['{', f'    uint32_t target = {target};',
+            '    if (target == ret) return;   /* a return through a register */',
+            f'    uint32_t to = {_tail_ret(fc)};',
+            '    recomp_call(ctx, target);  /* indirect tail call */',
+            '    recomp_continue(ctx, to, ret);', '}', 'return;']
 
 
 def _computed_jump(insn, fc, op):
@@ -715,6 +769,15 @@ def _jump_table(insn, fc):
     over every code address in the function.
     """
     _, rn_op, op2 = insn.operands
+    targets = getattr(fc.program, 'jump_tables', {}).get(insn.address) if fc.program else None
+    if targets is not None and not _is_thumb(insn) and not _sets_flags(insn) and op2.type == ARM_OP_REG \
+            and not op2.shift.value:
+        # `add pc, rA, rB`: a table address plus an offset read from that
+        # table (hand-written assembly); discovery found the targets.
+        value = f'{_read_reg(insn, rn_op.reg)} + {_read_reg(insn, op2.reg)}'
+        if RELOCATABLE:
+            value += ' - RB'            # case labels must be constants: offsets in the module
+        return _target_switch(insn, fc, value, [(_imm(t), t) for t in targets])
     if (_is_thumb(insn) or _sets_flags(insn) or rn_op.type != ARM_OP_REG or _reg_num(insn, rn_op.reg) != PC
             or op2.type != ARM_OP_REG or op2.shift.type != ARM_SFT_LSL or op2.shift.value != 2):
         raise UnsupportedInstruction(insn, 'writes pc (computed branches come later)')
@@ -1170,18 +1233,42 @@ def _address_switch(insn, fc, targets):
     addresses right after the following `b default` (discovery read the
     table and bound): a C switch over the index."""
     index = _read_reg(insn, insn.operands[1].mem.index)
-    lines = [f'switch ({index}) {{']
-    for i, target in enumerate(targets):
+    return _target_switch(insn, fc, index, [(str(i), t) for i, t in enumerate(targets)])
+
+
+def _target_switch(insn, fc, value, cases):
+    """A C switch on `value`: each (case label, target) jumps to an
+    instruction of this function, or tail-calls the function there. If
+    discovery found the jump is really a call (lr just pointed into this
+    function), each case calls its target and carries on where it returns."""
+    cont = _call_cont(insn, fc)
+    if cont is not None:
+        after = ' '.join(_continue_at(insn, cont))
+        lines = [f'switch ({value}) {{']
+        for label in dict.fromkeys(label for label, _ in cases):
+            target = dict(cases)[label]
+            if target not in fc.entries:
+                raise UnsupportedInstruction(insn, f'call target {target:08x} is not a function we recompiled')
+            lines.append(f'case {label}: {c_name(target)}(ctx); {after}')
+        lines += [f'default: recomp_bad_jump(ctx, {_imm(insn.address)}, {value});', '}']
+        fc.terminates = True
+        return lines
+    lines = [f'switch ({value}) {{']
+    seen = set()
+    for label, target in cases:
+        if label in seen:
+            continue                    # two table entries with the same target
+        seen.add(label)
         if target in fc.code_addrs:
             fc.labels.add(target)
-            lines.append(f'case {i}: goto L_{target:08x};')
+            lines.append(f'case {label}: goto L_{target:08x};')
         elif target in fc.entries:
-            lines.append(f'case {i}: {{ uint32_t to = ctx->r[14]; {c_name(target)}(ctx); '
+            lines.append(f'case {label}: {{ uint32_t to = {_tail_ret(fc)}; {c_name(target)}(ctx); '
                          f'recomp_continue(ctx, to, ret); return; }}')
             fc.uses_ret = True
         else:
             raise UnsupportedInstruction(insn, f'switch target {target:08x} is not code we recompiled')
-    lines += [f'default: recomp_bad_jump(ctx, {_imm(insn.address)}, {index});', '}']
+    lines += [f'default: recomp_bad_jump(ctx, {_imm(insn.address)}, {value});', '}']
     fc.terminates = True
     return lines
 
@@ -1273,13 +1360,19 @@ _PRESENT_COPROCESSORS = (10, 11, 14, 15)
 def _absent_coprocessor(insn, fc):
     """An instruction for a coprocessor the 3DS doesn't have (libgcc's
     unwinder carries iWMMXt save/restore helpers that never run there):
-    on hardware it would trap, so it recompiles to a trap."""
+    on hardware it would trap, so it recompiles to a trap. So does cdp to
+    p14/p15: the debug and system coprocessors have no data-processing
+    operations. (Such words are usually data after a call that never
+    returns: in Pokémon X, one after the end of the code made every
+    function that can reach it untranslatable.)"""
     coproc = (_encoding(insn) >> 8) & 0xF
-    if coproc in _PRESENT_COPROCESSORS:
+    no_cdp = insn.id in (ARM_INS_CDP, ARM_INS_CDP2) and coproc in (14, 15)
+    if coproc in _PRESENT_COPROCESSORS and not no_cdp:
         raise UnsupportedInstruction(insn, f'coprocessor p{coproc} operation')
     fc.terminates = True
     text = f'{insn.mnemonic} {insn.op_str}'.replace('"', "'")
-    return [f'recomp_undefined(ctx, {_imm(insn.address)}, "{text}");  /* no coprocessor p{coproc} on a 3DS */']
+    why = f'p{coproc} has no cdp operations' if no_cdp else f'no coprocessor p{coproc} on a 3DS'
+    return [f'recomp_undefined(ctx, {_imm(insn.address)}, "{text}");  /* {why} */']
 
 
 def _coproc(insn, fc):
@@ -1450,6 +1543,8 @@ _HANDLERS = {
     **{op: _half_mul for op in _HALF_MULS},
     ARM_INS_USAT: _saturate,
     ARM_INS_SSAT: _saturate,
+    ARM_INS_USAT16: _saturate,
+    ARM_INS_SSAT16: _saturate,
     ARM_INS_CLZ: _clz,
     ARM_INS_LDRD: _ldrd_strd,
     ARM_INS_STRD: _ldrd_strd,

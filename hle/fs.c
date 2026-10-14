@@ -632,8 +632,30 @@ void fs_file_handle(KObj *session, uint32_t *cmd)
         ipc_reply(cmd, RES_OK);
         return;
     case 0x0809:    /* Flush */
+    case 0x0807:    /* SetAttributes(attributes): nothing to keep for us */
+    case 0x080A:    /* SetPriority(priority): FS request scheduling, nothing for us */
         ipc_reply(cmd, RES_OK);
         return;
+    case 0x0806:    /* GetAttributes -> 0 (not a directory, hidden, archive or read-only) */
+    case 0x080B:    /* GetPriority -> 0 */
+        cmd[0] = ipc_header(cmd[0] >> 16, 2, 0);
+        cmd[1] = RES_OK;
+        cmd[2] = 0;
+        return;
+    case 0x080C: {  /* OpenLinkFile -> another handle to the same file */
+        File *g = malloc(sizeof *g);
+        if (!g) {
+            perror("OpenLinkFile");
+            exit(1);
+        }
+        *g = *f;
+        g->fd = f->fd >= 0 ? dup(f->fd) : -1;   /* its own descriptor: closing one leaves the other */
+        cmd[0] = ipc_header(0x080C, 1, 2);
+        cmd[1] = RES_OK;
+        cmd[2] = IPC_MOVE_HANDLES(1);
+        cmd[3] = handle_new(session_new(&file_service, g));
+        return;
+    }
     default:
         ipc_unhandled("FS file", cmd);
     }

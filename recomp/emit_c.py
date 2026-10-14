@@ -62,7 +62,9 @@ def _emit_functions(c, functions, trace):
         c.append(f'void {c_name(tf.fn.addr)}(Ctx *ctx)')
         c.append('{')
         if tf.uses_ret:
-            c.append('    const uint32_t ret = ctx->r[14];  /* return address we were called with */')
+            c.append('    const uint32_t ret = recomp_entry_ret(ctx);  /* return address we were called with */')
+        else:
+            c.append('    ctx->ret_override = 0;  /* (see recomp_tail_ret) */')
         for addr, comment, lines in tf.body:
             if addr in tf.labels:
                 c.append(f'L_{addr:08x}: ;')

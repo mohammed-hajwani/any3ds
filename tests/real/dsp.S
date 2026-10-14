@@ -95,6 +95,25 @@ END ssat_1_lsl
 FUNC ssat_32
     ssat r0, #32, r1
 END ssat_32
+@ usat16 / ssat16: each signed halfword clamped on its own.
+FUNC usat16_0
+    usat16 r0, #0, r1
+END usat16_0
+FUNC usat16_8
+    usat16 r0, #8, r1
+END usat16_8
+FUNC usat16_15
+    usat16 r0, #15, r1
+END usat16_15
+FUNC ssat16_1
+    ssat16 r0, #1, r1
+END ssat16_1
+FUNC ssat16_14
+    ssat16 r0, #14, r1
+END ssat16_14
+FUNC ssat16_16
+    ssat16 r0, #16, r1
+END ssat16_16
 
 @ ldm loading pc with other bases and modes: old APCS frame epilogues.
 FUNC apcs_frame
@@ -156,6 +175,7 @@ FUNC absent_coprocessor
 @   ldrexd / strexd   64-bit exclusive access
 @   pld               a cache preload hint: no architectural effect
 @   ldr pc, [sp], #N  a return that also drops N - 4 more bytes of stack
+@   a shared exit     `b` after a call into another function's epilogue
 
 FUNC preload
     pld [r1, #0x40]
@@ -236,3 +256,18 @@ END \op\()_ge
     PARGE s\op
     PARGE u\op
     .endr
+
+@ A shared exit: after a call, `b` to an epilogue that discovery made a
+@ function of its own (ARMCC's switch exits). lr still holds the call's
+@ return address there; the epilogue returns through the stack to our
+@ caller. (shared_exit alone pops a random return address: skipped.)
+FUNC shared_exit_caller
+    push {r4, lr}
+    mov r4, r0
+    bl add_two                  @ lr = the address after this call
+    add r0, r0, r4
+    b shared_exit               @ lr is stale here
+    .size shared_exit_caller, . - shared_exit_caller
+FUNC shared_exit
+    pop {r4, pc}
+    .size shared_exit, . - shared_exit

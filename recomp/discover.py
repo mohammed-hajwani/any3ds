@@ -36,7 +36,8 @@ from capstone.arm import (
     ARM_CC_AL, ARM_CC_LO, ARM_CC_LS, ARM_INS_ADD, ARM_INS_B, ARM_INS_BL, ARM_INS_BLX, ARM_INS_BX, ARM_INS_CMP,
     ARM_INS_CMN, ARM_INS_TEQ, ARM_INS_TST, ARM_INS_ADR,
     ARM_INS_LDM, ARM_INS_LDMDA, ARM_INS_LDMDB, ARM_INS_LDMIB, ARM_INS_LDR, ARM_INS_LDRB, ARM_INS_LDRD,
-    ARM_INS_LDRH, ARM_INS_LDRSB, ARM_INS_LDRSH, ARM_INS_LSL, ARM_INS_MOV, ARM_INS_POP, ARM_INS_UDF, ARM_INS_VLDR,
+    ARM_INS_LDRH, ARM_INS_LDRSB, ARM_INS_LDRSH, ARM_INS_LSL, ARM_INS_MOV, ARM_INS_POP, ARM_INS_SUB, ARM_INS_UDF,
+    ARM_INS_VLDR,
     ARM_OP_IMM, ARM_OP_MEM, ARM_OP_REG,
 )
 
@@ -91,6 +92,9 @@ class Discovery:
         self.unresolved = set()     # jump tables whose targets we couldn't find
         self.jump_tables = {}       # address of a `ldr pc` switch -> its targets, for the translator
         program.jump_tables = self.jump_tables
+        self.jump_returns = {}      # computed jump -> where it returns, when it is a call
+        program.jump_returns = self.jump_returns
+        self.call_conts = set()     # where those calls return
         self._added = None          # starts added while trying a guess, to undo if it fails
         self._start_info = {}       # start -> (thumb, root) when it was last explored
 
@@ -187,7 +191,13 @@ class Discovery:
 
         if iid == ARM_INS_B and len(ops) == 1 and ops[0].type == ARM_OP_IMM:
             target = ops[0].imm & 0xFFFFFFFF
-            if self._status(fn, target)[0] and target != fn.addr:
+            cont = self._call_return(fn, insn)
+            if cont is not None and self.in_text(target):
+                self._call(fn, target, thumb, insn)         # a call: lr points where it returns
+                self.jump_returns[insn.address] = cont
+                self.call_conts.add(cont)
+                work.append((cont, False))
+            elif self._status(fn, target)[0] and target != fn.addr:
                 self._call(fn, target, thumb, insn)         # a tail call
             elif fn.addr <= target < limit:
                 work.append((target, False))                # inside this function
@@ -200,6 +210,8 @@ class Discovery:
         if iid in (ARM_INS_BLX, ARM_INS_BX):                # register forms: indirect call / return / tail call
             if iid == ARM_INS_BLX or cond:
                 work.append((nxt, iid == ARM_INS_BLX))
+            if iid == ARM_INS_BX:
+                self._note_call_return(fn, insn, work)
             return
 
         if iid in _LDM and any(op.type == ARM_OP_REG and _reg_num(insn, op.reg) == PC for op in ops):
@@ -213,7 +225,7 @@ class Discovery:
         writes_pc = bool(ops) and ops[0].type == ARM_OP_REG and _reg_num(insn, ops[0].reg) == PC
         if iid in _LOAD_SIZES or iid == ARM_INS_VLDR:
             self._literal(fn, insn, iid)
-        if iid in (ARM_INS_ADD, ARM_INS_ADR) and not writes_pc:
+        if iid in (ARM_INS_ADD, ARM_INS_SUB, ARM_INS_ADR) and not writes_pc:
             self._pc_relative_address(fn, insn, thumb)
         if writes_pc:
             if iid == ARM_INS_ADD and not thumb:
@@ -224,6 +236,10 @@ class Discovery:
             if iid == ARM_INS_LDR and self._veneer(fn, insn):
                 if cond:
                     work.append((nxt, False))
+                return
+            if iid == ARM_INS_MOV and not thumb and len(ops) == 2 and ops[1].type == ARM_OP_REG \
+                    and _reg_num(insn, ops[1].reg) != 14:
+                self._based_table(fn, insn, work, nxt)      # mov pc, rX (not a return)
                 return
             if cond:
                 work.append((nxt, False))
@@ -267,7 +283,8 @@ class Discovery:
         ops = insn.operands
         if not (len(ops) == 3 and ops[1].type == ARM_OP_REG and _reg_num(insn, ops[1].reg) == PC
                 and ops[2].type == ARM_OP_REG):
-            return                  # some other computed jump: the translator will say so
+            self._based_table(fn, insn, work, nxt)
+            return
         index = _reg_num(insn, ops[2].reg)
         bound = None
         cmp = self._bound_check(fn, insn, index)
@@ -297,6 +314,148 @@ class Discovery:
             work.append((a, False))
             a, n = a + 4, n + 1
 
+    def _based_table(self, fn, insn, work, nxt):
+        """A computed jump in hand-written assembly (Pokémon X's video
+        decoder) to a table's address plus an offset loaded from that
+        table: `add pc, rA, rB` itself, or `mov pc, rX` after an
+        `add rX, rA, rB` (see _table_sum). Anything else is left to the
+        translator, which refuses it."""
+        if insn.cc != ARM_CC_AL:
+            work.append((nxt, False))
+        ops = insn.operands
+        add = insn
+        if insn.id == ARM_INS_MOV:
+            if len(ops) != 2 or ops[1].type != ARM_OP_REG or ops[1].shift.value:
+                return
+            rx = _reg_num(insn, ops[1].reg)
+            const = self._const_reg(fn, insn, rx)
+            if const is not None and self.in_text(const) and const % 4 == 0:
+                # A fixed address built from pc (`add r4, pc, #0x2400; add
+                # r4, r4, #0x248; movle pc, r4`): a jump straight there.
+                self.jump_tables[insn.address] = [const]
+                self._call(fn, const, False, insn)
+                self._note_call_return(fn, insn, work)
+                return
+            add = next((p for p in self._back(fn, insn.address, 12) if self._writes(p, rx)), None)
+            if add is None or add.id != ARM_INS_ADD:
+                self._note_call_return(fn, insn, work)
+                return                  # a return through a copy of lr, or an indirect jump (or call)
+        found = self._table_sum(fn, add)
+        if found is None:
+            self.unresolved.add(insn.address)
+            return
+        table, targets = found
+        fn.data.update((table + 4 * i, 4) for i in range(len(targets)))
+        self.jump_tables[insn.address] = targets
+        # The targets are subroutines: the decoder points lr where they are
+        # to return and calls the same ones through pointers too. So each is
+        # a function. With lr restored first (`mov lr, r8; add pc, r5, r6`)
+        # the jump is a tail call; with lr just made from pc (`add lr, pc,
+        # #n`) it is a call that returns into this function, which carries
+        # on there.
+        for t in targets:
+            self._call(fn, t, False, insn)
+        cont = self._call_return(fn, insn)
+        if cont is not None:
+            self.jump_returns[insn.address] = cont
+            self.call_conts.add(cont)
+            work.append((cont, False))
+
+    def _const_reg(self, fn, insn, reg, depth=4):
+        """The value of `reg` just before insn, if the straight-line code
+        before it built a constant from pc: `add/sub rX, pc, #n`, then any
+        `add/sub rX, rX, #n`. None otherwise."""
+        p = next((q for q in self._back(fn, insn.address, 8) if self._writes(q, reg)), None)
+        if p is None or depth == 0:
+            return None
+        value = self._pc_value(p)
+        if value is not None:
+            return value
+        ops = p.operands
+        if p.id in (ARM_INS_ADD, ARM_INS_SUB) and len(ops) == 3 and ops[1].type == ARM_OP_REG \
+                and _reg_num(p, ops[1].reg) == reg and ops[2].type == ARM_OP_IMM:
+            base = self._const_reg(fn, p, reg, depth - 1)
+            if base is not None:
+                return (base + (ops[2].imm if p.id == ARM_INS_ADD else -ops[2].imm)) & 0xFFFFFFFF
+        return None
+
+    def _note_call_return(self, fn, insn, work):
+        """A jump through a register that is a call in disguise (see
+        _call_return): the code carries on where it returns."""
+        cont = self._call_return(fn, insn)
+        if cont is not None:
+            self.jump_returns[insn.address] = cont
+            self.call_conts.add(cont)
+            work.append((cont, False))
+
+    def _call_return(self, fn, insn):
+        """Where a jump returns if lr was just pointed into the code
+        (`add/sub lr, pc, #n`, `mov lr, pc`): it is a call in disguise
+        (hand-written assembly: `add lr, pc, #12; bne sub; ...; add pc, r6,
+        r5`, both calls returning to the same place). None if not."""
+        if fn.thumb or insn.address in self.call_conts:
+            return None
+        for p in self._back(fn, insn.address, 6):
+            if p.id in (ARM_INS_BL, ARM_INS_BLX) or (p.id in (ARM_INS_B, ARM_INS_BX) and p.cc == ARM_CC_AL):
+                return None             # lr set by a call, or not straight-line code
+            if p.address in self.call_conts and not self._writes(p, 14):
+                return None             # where earlier calls return: lr is whatever they left
+            if self._writes(p, 14):
+                ops = p.operands
+                if p.id == ARM_INS_MOV and len(ops) == 2 and ops[1].type == ARM_OP_REG \
+                        and _reg_num(p, ops[1].reg) == PC:
+                    value = p.address + 8
+                else:
+                    value = self._pc_value(p)
+                return value if value is not None and self.in_text(value) and fn.addr <= value else None
+        return None
+
+    def _table_sum(self, fn, add):
+        """For `add rD, rA, rB`, where one register holds a table's address
+        made from pc (`sub rT, pc, #n`) and the other an offset loaded from
+        that table (`ldr rO, [rT, rI, lsl #2]`): (table, the addresses
+        table + offset). The table runs while its entries land on ARM
+        instructions in the code, outside the table itself (zero words
+        after a table would point at it). None if add isn't that."""
+        ops = add.operands
+        if not (len(ops) == 3 and all(op.type == ARM_OP_REG for op in ops) and not ops[2].shift.value):
+            return None
+        regs = [_reg_num(add, ops[1].reg), _reg_num(add, ops[2].reg)]
+        for base, offset in (regs, regs[::-1]):
+            writers = {}
+            for p in self._back(fn, add.address, 12):
+                for r in (base, offset):
+                    if r not in writers and self._writes(p, r):
+                        writers[r] = p
+            table, load = self._pc_value(writers.get(base)), writers.get(offset)
+            if table is None or load is None or load.id != ARM_INS_LDR or len(load.operands) != 2:
+                continue
+            mem = load.operands[1]
+            if (mem.type != ARM_OP_MEM or _reg_num(load, mem.mem.base) != base or not mem.mem.index
+                    or mem.subtracted or mem.shift.value not in (0, 2)):
+                continue                # (index scaled by 4, or already a byte offset)
+            targets = []
+            while len(targets) < 512:
+                raw = self.program.read(table + 4 * len(targets), 4)
+                t = (table + int.from_bytes(raw, 'little')) & 0xFFFFFFFF if raw else 1
+                if t % 4 or not self.in_text(t) or self.decode(t, False) is None \
+                        or table <= t <= table + 4 * len(targets):
+                    break
+                targets.append(t)
+            if targets:
+                return table, targets
+        return None
+
+    @staticmethod
+    def _pc_value(p):
+        """The address an ARM `add/sub rX, pc, #n` makes, or None."""
+        if p is None or p.id not in (ARM_INS_ADD, ARM_INS_SUB) or len(p.operands) != 3:
+            return None
+        _, src, imm = p.operands
+        if src.type != ARM_OP_REG or _reg_num(p, src.reg) != PC or imm.type != ARM_OP_IMM:
+            return None
+        return (p.address + 8 + (imm.imm if p.id == ARM_INS_ADD else -imm.imm)) & 0xFFFFFFFF
+
     def _pc_relative_address(self, fn, insn, thumb):
         """`add rX, pc, #n` / `adr rX, label`: an address next to the code.
         If it points at code, it may be called: ARMCC's interworking veneer
@@ -324,11 +483,20 @@ class Discovery:
             if len(ops) != 2 or ops[1].type != ARM_OP_IMM:
                 return
             imm = ops[1].imm
-        else:                               # ARM: add rX, pc, #n
-            if len(ops) != 3 or ops[1].type != ARM_OP_REG or _reg_num(insn, ops[1].reg) != PC \
-                    or ops[2].type != ARM_OP_IMM:
+        else:                               # ARM: add/sub rX, pc, #n
+            if len(ops) != 3 or ops[1].type != ARM_OP_REG or ops[2].type != ARM_OP_IMM:
                 return
-            imm = ops[2].imm
+            if _reg_num(insn, ops[1].reg) != PC:
+                # ...or two steps: `sub r4, pc, #0x1400; sub r4, r4, #0x398`
+                # (a module's title screen picks one of two such callbacks).
+                rx = _reg_num(insn, ops[1].reg)
+                base = self._const_reg(fn, insn, rx) if not thumb and _reg_num(insn, ops[0].reg) == rx else None
+                if base is not None:
+                    value = (base + (ops[2].imm if insn.id == ARM_INS_ADD else -ops[2].imm)) & 0xFFFFFFFF
+                    if self.in_text(value & ~1):
+                        fn.pointers.add(value)
+                return
+            imm = ops[2].imm if insn.id == ARM_INS_ADD else -ops[2].imm
         base = (insn.address + 4) & ~3 if thumb else insn.address + 8
         value = (base + imm) & 0xFFFFFFFF
         if self.in_text(value & ~1):
@@ -337,9 +505,9 @@ class Discovery:
     def _bound_check(self, fn, insn, index):
         """N from the `cmp rIndex, #N` whose flags insn's condition uses:
         compilers schedule other instructions in between (ARMCC puts a
-        `push` or `strb` there), so look back past any that leave both the
-        index register and the flags alone."""
-        for p in self._back(fn, insn.address, 8):
+        `push` or `strb` there; in Pokémon X, eight loads and adds), so look
+        back past any that leave both the index register and the flags alone."""
+        for p in self._back(fn, insn.address, 16):
             if p.id == ARM_INS_CMP:
                 ops = p.operands
                 if ops[1].type == ARM_OP_IMM and _reg_num(p, ops[0].reg) == index:
@@ -557,6 +725,7 @@ class Discovery:
         """Returns (functions, report)."""
         entry = self.program.entry
         roots = ({(entry & ~1, bool(entry & 1))} if entry is not None else set()) | set(extra)
+        hints = getattr(self.program, 'pointer_hints', set())
         accepted, rejected = set(), {}
         while True:
             try:
@@ -586,7 +755,11 @@ class Discovery:
             # ...unless the code before it ends in a filler nop: ARMCC puts
             # `mov r0, r0` where one function deliberately runs on into the
             # next (`ldr r0, [r0, #0x5c]; mov r0, r0` then the next function).
-            middle = {g for g in accepted if g[0] in falls and not self._after_filler(g)}
+            # An address the CRO loader links modules to (pointer_hints) is a
+            # function for certain, whatever runs into it: often a string in
+            # the code, decoded by some other guess as Thumb instructions.
+            middle = {g for g in accepted if g[0] in falls and not self._after_filler(g)
+                      and g[0] | g[1] not in hints}
             if middle:
                 for g in middle:
                     accepted.discard(g)
@@ -611,11 +784,14 @@ class Discovery:
                     continue
                 if not thumb and addr % 4:
                     continue
-                if addr in code:
+                if addr in code and value not in hints:
                     # Inside a function we already know: splitting it there
                     # would break its returns. A real function pointer to
                     # such an address stops loudly at runtime instead, naming
-                    # it (add it with --entries).
+                    # it (add it with --entries). An address the CRO loader
+                    # links to is a function for certain: the code "around"
+                    # it is another guess running into it (from a filler nop
+                    # before it, say), so it is split there.
                     continue
                 found = self._try_guess((addr, thumb), known, data_words, code)
                 if isinstance(found, str):
@@ -731,6 +907,21 @@ class Discovery:
         if exact is not None:
             # A CRO's relocations say exactly which words point into its code.
             return out | exact
+        # Words in the gaps of the code itself: bytes no function runs and
+        # no load reads as a literal. Hand-written assembly keeps data there
+        # (Pokémon X's video decoder keeps its own start address after its
+        # last function, and finds it relative to the code around it).
+        code, pools = set(), self._data_words(fns)
+        for fn in fns.values():
+            code.update(fn.insns)
+        text = self.text
+        for off in range(0, len(text.data) - 3, 4):
+            a = text.vaddr + off
+            if a in code or a + 2 in code or a in pools:
+                continue
+            value = int.from_bytes(text.data[off:off + 4], 'little')
+            if self.in_text(value & ~1):
+                out.add(value)
         for seg in self.program.segments:
             if seg is self.text:
                 continue
@@ -793,6 +984,7 @@ def discover(program, extra=()):
     program.functions = functions
     program.data_ranges = data_ranges
     program.jump_tables = d.jump_tables
+    program.jump_returns = d.jump_returns
     report['functions'] = len(functions)
     report['instructions'] = sum(len(f.insns) for f in fns.values())
     return functions, report
