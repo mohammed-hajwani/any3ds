@@ -42,6 +42,9 @@ L_00100054:
 - **An unsupported instruction is a hard error** naming its address and mnemonic. Nothing is ever skipped silently.
 - Optimisation is clang's job. Generated code should stay readable.
 
+Every architectural choice, the alternatives it was picked over, what it costs and where the
+levers are: [docs/architecture.md](docs/architecture.md).
+
 OS calls (`SVC`) go to `hle/`, our own high-level emulation of the 3DS kernel and services written from the public [3dbrew](https://www.3dbrew.org) docs: threads and synchronisation, IPC, APT, GSP, HID, FS (RomFS, saves, extdata), CFG, RO (CRO modules), Y2R and the DSP (audio inputs and an AAC decoder). The GPU in `gpu/` is our own too. No emulator code is reused, so the licence stays open. Where 3dbrew is silent, behaviour comes from what the game's own code expects, and each such guess is logged when it is used. See [CLAUDE.md](CLAUDE.md) for the full design and roadmap.
 
 ## Legal rules (read before contributing)
