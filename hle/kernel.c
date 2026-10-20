@@ -267,7 +267,7 @@ static void vblank(void *arg)
     frame_count++;
     gsp_vblank();
     hid_vblank(frame_count);
-    gpu_stats_report(frame_count);
+    gpu_frame(frame_count);
     if (config.live_path && frame_count % config.live_every == 0) {
         /* A live view (runner --live): written to a side file, then renamed,
            so a viewer never reads half a picture. */

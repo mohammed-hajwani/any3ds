@@ -10,11 +10,23 @@
 
 static uint8_t *mem;
 int gpu_trace;
+static uint32_t trace_from;     /* GPU_TRACE=N (N > 1): start tracing at frame N */
 
 void gpu_init(uint8_t *guest_mem)
 {
     mem = guest_mem;
-    gpu_trace = getenv("GPU_TRACE") != NULL;
+    const char *t = getenv("GPU_TRACE");
+    trace_from = t ? (uint32_t)strtoul(t, NULL, 0) : 0;
+    gpu_trace = t && trace_from <= 1;
+}
+
+void gpu_frame(uint32_t frame)
+{
+    if (trace_from > 1 && frame == trace_from) {
+        gpu_trace = 1;
+        fprintf(stderr, "gpu: tracing from frame %" PRIu32 "\n", frame);
+    }
+    gpu_stats_report(frame);
 }
 
 void gpu_fatal(const char *fmt, ...)

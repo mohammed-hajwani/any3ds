@@ -268,18 +268,18 @@ static Color frag_texture(Frag *f, int unit)
     if (f->sampled >> unit & 1)
         return f->tex[unit];
     uint32_t config = pica.reg[REG_TEXUNIT_CONFIG];
-    if (!(config >> unit & 1))
-        gpu_fatal("a colour combiner reads texture %d, which is disabled", unit);
-    TexUnit t;
-    tex_unit_read(unit, &t);
+    TexUnit t = { 0 };
+    if (config >> unit & 1)
+        tex_unit_read(unit, &t);
     if (!t.width || !t.height) {
-        /* An enabled unit whose size was never set (Pokémon X's intro does
-           this). 3dbrew doesn't say what the hardware samples then. */
-        static int told;
-        if (!told++)
-            fprintf(stderr, "gpu: a colour combiner reads texture %d, which is %" PRIu32 "x%" PRIu32
-                    " (address %08" PRIx32 ", format %" PRIu32 "): reading zero\n",
-                    unit, t.width, t.height, t.addr[0], t.format);
+        /* A unit that is disabled, or enabled with no size set: Pokémon X's
+           intro clears all three units and then draws with a combiner that
+           reads them. 3dbrew doesn't say what the hardware samples then. */
+        static int told[3];
+        if (!told[unit]++)
+            fprintf(stderr, "gpu: a colour combiner reads texture %d, which is %s %" PRIu32 "x%" PRIu32
+                    " (address %08" PRIx32 "): reading zero\n", unit,
+                    config >> unit & 1 ? "enabled," : "disabled,", t.width, t.height, t.addr[0]);
         f->tex[unit] = (Color){ 0, 0, 0, 0 };
         f->sampled |= 1 << unit;
         return f->tex[unit];
