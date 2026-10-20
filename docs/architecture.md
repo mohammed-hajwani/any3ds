@@ -247,6 +247,17 @@ descent from the entry point, plus:
 - it all runs **to a fixpoint**, because a newly found start can shorten another
   function and newly found data can stop a fall-through.
 
+The rule set keeps growing, and it has changed *kind* along the way. It started
+as pure structural reasoning (who branches where) and now also weighs **positive
+evidence of a function**: a guessed start that opens with `push {..., lr}` is a
+real function, not the middle of one, because that is what a function does first
+— which is how C++ methods preceded by string data in the code stopped being
+swallowed by a neighbouring guess. Likewise an address the CRO loader links
+to is a function whatever appears to run into it, a start preceded by ARMCC's
+filler `mov r0, r0` is not a mid-function, and a based jump table may have
+unused zero entries in the middle of it (Pokémon X's video decoder has two, and
+everything after them used to be dropped).
+
 **Why.** Retail games have no symbols at all. Without this there is no path to
 commercial software, and 3dsx homebrew only gets you so far.
 
@@ -627,6 +638,14 @@ nearest, short vectors, trapped exceptions, cumulative exception flags.
 per-operation `fesetround`, which is slow — better to implement it only for the
 instructions that need it.
 
+`RECOMP_NAN=1` was added for the failure mode this layer makes possible: a NaN
+born from ordinary numbers (0/0, inf - inf, sqrt of a negative) propagates
+silently through every later operation, so the symptom appears nowhere near the
+cause. It calls `recomp_nan_born(ctx)` — deliberately `noinline`, so it is a
+breakpoint you can put a debugger on and get the whole guest call stack. Note
+that it costs a branch per VFP result even when off; if that ever shows in a
+profile, make it a compile-time `#ifdef`.
+
 ### 3.10 The exclusive monitor is a pair of fields
 
 **What we do.** `ldrex` records the address and arms a flag; `strex` succeeds only
@@ -754,11 +773,20 @@ instead of silent aliasing. Never freeing is a deliberate simplification.
 (correct, and needed if a long session creates objects in a loop).
 
 **What it costs.** Leaks, bounded only by the run's length — fine for minutes,
-not for hours of gameplay. 4096 handles and 32 threads are hard limits.
+not for hours of gameplay.
+
+This is the first simplification a real game has started to bend. The thread
+table was 32 entries; a retail game creates thousands of threads over a session,
+so it became 4096 "every thread ever created" (finished ones stay, because
+something may still join them) with a separate pool of 64 **TLS blocks that are
+reused once their thread finishes**. Worth noticing *why* the reuse was needed:
+not host memory, but guest address space — TLS blocks live at
+`0x1FF82000 + 0x200 * i`, a fixed region with no room to grow. The limits that
+bind first are the ones the console's own memory map imposes, not ours.
 
 **Lever.** When runs get long, add refcounting (`KObj.refs`, incremented per
 handle) and free on zero. Cheap to do, and the `all_objs` list already gives you
-the audit trail.
+the audit trail. The 4096 handles are the next ceiling of the same kind.
 
 ### 4.5 IPC is a command buffer and a dispatch function per service
 
@@ -799,8 +827,27 @@ limped on. `HLE_LENIENT` is the escape valve, and the compat sweep's
 classification (`stops` with the reason) turns every stop into a line in a
 table instead of a mystery.
 
-**Lever.** Keep this rule above all the others. It is the project's actual
-methodology.
+**The third answer, added later.** Running a retail game forced a category the
+original binary rule had no room for: behaviour the hardware clearly *has* but
+3dbrew does not document. Pokémon X's intro clears all three texture units and
+then draws with a combiner that reads two of them; it also reads fragment
+lighting while lighting is disabled. There is no documented answer for what the
+hardware samples then, and no documentation to implement. Stopping is wrong (the
+game is doing something ordinary); guessing silently is worse. So those cases now
+**read zero and log once, naming the unit**, while `gpu_fatal` stays for things
+that are documented and simply not implemented yet (unknown texture formats,
+shadow and projection textures).
+
+That is the right call, and it is worth being clear-eyed about the price: a
+wrong guess here produces wrong *pixels*, not a stop, and the single log line is
+the only evidence. Keep those lines distinctive, keep the list short, and treat
+each one as a hypothesis to confirm against hardware or a trusted emulator's
+behaviour some day — not as a finished feature.
+
+**Lever.** Keep the original rule above all the others; it is the project's
+actual methodology. Keep this exception narrow, and keep the two kinds of
+unknown — "undocumented, assumed benign" and "documented, not implemented" —
+visibly different in the code, as they are now.
 
 ### 4.7 Memory is already there; the OS just bookkeeps
 
@@ -834,6 +881,40 @@ code is a hard stop naming it.
 **What it costs.** A full CRO relocator in C, mirroring the one in Python. The
 two must agree about what gets patched; `cro.without_patched()` is the shared
 assumption.
+
+### 4.9 Service state is sampled once a frame, not reacted to on write
+
+**What we do.** Services that talk to the guest through shared memory (GSP's
+interrupt queue, HID's pad state, DSP's voice configuration) are driven from the
+60 Hz vblank: each frame the service reads what the guest wrote and writes back
+what the guest should see.
+
+**Why.** It is the only option the memory design leaves. Guest memory is a flat
+mapping with no hooks (§3.2), so nothing can *notice* a guest write — there is no
+MMIO trap, no dirty-page callback. Polling at the rate the hardware updates
+(once a frame) is both natural and cheap.
+
+**Instead we could have** write-protected the shared-memory pages and caught the
+faults (precise, but signal handlers and iOS do not mix), or checked for changes
+at every svc (finer-grained, still sampling).
+
+**What it costs.** The guest can act faster than we sample, and then changes get
+lost. This produced a genuinely hard bug: Pokémon X's sound library writes
+*both* DSP shared-memory regions between two of our frames, and the kernel
+applied only the newer one — so every other frame's changes vanished, including
+the ones that start voices. No sound ever played, and a music stream never became
+"prepared", which showed up as a black screen several steps later. The fix is the
+general shape for this class: consume **by the per-field dirty flags** (apply the
+older region's flagged changes, then the current one's, clearing flags as you go,
+and write status back to both regions) rather than by "whichever region looks
+newest".
+
+**Lever.** Audit the other double-buffered shared-memory protocols for the same
+assumption — GSP and HID have the same shape — and prefer "drain everything
+flagged since last time" to "read the newest snapshot" everywhere. If a service
+ever genuinely needs write-time reaction, the honest fix is a narrow one: give
+that one region a guarded page and handle the fault, rather than giving up the
+flat mapping.
 
 ---
 
@@ -1037,10 +1118,32 @@ documented service command, every ARMv6K/VFPv2 instruction and every PICA shader
 instruction, green where implemented), and the live view (`--live` writes both
 screens to a BMP every 30 frames, written to a side file and renamed so a viewer
 never sees half a picture; `tools/live.html` + `live_server.py` show it and feed
-input back). All of it opt-in and zero-cost when off.
+input back).
+
+**Moving from examples to a retail game changed what a diagnostic has to be.**
+An example runs for a few hundred frames and you can read its whole trace; a
+game runs for thousands and the interesting draw is one of millions. So the
+tools grew two properties:
+
+- **Gated by frame.** `HLE_TRACE=N` and `GPU_TRACE=N` start tracing at frame N
+  (both hang off the vblank, via `gpu_frame`), so one late draw can be traced
+  without logging the run that led to it.
+- **Aggregated instead of logged.** `GPU_STATS=1` reports, once a second,
+  triangles drawn / clipped / culled and fragments written versus dropped by the
+  alpha, stencil and depth tests. That turns "nothing is on screen" from a
+  guessing game into a number: geometry never arrived, or it was culled, or it
+  was clipped, or it was drawn and then rejected per-pixel.
+- **Provenance for silent corruption.** `RECOMP_NAN=1` (§3.9) names where a NaN
+  was born rather than where it was noticed.
+
+Two of these are not free: the `GPU_STATS` counters increment unconditionally
+(per fragment, per test), and `RECOMP_NAN` costs a branch per VFP result. Both
+are small against a software rasteriser, but they are on the hot path — worth an
+`#ifdef` if §9.1's benchmark ever says so.
 
 This is unusually good, and it is why a one-person project can carry four
-subsystems at once.
+subsystems at once. Build the diagnostic *before* the hunt, every time; the
+record of this project is that the tool pays for itself inside a day.
 
 ### 6.7 The build system
 
@@ -1144,13 +1247,38 @@ currently built `-O0` in the sweep. Everything in §3 about register
 localisation and flag liveness is reasoning, not measurement. This is the
 cheapest gap to close and it gates every other performance decision.
 
-### 8.5 Volume in the OS layer
+### 8.5 Zero is not a safe default for data the HLE invents
+
+Unimplemented *code* stops loudly; unimplemented *data* does not, and that makes
+it the more dangerous of the two. The clearest case so far: `cfg:u` block
+`0x00050005` (stereo display calibration, which 3dbrew lists as unknown)
+returned zeros. The SDK's stereo camera divides by the screen height, so every
+3D vertex became NaN and every model silently vanished — with no error anywhere
+in CPU, kernel or GPU. The fix was to put *physically plausible* values there
+(eye separation, viewing distance, the top screen's real dimensions in mm).
+
+The general rule to carry forward: when a service has to invent data, invent
+something a real console would plausibly return, and write down in a comment
+where the meanings came from (here: how the game's own code uses the fields).
+Zero-filling a structure is the fastest way to turn a missing feature into an
+undiagnosable one. `RECOMP_NAN=1` exists because of this failure class, and the
+same reasoning applies to anything used as a divisor, a count, a size or a
+stride.
+
+### 8.6 Service state is sampled, so the guest can outrun it
+
+See §4.9: shared-memory services read the guest once a frame, and a guest that
+writes twice between two frames loses a change. The DSP bug was one instance;
+GSP and HID have the same double-buffered shape. Audit for it before it costs
+another week.
+
+### 8.7 Volume in the OS layer
 
 Every new game wants more services. This is expected and the design handles it;
 just do not be surprised when "boot one more game" is three weeks of FS and APT
 edge cases rather than anything architectural.
 
-### 8.6 Single-threaded by construction
+### 8.8 Single-threaded by construction
 
 Guest code will never use more than one host core (§4.2). On a phone, with a
 software GPU (§5.1) competing for the same core, that is a hard ceiling. The GPU
@@ -1297,7 +1425,8 @@ Do it after the CPU side is measured and the interpreter exists.
 | 4.1 | own HLE from docs | reuse Azahar / LLE | licence stays open | unbounded service surface |
 | 4.2 | pthread per guest thread, one at a time | preemptive / fibers | needs host stacks; fully deterministic | µs switches; one core only |
 | 4.3 | virtual clock | wall clock | deterministic; deadlock reports | not playable in real time |
-| 4.6 | unknown = named stop | log and continue | always a named next task | one gap stops the app |
+| 4.6 | unknown = named stop (undocumented hardware: read zero, log once) | log and continue | always a named next task | one gap stops the app; the zero-reads are hypotheses |
+| 4.9 | services sample shared memory each frame | write traps / check per svc | flat memory has no write hooks | a guest that writes twice per frame loses a change |
 | 5.1 | own software GPU | Azahar's / host GPU | licence; pixel-exact oracle | far from real time |
 | 5.3 | interpret shaders, float32 | exact float24 / host shaders | shaders only exist at run time | precision artefacts possible |
 | 6.1 | Unicorn lockstep diff | exit-state compare | pinpoints the exact instruction | test-only dependency |
