@@ -34,6 +34,19 @@ static void read_block(uint32_t id, uint8_t *out, uint32_t size)
                 out[lang * 0x80 + 2 * i] = (uint8_t)country[i];
         return;
     }
+    case 0x00050005: {          /* stereo display settings: 8 floats, factory calibration */
+        /* Undocumented ("???" on 3dbrew), so the meanings come from how the
+           SDK's stereo camera code in Pokémon X uses them, and the values are
+           physical measurements, not a real console's calibration:
+           [0] the distance between the viewer's eyes (mm, a typical adult),
+           [1] the viewing distance (mm, an arm's-length handheld),
+           [2], [3] the top screen's width and height (mm: 3.53" diagonal, 5:3),
+           [4] a default camera separation (mm; only used with the 3D slider up).
+           [3] is a divisor, so zeros make every 3D vertex NaN. */
+        static const float stereo[8] = { 62.0f, 300.0f, 76.9f, 46.1f, 10.0f };
+        memcpy(out, stereo, size < sizeof stereo ? size : sizeof stereo);
+        return;
+    }
     case 0x000B0002:            /* state name (UTF-16 per language): none */
     case 0x000B0003:            /* coordinates: 0, 0 */
         return;

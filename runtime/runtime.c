@@ -139,6 +139,22 @@ void recomp_tick(Ctx *ctx)
         recomp_tick_handler(ctx);
 }
 
+/* RECOMP_NAN=1 (see vfp.h): report where the first few NaNs are made. Under
+   a debugger, break on recomp_nan_born for the whole call stack. */
+int recomp_nan_debug;
+
+__attribute__((constructor)) static void recomp_nan_debug_init(void)
+{
+    recomp_nan_debug = getenv("RECOMP_NAN") != NULL;
+}
+
+__attribute__((noinline)) void recomp_nan_born(const Ctx *ctx)
+{
+    static int told;
+    if (told++ < 10)
+        fprintf(stderr, "recomp: a NaN was made from numbers (lr = 0x%08" PRIx32 ")\n", ctx->r[14]);
+}
+
 void recomp_bad_fpscr(Ctx *ctx, uint32_t value)
 {
     fprintf(stderr, "recomp: guest set FPSCR = 0x%08" PRIx32 ": a rounding mode, short-vector mode or"

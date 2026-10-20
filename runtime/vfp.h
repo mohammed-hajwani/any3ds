@@ -56,9 +56,20 @@ static inline uint32_t f32_flush(const Ctx *ctx, uint32_t a)
     return (ctx->fpscr & FPSCR_FZ) && !(a & 0x7F800000u) ? a & 0x80000000u : a;
 }
 
+/* RECOMP_NAN=1: recomp_nan_born is called whenever an operation makes a NaN
+   out of numbers (0/0, inf - inf, the root of a negative): a place to put a
+   debugger breakpoint when NaNs turn up where they shouldn't. */
+extern int recomp_nan_debug;
+void recomp_nan_born(const Ctx *ctx);
+
 static inline uint32_t f32_result(const Ctx *ctx, uint32_t r)
 {
-    return f32_is_nan(r) ? F32_DEFAULT_NAN : f32_flush(ctx, r);
+    if (f32_is_nan(r)) {
+        if (recomp_nan_debug)
+            recomp_nan_born(ctx);
+        return F32_DEFAULT_NAN;
+    }
+    return f32_flush(ctx, r);
 }
 
 #define VFP_OP32(name, op)                                                      \
@@ -110,7 +121,12 @@ static inline uint64_t f64_flush(const Ctx *ctx, uint64_t a)
 
 static inline uint64_t f64_result(const Ctx *ctx, uint64_t r)
 {
-    return f64_is_nan(r) ? F64_DEFAULT_NAN : f64_flush(ctx, r);
+    if (f64_is_nan(r)) {
+        if (recomp_nan_debug)
+            recomp_nan_born(ctx);
+        return F64_DEFAULT_NAN;
+    }
+    return f64_flush(ctx, r);
 }
 
 #define VFP_OP64(name, op)                                                      \

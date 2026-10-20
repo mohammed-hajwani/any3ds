@@ -344,8 +344,8 @@ class Discovery:
         if found is None:
             self.unresolved.add(insn.address)
             return
-        table, targets = found
-        fn.data.update((table + 4 * i, 4) for i in range(len(targets)))
+        table, targets, entries = found
+        fn.data.update((table + 4 * i, 4) for i in range(entries))
         self.jump_tables[insn.address] = targets
         # The targets are subroutines: the decoder points lr where they are
         # to return and calls the same ones through pointers too. So each is
@@ -414,9 +414,10 @@ class Discovery:
         """For `add rD, rA, rB`, where one register holds a table's address
         made from pc (`sub rT, pc, #n`) and the other an offset loaded from
         that table (`ldr rO, [rT, rI, lsl #2]`): (table, the addresses
-        table + offset). The table runs while its entries land on ARM
-        instructions in the code, outside the table itself (zero words
-        after a table would point at it). None if add isn't that."""
+        table + offset, the number of entries). The table runs while its
+        entries land on ARM instructions in the code, outside the table
+        itself; zero entries are skipped, and trailing ones aren't counted.
+        None if add isn't that."""
         ops = add.operands
         if not (len(ops) == 3 and all(op.type == ARM_OP_REG for op in ops) and not ops[2].shift.value):
             return None
@@ -434,16 +435,25 @@ class Discovery:
             if (mem.type != ARM_OP_MEM or _reg_num(load, mem.mem.base) != base or not mem.mem.index
                     or mem.subtracted or mem.shift.value not in (0, 2)):
                 continue                # (index scaled by 4, or already a byte offset)
-            targets = []
-            while len(targets) < 512:
-                raw = self.program.read(table + 4 * len(targets), 4)
-                t = (table + int.from_bytes(raw, 'little')) & 0xFFFFFFFF if raw else 1
+            # A zero entry (pointing at the table) is an unused slot when
+            # real entries follow it: Pokémon X's decoder has two in the
+            # middle of one table.
+            targets, n, used = [], 0, 0
+            while n < 512:
+                raw = self.program.read(table + 4 * n, 4)
+                offset = int.from_bytes(raw, 'little') if raw else 1
+                t = (table + offset) & 0xFFFFFFFF
+                if offset == 0:
+                    n += 1
+                    continue
                 if t % 4 or not self.in_text(t) or self.decode(t, False) is None \
-                        or table <= t <= table + 4 * len(targets):
+                        or table <= t <= table + 4 * n:
                     break
                 targets.append(t)
+                n += 1
+                used = n
             if targets:
-                return table, targets
+                return table, targets, used
         return None
 
     @staticmethod

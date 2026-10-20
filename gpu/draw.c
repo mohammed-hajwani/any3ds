@@ -272,6 +272,18 @@ static Color frag_texture(Frag *f, int unit)
         gpu_fatal("a colour combiner reads texture %d, which is disabled", unit);
     TexUnit t;
     tex_unit_read(unit, &t);
+    if (!t.width || !t.height) {
+        /* An enabled unit whose size was never set (Pokémon X's intro does
+           this). 3dbrew doesn't say what the hardware samples then. */
+        static int told;
+        if (!told++)
+            fprintf(stderr, "gpu: a colour combiner reads texture %d, which is %" PRIu32 "x%" PRIu32
+                    " (address %08" PRIx32 ", format %" PRIu32 "): reading zero\n",
+                    unit, t.width, t.height, t.addr[0], t.format);
+        f->tex[unit] = (Color){ 0, 0, 0, 0 };
+        f->sampled |= 1 << unit;
+        return f->tex[unit];
+    }
     /* Unit 2 can use texture coordinates 2 or 1. */
     int set = unit == 2 && (config >> 13 & 1) ? 1 : unit;
     const float *d = f->d[set];

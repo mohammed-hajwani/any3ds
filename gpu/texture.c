@@ -137,7 +137,8 @@ void tex_unit_read(int unit, TexUnit *t)
         gpu_fatal("texture unit %d format %" PRIu32, unit, t->format);
     if (t->type != 0 && t->type != 1)
         gpu_fatal("texture unit %d type %d (shadow/projection textures are not implemented yet)", unit, t->type);
-    if (t->width < 8 || t->height < 8 || t->width % 8 || t->height % 8)
+    if (t->width && t->height       /* (0: never set up, frag_texture reads zero) */
+            && (t->width < 8 || t->height < 8 || t->width % 8 || t->height % 8))
         gpu_fatal("texture unit %d is %" PRIu32 "x%" PRIu32 ", not a multiple of 8", unit, t->width, t->height);
     uint32_t first = pica.reg[r[4]];
     t->addr[0] = first << 3;

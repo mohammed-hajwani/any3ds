@@ -4,7 +4,8 @@
 @ each jump into a switch over the targets it found.
 @   add pc, rT, rO    rT = a table's address (sub rT, pc, #n), rO = an
 @                     offset loaded from the table (index scaled by 4);
-@                     the word after the table is not an entry
+@                     the word after the table is not an entry, and a
+@                     zero entry in the middle is an unused slot
 @   mov pc, rX        after add rX, rT, rO, with other instructions between
 @   add pc, rT, rO    offsets back to before the function, indexed by a
 @                     byte offset: those targets are functions of their own
@@ -37,8 +38,10 @@ _start:
 
 add_table:
     and r1, r1, #3
+    cmp r1, #2                  @ indices 0, 1, 3, 4: 2 is the unused slot
+    addhs r1, r1, #1
     b 2f
-1:  .word 10f - 1b, 11f - 1b, 12f - 1b, 13f - 1b
+1:  .word 10f - 1b, 11f - 1b, 0, 12f - 1b, 13f - 1b
     .word 0x05040301            @ (a byte table after it: not an entry)
 2:  adr r2, 1b                  @ sub r2, pc, #n
     ldr r3, [r2, r1, lsl #2]
