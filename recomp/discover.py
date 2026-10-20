@@ -36,7 +36,7 @@ from capstone.arm import (
     ARM_CC_AL, ARM_CC_LO, ARM_CC_LS, ARM_INS_ADD, ARM_INS_B, ARM_INS_BL, ARM_INS_BLX, ARM_INS_BX, ARM_INS_CMP,
     ARM_INS_CMN, ARM_INS_TEQ, ARM_INS_TST, ARM_INS_ADR,
     ARM_INS_LDM, ARM_INS_LDMDA, ARM_INS_LDMDB, ARM_INS_LDMIB, ARM_INS_LDR, ARM_INS_LDRB, ARM_INS_LDRD,
-    ARM_INS_LDRH, ARM_INS_LDRSB, ARM_INS_LDRSH, ARM_INS_LSL, ARM_INS_MOV, ARM_INS_POP, ARM_INS_SUB, ARM_INS_UDF,
+    ARM_INS_LDRH, ARM_INS_LDRSB, ARM_INS_LDRSH, ARM_INS_LSL, ARM_INS_MOV, ARM_INS_POP, ARM_INS_PUSH, ARM_INS_SUB, ARM_INS_UDF,
     ARM_INS_VLDR,
     ARM_OP_IMM, ARM_OP_MEM, ARM_OP_REG,
 )
@@ -405,8 +405,8 @@ class Discovery:
                 if p.id == ARM_INS_MOV and len(ops) == 2 and ops[1].type == ARM_OP_REG \
                         and _reg_num(p, ops[1].reg) == PC:
                     value = p.address + 8
-                else:
-                    value = self._pc_value(p)
+                else:               # `add lr, pc, #n`, maybe then `add lr, lr, #m`
+                    value = self._const_reg(fn, insn, 14)
                 return value if value is not None and self.in_text(value) and fn.addr <= value else None
         return None
 
@@ -758,8 +758,10 @@ class Discovery:
             # An address the CRO loader links modules to (pointer_hints) is a
             # function for certain, whatever runs into it: often a string in
             # the code, decoded by some other guess as Thumb instructions.
+            # Nor is one that opens with a prologue saving lr: strings in the
+            # code before a C++ method, decoded by another guess, run into it.
             middle = {g for g in accepted if g[0] in falls and not self._after_filler(g)
-                      and g[0] | g[1] not in hints}
+                      and g[0] | g[1] not in hints and not self._prologue(g)}
             if middle:
                 for g in middle:
                     accepted.discard(g)
@@ -834,6 +836,14 @@ class Discovery:
             if failure is not None:
                 return failure
         return 'its literal data never settled'
+
+    def _prologue(self, start):
+        """Whether a function start opens by saving lr on the stack
+        (`push {..., lr}`, ARM or Thumb): what a real function does first."""
+        insn = self.decode(*start)
+        if insn is None or insn.id != ARM_INS_PUSH:
+            return False
+        return any(op.type == ARM_OP_REG and _reg_num(insn, op.reg) == 14 for op in insn.operands)
 
     def _after_filler(self, start):
         """Whether the instruction just before a function start is a filler

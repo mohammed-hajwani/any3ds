@@ -11,14 +11,15 @@
 #include "gpu.h"
 #include "kernel.h"
 
-#define MAX_THREADS 32
+#define MAX_THREADS 4096            /* every thread ever created (finished ones stay, for joins) */
+#define MAX_TLS     64              /* threads alive at once: each has a TLS block */
 #define MAX_WAIT    64              /* WaitSynchronizationN's limit */
 #define MAX_HANDLES 4096
 #define MAX_TIMERS  8
 #define NO_DEADLINE UINT64_MAX
 #define SVC_COST    (TICKS_PER_SEC / 1000000)   /* each svc takes 1 us */
 
-#define TLS_BASE    0x1FF82000u     /* thread i's TLS block: TLS_BASE + 0x200 * i */
+#define TLS_BASE    0x1FF82000u     /* TLS block i: TLS_BASE + 0x200 * i, reused once its thread finishes */
 #define EXIT_ADDR   0x00ABC000u     /* return address of a thread's entry function */
 #define HOST_STACK  (16u << 20)
 
@@ -51,6 +52,7 @@ int hle_trace;
 
 static pthread_mutex_t big_lock = PTHREAD_MUTEX_INITIALIZER;
 static KThread *threads[MAX_THREADS];
+static KThread *tls_owner[MAX_TLS];
 static int nthreads;
 static KThread *cur;
 static uint64_t now_ticks, seq;
@@ -265,6 +267,7 @@ static void vblank(void *arg)
     frame_count++;
     gsp_vblank();
     hid_vblank(frame_count);
+    gpu_stats_report(frame_count);
     if (config.live_path && frame_count % config.live_every == 0) {
         /* A live view (runner --live): written to a side file, then renamed,
            so a viewer never reads half a picture. */
@@ -461,6 +464,7 @@ static void run_guest(KThread *t)
 static void thread_finish(KThread *t)
 {
     t->state = T_DEAD;
+    tls_owner[(t->ctx.tls - TLS_BASE) / 0x200u] = NULL;    /* its TLS block is free again */
     wake_waiters();
     KThread *next = next_to_run();
     cur = next;
@@ -481,8 +485,11 @@ static void *host_thread_main(void *arg)
 
 static KThread *thread_new(uint32_t entry, int prio)
 {
-    if (nthreads == MAX_THREADS) {
-        fprintf(stderr, "hle: too many threads\n");
+    int slot = 0;
+    while (slot < MAX_TLS && tls_owner[slot])
+        slot++;
+    if (nthreads == MAX_THREADS || slot == MAX_TLS) {
+        fprintf(stderr, "hle: too many threads (%d alive)\n", slot);
         exit(3);
     }
     KThread *t = calloc(1, sizeof *t);
@@ -495,7 +502,8 @@ static KThread *thread_new(uint32_t entry, int prio)
     t->entry = entry;
     t->prio = prio;
     t->ctx.mem = mem;
-    t->ctx.tls = TLS_BASE + 0x200u * (uint32_t)t->index;
+    t->ctx.tls = TLS_BASE + 0x200u * (uint32_t)slot;
+    tls_owner[slot] = t;
     memset(mem + t->ctx.tls, 0, 0x200);
     t->ctx.r[14] = EXIT_ADDR;
     t->deadline = NO_DEADLINE;

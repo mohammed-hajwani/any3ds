@@ -12,6 +12,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "pica.h"
@@ -283,12 +284,25 @@ static Color frag_texture(Frag *f, int unit)
     return f->tex[unit];
 }
 
-/* Fragment lighting's primary (0) or secondary (1) colour. */
+/* GPU_STATS=1: where triangles and pixels go, reported once a second
+   (gpu_stats_report, from the vblank): drawn, clipped away, culled, and the
+   fragments that fail the alpha, stencil or depth test or get written. */
+static struct { uint64_t tris, clipped, culled, frags, alpha, stencil, depth, written, unlit; } stats;
+
+/* Fragment lighting's primary (0) or secondary (1) colour. With lighting
+   disabled (3dbrew doesn't say what the combiners then read), a unit that
+   is off adds no light: both colours are zero. */
 static Color frag_light(Frag *f, int which)
 {
+    if (!f->lit && !(pica.reg[REG_LIGHTING_ENABLE0] & 1)) {
+        static int told;
+        if (!told++)
+            fprintf(stderr, "gpu: a colour combiner reads fragment lighting while it is disabled: reading zero\n");
+        f->light[0] = f->light[1] = (Color){ 0, 0, 0, 0 };
+        f->lit = 1;
+        stats.unlit++;
+    }
     if (!f->lit) {
-        if (!(pica.reg[REG_LIGHTING_ENABLE0] & 1))
-            gpu_fatal("a colour combiner reads fragment lighting, which is disabled");
         uint32_t c0 = pica.reg[0x1C3];
         Rgba bump, p, s;
         int bumped = (c0 >> 28 & 3) != 0;
@@ -557,8 +571,24 @@ static Color apply_fog(Color c, float depth)
 }
 
 /* One fragment at render-target pixel (x, y) (y measured from the bottom). */
+void gpu_stats_report(uint32_t frame)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("GPU_STATS") != NULL;
+    if (!on || frame % 60)
+        return;
+    fprintf(stderr, "gpu stats (frame %u): %llu triangles (%llu clipped away, %llu culled), %llu fragments: "
+            "%llu failed alpha, %llu stencil, %llu depth; %llu written (%llu read lighting while off)\n", frame,
+            (unsigned long long)stats.tris, (unsigned long long)stats.clipped, (unsigned long long)stats.culled,
+            (unsigned long long)stats.frags, (unsigned long long)stats.alpha, (unsigned long long)stats.stencil,
+            (unsigned long long)stats.depth, (unsigned long long)stats.written, (unsigned long long)stats.unlit);
+    memset(&stats, 0, sizeof stats);
+}
+
 static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Frag *f)
 {
+    stats.frags++;
     /* Memory rows go top to bottom; the window's y = 0 is the bottom row. */
     uint32_t idx = tile_index(x, t->height - 1 - y, t->width);
 
@@ -567,8 +597,10 @@ static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Frag 
         c = apply_fog(c, depth);
 
     uint32_t at = pica.reg[REG_ALPHA_TEST];
-    if ((at & 1) && !test(at >> 4 & 7, (uint32_t)c.a, at >> 8 & 0xFF))
+    if ((at & 1) && !test(at >> 4 & 7, (uint32_t)c.a, at >> 8 & 0xFF)) {
+        stats.alpha++;
         return;
+    }
 
     /* depth and stencil */
     uint32_t dmax = t->depth_fmt == 0 ? 0xFFFF : 0xFFFFFF;
@@ -587,12 +619,14 @@ static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Frag 
     int stencil_on = (st & 1) && t->depth_fmt == 3 && dp;
     uint32_t sref = st >> 16 & 0xFF, smask = st >> 24, swmask = st >> 8 & 0xFF, new_stencil = stencil;
     if (stencil_on && !test(st >> 4 & 7, sref & smask, stencil & smask)) {
+        stats.stencil++;
         new_stencil = stencil_op(so & 7, stencil, sref);
         goto write_stencil;
     }
     uint32_t dcm = pica.reg[REG_DEPTH_COLOR_MASK];
     int depth_pass = !(dcm & 1) || !t->depth_read || test(dcm >> 4 & 7, z, old_z);
     if (!depth_pass) {
+        stats.depth++;
         if (stencil_on)
             new_stencil = stencil_op(so >> 4 & 7, stencil, sref);
         goto write_stencil;
@@ -606,6 +640,7 @@ static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Frag 
 
     /* blend / logic op, then the colour write mask */
     if (t->color && t->color_write) {
+        stats.written++;
         uint8_t *cp = t->color + idx * (uint32_t)pixel_size(t->color_fmt);
         Rgba d8 = color_decode(cp, t->color_fmt);
         Color dst = { d8.r, d8.g, d8.b, d8.a }, out = c;
@@ -689,8 +724,10 @@ static void raster_triangle(const Target *t, const WinVertex *v0, const WinVerte
 
     /* face culling: counter-clockwise (positive area, y up) is the front */
     uint32_t cull = pica.reg[REG_FACECULLING] & 3;
-    if ((cull == 1 && area > 0) || (cull == 2 && area < 0))
+    if ((cull == 1 && area > 0) || (cull == 2 && area < 0)) {
+        stats.culled++;
         return;
+    }
     if (area < 0) {                     /* make it counter-clockwise for the edge tests */
         const WinVertex *tmp = v1;
         v1 = v2;
@@ -775,9 +812,12 @@ static void draw_triangle(const Vertex *a, const Vertex *b, const Vertex *c)
         poly[i].z = in[i]->a[2];
         poly[i].w = in[i]->a[3];
     }
+    stats.tris++;
     int n = clip_polygon(poly, 3);
-    if (n < 3)
+    if (n < 3) {
+        stats.clipped++;
         return;
+    }
 
     Target t;
     get_target(&t);

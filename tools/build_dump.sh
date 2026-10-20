@@ -21,6 +21,8 @@ case "$out" in out/*) ;; *) echo "OUT_DIR must be under out/ (gitignored)"; exit
 jobs=$(nproc)
 mkdir -p "$out" "$out/cro"
 py=.venv/bin/python
+start=$(date +%s)
+since() { echo "   ($(( $(date +%s) - start )) s so far)"; }
 
 # OS_ONLY=1: keep the recompiled game, rebuild just the OS layer (hle/, gpu/).
 if [ "${OS_ONLY:-0}" = 1 ] && [ -f "$out/gen.o" ]; then
@@ -30,6 +32,7 @@ else
     rm -f "$out"/gen*.c "$out"/gen*.o "$out"/cro/*
     $py -m recomp "$dump" -o "$out/gen.c" --keep-going --split 400 > "$out/recomp.log"
     grep -v '^  f_' "$out/recomp.log"
+    since
 
     # The CRO modules, if the game has any.
     $py -m recomp.romfs "$dump" 2>/dev/null | awk '$2 ~ /\.cro$/ { print $2 }' > "$out/cro/list.txt" || true
@@ -41,6 +44,7 @@ else
                 > "'"$out"'/cro/$name.log" 2>&1 || { echo "  FAILED: {} (see '"$out"'/cro/$name.log)"; exit 1; }
         ' < "$out/cro/list.txt"
         grep -h "^module " "$out"/cro/*.log | awk '{ f += $3; i += $5 } END { print "   ", f, "functions,", i, "instructions" }'
+        since
     fi
     # The table of modules the runtime looks up when the game loads one.
     {
@@ -67,6 +71,7 @@ if [ "${OS_ONLY:-0}" != 1 ] || [ ! -f "$out/gen.o" ]; then
     echo "== compiling $(ls "$out"/gen*.c "$out"/cro/*.c "$out/modules.c" 2>/dev/null | wc -l) C files with $jobs jobs"
     ls "$out"/gen*.c "$out"/cro/*.c "$out/modules.c" 2>/dev/null \
         | xargs -P "$jobs" -I{} sh -c 'clang '"$GEN_FLAGS"' -c {} -o "$(echo {} | sed "s/\.c$/.o/")"'
+    since
 fi
 for f in tests/m6/runner.c runtime/runtime.c hle/*.c gpu/*.c; do
     echo "$f"
@@ -75,3 +80,4 @@ done | xargs -P "$jobs" -I{} sh -c 'clang '"$OS_FLAGS"' -c {} -o '"$out"'/os_$(b
 echo "== linking $out/run"
 clang -pthread "$out"/gen*.o "$out"/cro/*.o "$out/modules.o" "$out"/os_*.o -lm -o "$out/run"
 echo "built $out/run"
+since

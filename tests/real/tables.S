@@ -15,6 +15,7 @@
 @                     as well), returning to the label
 @   movlt pc, rX      to a fixed address built from pc in two steps
 @   b label           after such calls return: a plain jump again
+@   add pc, rT, rO    after lr is built from pc in two steps: a call too
 
     .syntax unified
     .arm
@@ -31,6 +32,7 @@ _start:
     bl register_call
     bl const_jump
     bl cont_then_jump
+    bl two_step_call
     pop {r4, pc}
 
 add_table:
@@ -146,3 +148,19 @@ cont_then_jump:
 72: add r0, r0, #20
     bx lr
 73: pop {r4, pc}
+
+two_step_call:
+    push {r4, lr}
+    and r1, r1, #1
+80: add lr, pc, #0              @ lr = 80b + 8 ...
+    add lr, lr, #(81f - 80b - 8)    @ ... then the return point, in two steps
+    adr r2, 82f
+    ldr r3, [r2, r1, lsl #2]
+    add pc, r2, r3              @ a table call returning to 81
+81: add r0, r0, #2
+    pop {r4, pc}
+82: .word 83f - 82b, 84f - 82b
+83: add r0, r0, #30
+    bx lr
+84: sub r0, r0, #30
+    bx lr
