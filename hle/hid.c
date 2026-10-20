@@ -25,7 +25,7 @@
 
 #include "service.h"
 
-#define MAX_SCRIPT 32
+#define MAX_SCRIPT 256
 #define PAD_SECTION   0
 #define TOUCH_SECTION 42
 
@@ -39,8 +39,11 @@ static const char *input_path;
 
 static void script_add(Script *s, uint32_t frame, uint32_t value, uint32_t down)
 {
-    if (s->n < MAX_SCRIPT)
-        s->steps[s->n++] = (Step){ frame, value, down };
+    if (s->n == MAX_SCRIPT) {
+        fprintf(stderr, "hle: more than %d scripted input changes\n", MAX_SCRIPT);
+        exit(2);
+    }
+    s->steps[s->n++] = (Step){ frame, value, down };
 }
 
 /* The step in force at `frame`: the latest one that has started. */

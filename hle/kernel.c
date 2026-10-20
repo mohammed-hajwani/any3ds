@@ -49,6 +49,7 @@ typedef struct KThread {
 typedef struct { uint64_t due, period; TimerFn fn; void *arg; } Timer;
 
 int hle_trace;
+static uint32_t trace_from;     /* HLE_TRACE=N (N > 1): start tracing at frame N */
 
 static pthread_mutex_t big_lock = PTHREAD_MUTEX_INITIALIZER;
 static KThread *threads[MAX_THREADS];
@@ -265,6 +266,10 @@ static void vblank(void *arg)
 {
     (void)arg;
     frame_count++;
+    if (trace_from > 1 && frame_count == trace_from) {
+        hle_trace = 1;
+        fprintf(stderr, "hle: tracing from frame %" PRIu32 "\n", frame_count);
+    }
     gsp_vblank();
     hid_vblank(frame_count);
     gpu_frame(frame_count);
@@ -681,7 +686,9 @@ void hle_run(uint8_t *guest_mem, const HleConfig *cfg)
 {
     mem = guest_mem;
     config = *cfg;
-    hle_trace = getenv("HLE_TRACE") != NULL;
+    const char *trace = getenv("HLE_TRACE");
+    trace_from = trace ? (uint32_t)strtoul(trace, NULL, 0) : 0;
+    hle_trace = trace && trace_from <= 1;
     recomp_svc_handler = hle_svc;
     recomp_tick_handler = k_tick;
     config_mem_init(mem);

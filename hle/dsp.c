@@ -212,9 +212,16 @@ static void dsp_frame(void *arg)
         return;                         /* the app hasn't written a frame yet */
     uint32_t cur = (int16_t)(c1 - c0) > 0 ? REGION1 : REGION0, other = cur == REGION0 ? REGION1 : REGION0;
     for (int i = 0; i < NINPUTS; i++) {
+        /* The app may have written both regions since our last frame (the
+           official library runs its frame twice per DSP frame here), so the
+           older region's changes are applied too, before the current one's.
+           Applied changes have their dirty flags cleared, so nothing is
+           applied twice. */
+        configure(&inputs[i], at(other, OFF_INPUT_CONFIG + IC_SIZE * i));
         configure(&inputs[i], at(cur, OFF_INPUT_CONFIG + IC_SIZE * i));
         play(&inputs[i]);
         write_status(&inputs[i], at(other, OFF_INPUT_STATUS + 12 * i));
+        write_status(&inputs[i], at(cur, OFF_INPUT_STATUS + 12 * i));
     }
     memset(at(other, OFF_DSP_STATUS), 0, 0x20);                     /* no dropped frames */
     memset(at(other, OFF_OUTPUT), 0, FRAME_SAMPLES * 4);            /* silent (step 1) */
