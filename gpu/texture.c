@@ -135,8 +135,8 @@ void tex_unit_read(int unit, TexUnit *t)
     t->type = unit == 0 ? (int)(t->param >> 28 & 7) : 0;
     if (t->format > TEX_ETC1A4)
         gpu_fatal("texture unit %d format %" PRIu32, unit, t->format);
-    if (t->type != 0 && t->type != 1)
-        gpu_fatal("texture unit %d type %d (shadow/projection textures are not implemented yet)", unit, t->type);
+    if (t->type != 0 && t->type != 1 && t->type != 3)
+        gpu_fatal("texture unit %d type %d (shadow textures are not implemented yet)", unit, t->type);
     if (t->width && t->height       /* (0: never set up, frag_texture reads zero) */
             && (t->width < 8 || t->height < 8 || t->width % 8 || t->height % 8))
         gpu_fatal("texture unit %d is %" PRIu32 "x%" PRIu32 ", not a multiple of 8", unit, t->width, t->height);
@@ -232,6 +232,10 @@ Rgba tex_sample(const TexUnit *t, float u, float v, float w, float lod)
     int face = 0;
     if (t->type == 1)
         face = cube_face(u, v, w, &u, &v);
+    else if (t->type == 3 && w != 0) {  /* projection: (u, v) / w, as in projective texturing */
+        u /= w;
+        v /= w;
+    }
 
     /* Level of detail: base + bias, clamped to [min, max]; minification
        when it's above 0. */

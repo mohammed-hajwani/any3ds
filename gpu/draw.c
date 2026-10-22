@@ -8,12 +8,19 @@
  *  - Render targets are tiled 8x8 (see tile_index) and stored with the
  *    window's y = 0 in the last row: the GPU's origin is bottom-left.
  *  - The 3DS screens are rotated, so a 400x240 screen is a 240x400 render
- *    target; apps fold the rotation into their projection matrix. */
+ *    target; apps fold the rotation into their projection matrix.
+ *
+ * Rasterising is spread over threads (raster_flush), with the same result
+ * as one thread: each pixel is drawn by one thread, in triangle order. */
+#define _POSIX_C_SOURCE 200809L     /* sysconf */
+
 #include <inttypes.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "pica.h"
 #include "lighting.h"
@@ -299,7 +306,11 @@ static Color frag_texture(Frag *f, int unit)
 /* GPU_STATS=1: where triangles and pixels go, reported once a second
    (gpu_stats_report, from the vblank): drawn, clipped away, culled, and the
    fragments that fail the alpha, stencil or depth test or get written. */
-static struct { uint64_t tris, clipped, culled, frags, alpha, stencil, depth, written, unlit; } stats;
+typedef struct { uint64_t tris, clipped, culled, frags, alpha, stencil, depth, written, unlit; } Stats;
+static Stats stats;
+/* Rasterising runs on several threads (see raster_flush): each counts into
+   its own Stats, added to `stats` when its band is done. */
+static _Thread_local Stats *band_stats = &stats;
 
 /* Fragment lighting's primary (0) or secondary (1) colour. With lighting
    disabled (3dbrew doesn't say what the combiners then read), a unit that
@@ -312,7 +323,7 @@ static Color frag_light(Frag *f, int which)
             fprintf(stderr, "gpu: a colour combiner reads fragment lighting while it is disabled: reading zero\n");
         f->light[0] = f->light[1] = (Color){ 0, 0, 0, 0 };
         f->lit = 1;
-        stats.unlit++;
+        band_stats->unlit++;
     }
     if (!f->lit) {
         uint32_t c0 = pica.reg[0x1C3];
@@ -600,7 +611,7 @@ void gpu_stats_report(uint32_t frame)
 
 static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Frag *f)
 {
-    stats.frags++;
+    band_stats->frags++;
     /* Memory rows go top to bottom; the window's y = 0 is the bottom row. */
     uint32_t idx = tile_index(x, t->height - 1 - y, t->width);
 
@@ -610,7 +621,7 @@ static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Frag 
 
     uint32_t at = pica.reg[REG_ALPHA_TEST];
     if ((at & 1) && !test(at >> 4 & 7, (uint32_t)c.a, at >> 8 & 0xFF)) {
-        stats.alpha++;
+        band_stats->alpha++;
         return;
     }
 
@@ -631,14 +642,14 @@ static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Frag 
     int stencil_on = (st & 1) && t->depth_fmt == 3 && dp;
     uint32_t sref = st >> 16 & 0xFF, smask = st >> 24, swmask = st >> 8 & 0xFF, new_stencil = stencil;
     if (stencil_on && !test(st >> 4 & 7, sref & smask, stencil & smask)) {
-        stats.stencil++;
+        band_stats->stencil++;
         new_stencil = stencil_op(so & 7, stencil, sref);
         goto write_stencil;
     }
     uint32_t dcm = pica.reg[REG_DEPTH_COLOR_MASK];
     int depth_pass = !(dcm & 1) || !t->depth_read || test(dcm >> 4 & 7, z, old_z);
     if (!depth_pass) {
-        stats.depth++;
+        band_stats->depth++;
         if (stencil_on)
             new_stencil = stencil_op(so >> 4 & 7, stencil, sref);
         goto write_stencil;
@@ -652,7 +663,7 @@ static void fragment(const Target *t, uint32_t x, uint32_t y, float depth, Frag 
 
     /* blend / logic op, then the colour write mask */
     if (t->color && t->color_write) {
-        stats.written++;
+        band_stats->written++;
         uint8_t *cp = t->color + idx * (uint32_t)pixel_size(t->color_fmt);
         Rgba d8 = color_decode(cp, t->color_fmt);
         Color dst = { d8.r, d8.g, d8.b, d8.a }, out = c;
@@ -728,7 +739,12 @@ static void interpolate(const WinVertex *v0, const WinVertex *v1, const WinVerte
         out[k] = (b0 * v0->a[k] + b1 * v1->a[k] + b2 * v2->a[k]) / inv_w;
 }
 
-static void raster_triangle(const Target *t, const WinVertex *v0, const WinVertex *v1, const WinVertex *v2)
+/* Rows go to bands in stripes of 8: band b of n draws the rows whose stripe
+   number is b modulo n (all rows when n is 1). */
+#define BAND_ROWS 8
+
+static void raster_triangle(const Target *t, const WinVertex *v0, const WinVertex *v1, const WinVertex *v2,
+                            int band, int nbands)
 {
     float area = edge(v0->x, v0->y, v1->x, v1->y, v2->x, v2->y);
     if (area == 0)
@@ -737,7 +753,7 @@ static void raster_triangle(const Target *t, const WinVertex *v0, const WinVerte
     /* face culling: counter-clockwise (positive area, y up) is the front */
     uint32_t cull = pica.reg[REG_FACECULLING] & 3;
     if ((cull == 1 && area > 0) || (cull == 2 && area < 0)) {
-        stats.culled++;
+        band_stats->culled++;
         return;
     }
     if (area < 0) {                     /* make it counter-clockwise for the edge tests */
@@ -762,6 +778,10 @@ static void raster_triangle(const Target *t, const WinVertex *v0, const WinVerte
         tl2 = top_left(v0->x, v0->y, v1->x, v1->y);
     for (int y = y0; y < y1; y++)
         for (int x = x0; x < x1; x++) {
+            if (nbands > 1 && (y / BAND_ROWS) % nbands != band) {
+                x = x1;                 /* not this band's row */
+                continue;
+            }
             if (smode == 3 && (x < sx0 || x > sx1 || y < sy0 || y > sy1))
                 continue;
             if (smode == 1 && x >= sx0 && x <= sx1 && y >= sy0 && y <= sy1)
@@ -805,6 +825,127 @@ static void raster_triangle(const Target *t, const WinVertex *v0, const WinVerte
             f.lit = 0;
             fragment(t, (uint32_t)x, (uint32_t)y, z, &f);
         }
+}
+
+/* ---------------------------------------------------------------- parallel rasterising */
+
+/* Triangles in window space wait in a queue; raster_flush draws them,
+   before any register changes (pica_raster_flush is called from every
+   register write) so they all see the state they were drawn with. Each of
+   N bands (threads) walks the whole queue in order but draws only its own
+   rows, so every pixel gets exactly the single-threaded sequence of
+   writes. GPU_THREADS=N sets the number of bands (1: no extra threads). */
+typedef struct { Target t; WinVertex v[3]; } QueuedTri;
+
+static QueuedTri *queue;
+static size_t nqueue, queue_cap;
+static uint64_t queue_pixels;          /* bounding-box area: small batches stay on this thread */
+static int nbands = 0;                  /* 0: not set up yet */
+
+static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pool_go = PTHREAD_COND_INITIALIZER, pool_idle = PTHREAD_COND_INITIALIZER;
+static uint64_t pool_gen;
+static int pool_done;
+
+static void stats_add(const Stats *s)
+{
+    stats.culled += s->culled;
+    stats.frags += s->frags;
+    stats.alpha += s->alpha;
+    stats.stencil += s->stencil;
+    stats.depth += s->depth;
+    stats.written += s->written;
+    stats.unlit += s->unlit;
+}
+
+static void raster_band(int band, Stats *s)
+{
+    band_stats = s;
+    for (size_t i = 0; i < nqueue; i++)
+        raster_triangle(&queue[i].t, &queue[i].v[0], &queue[i].v[1], &queue[i].v[2], band, nbands);
+    band_stats = &stats;
+}
+
+static void *raster_worker(void *arg)
+{
+    int band = (int)(intptr_t)arg;
+    uint64_t seen = 0;
+    pthread_mutex_lock(&pool_lock);
+    for (;;) {
+        while (pool_gen == seen)
+            pthread_cond_wait(&pool_go, &pool_lock);
+        seen = pool_gen;
+        pthread_mutex_unlock(&pool_lock);
+        Stats s = { 0 };
+        raster_band(band, &s);
+        pthread_mutex_lock(&pool_lock);
+        stats_add(&s);
+        if (++pool_done == nbands - 1)
+            pthread_cond_signal(&pool_idle);
+    }
+    return NULL;
+}
+
+static void pool_start(void)
+{
+    const char *env = getenv("GPU_THREADS");
+    long n = env ? strtol(env, NULL, 0) : sysconf(_SC_NPROCESSORS_ONLN);
+    nbands = n < 1 ? 1 : n > 16 ? 16 : (int)n;
+    for (int b = 1; b < nbands; b++) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, raster_worker, (void *)(intptr_t)b) != 0)
+            gpu_fatal("cannot start a rasterising thread");
+        pthread_detach(th);
+    }
+}
+
+void pica_raster_flush(void)
+{
+    if (!nqueue)
+        return;
+    if (!nbands)
+        pool_start();
+    if (nbands == 1 || queue_pixels < 16384) {
+        int all = nbands;               /* one band covering every row */
+        nbands = 1;
+        Stats s = { 0 };
+        raster_band(0, &s);
+        stats_add(&s);
+        nbands = all;
+    } else {
+        pthread_mutex_lock(&pool_lock);
+        pool_done = 0;
+        pool_gen++;
+        pthread_cond_broadcast(&pool_go);
+        pthread_mutex_unlock(&pool_lock);
+        Stats s = { 0 };
+        raster_band(0, &s);             /* this thread takes band 0 */
+        pthread_mutex_lock(&pool_lock);
+        stats_add(&s);
+        while (pool_done < nbands - 1)
+            pthread_cond_wait(&pool_idle, &pool_lock);
+        pthread_mutex_unlock(&pool_lock);
+    }
+    nqueue = 0;
+    queue_pixels = 0;
+}
+
+static void raster_queue(const Target *t, const WinVertex *a, const WinVertex *b, const WinVertex *c)
+{
+    if (nqueue == queue_cap) {
+        queue_cap = queue_cap ? 2 * queue_cap : 1024;
+        queue = realloc(queue, queue_cap * sizeof *queue);
+        if (!queue)
+            gpu_fatal("out of memory for the triangle queue");
+    }
+    QueuedTri *q = &queue[nqueue++];
+    q->t = *t;
+    q->v[0] = *a;
+    q->v[1] = *b;
+    q->v[2] = *c;
+    float w = fmaxf(a->x, fmaxf(b->x, c->x)) - fminf(a->x, fminf(b->x, c->x));
+    float h = fmaxf(a->y, fmaxf(b->y, c->y)) - fminf(a->y, fminf(b->y, c->y));
+    queue_pixels += (uint64_t)(fminf(w, 1024) * fminf(h, 1024));
 }
 
 static int32_t sign10(uint32_t v)       /* a signed 10-bit field */
@@ -851,7 +992,7 @@ static void draw_triangle(const Vertex *a, const Vertex *b, const Vertex *c)
             win[i].a[k] = p->v.a[k] * inv_w;
     }
     for (int i = 1; i + 1 < n; i++)     /* the clipped polygon is convex: a fan */
-        raster_triangle(&t, &win[0], &win[i], &win[i + 1]);
+        raster_queue(&t, &win[0], &win[i], &win[i + 1]);
 }
 
 /* ---------------------------------------------------------------- geometry shaders */

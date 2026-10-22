@@ -105,6 +105,7 @@ static int reg_write(uint32_t id, uint32_t value, uint32_t mask)
 {
     if (id >= PICA_REGS)
         gpu_fatal("command list writes register %03" PRIx32 ", which doesn't exist", id);
+    pica_raster_flush();                /* queued triangles see the state they were drawn with */
     pica.reg[id] = (pica.reg[id] & ~mask) | (value & mask);
     value = pica.reg[id];
     if (gpu_trace) {
@@ -187,7 +188,7 @@ static uint32_t byte_mask(uint32_t bits)
     return mask;
 }
 
-void pica_run_command_list(uint32_t addr, uint32_t size)
+static void run_list(uint32_t addr, uint32_t size)
 {
     if (gpu_trace)
         fprintf(stderr, "    GX ProcessCommandList %08" PRIx32 ", %" PRIu32 " bytes\n", addr, size);
@@ -217,10 +218,16 @@ void pica_run_command_list(uint32_t addr, uint32_t size)
             uint32_t bytes = (pica.reg[REG_CMDBUF_SIZE0 + b] & 0x1FFFFF) << 3;
             if (!target)
                 gpu_fatal("command buffer jump to physical %08" PRIx32, pica.reg[REG_CMDBUF_ADDR0 + b] << 3);
-            pica_run_command_list(target, bytes);
+            run_list(target, bytes);
             return;
         }
         i += 2 + extra;
         i += i & 1;                 /* commands are padded to 8 bytes */
     }
+}
+
+void pica_run_command_list(uint32_t addr, uint32_t size)
+{
+    run_list(addr, size);
+    pica_raster_flush();                /* the list's last triangles */
 }

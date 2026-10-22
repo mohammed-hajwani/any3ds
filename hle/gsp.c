@@ -186,6 +186,7 @@ void gsp_handle(KObj *session, uint32_t *cmd)
     case 0x02:      /* WriteHWRegsWithMask */
     case 0x08:      /* FlushDataCache: host memory is coherent */
     case 0x09:      /* InvalidateDataCache */
+    case 0x10:      /* SetAxiConfigQoSMode(mode): memory bus priorities, nothing to model */
     case 0x14:      /* UnregisterInterruptRelayQueue */
     case 0x16:      /* AcquireRight */
     case 0x17:      /* ReleaseRight */

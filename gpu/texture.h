@@ -9,7 +9,7 @@
 typedef struct {
     uint32_t addr[6];               /* physical; [1..5] are the other cube faces */
     uint32_t width, height, format, param, lod, border;
-    int type;                       /* 0 = 2D, 1 = cube map */
+    int type;                       /* 0 = 2D, 1 = cube map, 3 = projection */
 } TexUnit;
 
 /* Read texture unit 0, 1 or 2's registers. */

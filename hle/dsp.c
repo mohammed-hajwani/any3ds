@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gpu.h"
 #include "service.h"
 
 #define REGION0         0x1FF50000u
@@ -228,24 +229,62 @@ static void dsp_frame(void *arg)
     raise_pipe_interrupt();
 }
 
+/* The AAC decoder (codec 1). 3dbrew doesn't document its messages, so this
+ * layout is read from the client in Pokémon X (0x2c8504 init, 0x2c8a0c
+ * decode, 0x2c8e98 reply): requests are u16 codec, u16 command, u32
+ * result, then arguments; replies echo the request with the result and,
+ * for a decode, u32 sample-rate index (into 48000, 44100, 32000, 24000,
+ * 22050, 16000, 12000, 11025, 8000) at +8, u32 channels at +12, u32 bytes
+ * of input consumed at +16.
+ *   0 init      (four arguments, unused here)
+ *   1 decode    +8 input address, +12 size (one ADTS frame), +16 / +20 the
+ *               left and right outputs (1024 16-bit samples each), all physical
+ *   2 shutdown, others: acknowledged
+ * We decode to silence: the frame's ADTS header (ISO 14496-3, a public
+ * format) gives its length, rate and channels, which is all the game reads.
+ * No sound comes out yet anyway. */
+#define CODEC_AAC        1
+#define AAC_SAMPLES      1024
+
+static uint32_t aac_request(const uint8_t *req, uint8_t *reply)
+{
+    if (r16(req + 2) != 1)
+        return 0;
+    uint32_t src = gpu_phys_to_virt(r32(req + 8)), size = r32(req + 12);
+    if (!src || size < 7)
+        return 1;
+    const uint8_t *h = kernel_mem() + src;
+    if (h[0] != 0xFF || (h[1] & 0xF0) != 0xF0)     /* ADTS sync word */
+        return 1;
+    uint32_t rate = (h[2] >> 2) & 0xF, channels = ((h[2] & 1) << 2) | (h[3] >> 6);
+    uint32_t length = ((uint32_t)(h[3] & 3) << 11) | (uint32_t)h[4] << 3 | h[5] >> 5;
+    if (rate < 3 || rate > 11 || !channels || length > size)
+        return 1;
+    for (int ch = 0; ch < 2; ch++) {
+        uint32_t out = gpu_phys_to_virt(r32(req + 16 + 4 * ch));
+        if (out)
+            memset(kernel_mem() + out, 0, AAC_SAMPLES * 2);
+    }
+    w32(reply + 8, rate - 3);           /* ADTS index 3 is 48000 Hz */
+    w32(reply + 12, channels);
+    w32(reply + 16, length);
+    return 0;
+}
+
 /* WriteProcessPipe on the binary pipe: a request for one of the DSP's
    codecs (3dbrew: DSP:WriteProcessPipe; u16 codec, u16 command, u32
-   result, 24 bytes of arguments, not documented further). Our DSP has no
-   codecs: it answers each request with the same message, result 1
-   ("failed"), on the same pipe, and raises its interrupt. An app is left
-   to go on without (a movie without its soundtrack, say). */
+   result, 24 bytes of arguments). The reply goes on the same pipe, with
+   the interrupt. Other codecs answer result 1 ("failed"): an app is left to
+   go on without (a movie without its soundtrack, say). */
 static void binary_pipe_request(const uint8_t *req, uint32_t size)
 {
-    static int told;
     if (size < 8 || binary_len + size > sizeof binary) {
         fprintf(stderr, "hle: DSP binary pipe: a %" PRIu32 "-byte request is not modelled\n", size);
         exit(3);
     }
-    if (!told++)
-        fprintf(stderr, "hle: DSP codec %u command %u: no codecs here, answering \"failed\"\n",
-                r16(req), r16(req + 2));
-    memcpy(binary + binary_len, req, size);
-    w32(binary + binary_len + 4, 1);
+    uint8_t *reply = binary + binary_len;
+    memcpy(reply, req, size);
+    w32(reply + 4, r16(req) == CODEC_AAC ? aac_request(req, reply) : 1);
     binary_len += size;
     if (binary_event)
         kevent_signal(binary_event);

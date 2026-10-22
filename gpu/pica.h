@@ -109,6 +109,7 @@ float reg_f24(uint32_t id);
 
 /* Draw: triggered by GPUREG_DRAWARRAYS / DRAWELEMENTS (draw.c). */
 void pica_draw(int indexed);
+void pica_raster_flush(void);    /* draw the queued triangles (draw.c) */
 void pica_immediate_vertex(const Vec4 *attribs);   /* one immediate-mode vertex is complete */
 void pica_restart_primitive(void);
 

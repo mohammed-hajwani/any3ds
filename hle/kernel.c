@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "gpu.h"
 #include "kernel.h"
@@ -262,10 +263,35 @@ void kernel_add_timer(uint64_t period, TimerFn fn, void *arg)
     timers[ntimers++] = (Timer){ now_ticks + period, period, fn, arg };
 }
 
+/* --speed N: hold each vblank back until the real clock has caught up
+   with the virtual one (divided by N). Only waits, never skips: a run
+   that can't keep up just runs slower. */
+static void pace(void)
+{
+    static struct timespec start;
+    static uint64_t start_ticks;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!start.tv_sec && !start.tv_nsec) {
+        start = now;
+        start_ticks = now_ticks;
+        return;
+    }
+    double due = (double)(now_ticks - start_ticks) / (double)TICKS_PER_SEC / config.speed;
+    double real = (double)(now.tv_sec - start.tv_sec) + (double)(now.tv_nsec - start.tv_nsec) / 1e9;
+    if (due > real) {
+        double wait = due - real;
+        struct timespec ts = { (time_t)wait, (long)((wait - (double)(time_t)wait) * 1e9) };
+        nanosleep(&ts, NULL);
+    }
+}
+
 static void vblank(void *arg)
 {
     (void)arg;
     frame_count++;
+    if (config.speed)
+        pace();
     if (trace_from > 1 && frame_count == trace_from) {
         hle_trace = 1;
         fprintf(stderr, "hle: tracing from frame %" PRIu32 "\n", frame_count);

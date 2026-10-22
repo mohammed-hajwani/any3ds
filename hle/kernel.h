@@ -99,6 +99,7 @@ typedef struct {
     void   (*on_exit)(void);        /* e.g. dump the framebuffer */
     const char *live_path;          /* if set: the screens are saved here every live_every frames */
     uint32_t live_every;
+    uint32_t speed;                 /* 0: as fast as possible; N: N times the 3DS's own speed */
 } HleConfig;
 void hle_run(uint8_t *mem, const HleConfig *config) __attribute__((noreturn));
 

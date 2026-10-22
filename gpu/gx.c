@@ -102,13 +102,24 @@ void gx_memory_fill(uint32_t start, uint32_t value, uint32_t end, uint32_t contr
 void gx_display_transfer(uint32_t in, uint32_t out, uint32_t in_dim, uint32_t out_dim, uint32_t flags)
 {
     uint32_t in_w = in_dim & 0xFFFF, in_h = in_dim >> 16, out_w = out_dim & 0xFFFF, out_h = out_dim >> 16;
-    int flip = flags & 1, to_tiled = flags >> 1 & 1, in_fmt = flags >> 8 & 7, out_fmt = flags >> 12 & 7;
+    /* 3dbrew's flags: bit 1 linear -> tiled, bit 5 tiled -> tiled (both
+       override the default tiled -> linear), bit 16 32x32 blocks. */
+    int flip = flags & 1, tiled_to_tiled = flags >> 5 & 1, to_tiled = (flags >> 1 & 1) && !tiled_to_tiled;
+    int in_fmt = flags >> 8 & 7, out_fmt = flags >> 12 & 7;
     uint32_t scale = flags >> 24 & 3;
     if (flags & 8)
         gpu_fatal("DisplayTransfer raw-copy mode (flags %08" PRIx32 ")", flags);
+    if (flags & 0x10000)
+        gpu_fatal("DisplayTransfer with 32x32 block tiling (flags %08" PRIx32 ")", flags);
     if (scale == 3 || !pixel_size(in_fmt) || !pixel_size(out_fmt))
         gpu_fatal("DisplayTransfer flags %08" PRIx32, flags);
     uint32_t sx = scale ? 2 : 1, sy = scale == 2 ? 2 : 1;      /* input pixels per output pixel */
+    if (scale && out_w == in_w && out_h == in_h) {
+        /* 3dbrew: with a downscale, the input and output dimensions are
+           given the same; the output is the input divided by the scale. */
+        out_w /= sx;
+        out_h /= sy;
+    }
     if (out_w * sx > in_w || out_h * sy > in_h || in_w % 8 || in_h % 8)
         gpu_fatal("DisplayTransfer %" PRIu32 "x%" PRIu32 " -> %" PRIu32 "x%" PRIu32 " (flags %08" PRIx32 ")",
                   in_w, in_h, out_w, out_h, flags);
@@ -129,7 +140,7 @@ void gx_display_transfer(uint32_t in, uint32_t out, uint32_t in_dim, uint32_t ou
                 }
             uint32_t n = sx * sy, ty = flip ? out_h - 1 - oy : oy;
             Rgba c = { (uint8_t)(sum[0] / n), (uint8_t)(sum[1] / n), (uint8_t)(sum[2] / n), (uint8_t)(sum[3] / n) };
-            uint32_t o = to_tiled ? tile_index(ox, ty, out_w) : ty * out_w + ox;
+            uint32_t o = to_tiled || tiled_to_tiled ? tile_index(ox, ty, out_w) : ty * out_w + ox;
             color_encode(dst + o * (uint32_t)out_bpp, out_fmt, c);
         }
     if (gpu_trace)

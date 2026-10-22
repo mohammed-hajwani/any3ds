@@ -2,7 +2,7 @@
  *
  *   runner [--max-seconds N] [--hold FRAME:KEYS]... [--touch FRAME:X,Y|FRAME:up]...
  *          [--sdmc DIR] [--save DIR] [--romfs FILE] [--shared-font FILE] [--dump FILE.bmp]
- *          [--live FILE.bmp] [--input FILE]
+ *          [--live FILE.bmp] [--input FILE] [--speed N]
  *
  * --hold presses buttons from a frame on (KEYS in hex, libctru's KEY_*
  * bits; 0 releases them), e.g. --hold 10:8 holds START from frame 10.
@@ -17,6 +17,8 @@
  * buttons live from FILE every frame: the held keys in hex, then
  * optionally "X Y" to touch the bottom screen (tools/live_server.py writes
  * it from the buttons on that page).
+ * --speed N paces the run against the real clock: 1 is the 3DS's own
+ * speed (to play), 2 twice that; 0 (the default) runs as fast as it can.
  * --dump saves the last frame shown when the program exits: the top
  * screen above the bottom one. Guest debug output (svcOutputDebugString) goes to stdout; the
  * OS layer's log goes to stderr (HLE_TRACE=1 logs every svc and IPC). */
@@ -82,6 +84,8 @@ int main(int argc, char **argv)
                 fprintf(stderr, "runner: can't read a RomFS from %s\n", argv[i]);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--speed") == 0) {
+            config.speed = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--live") == 0) {
             config.live_path = argv[++i];
             config.live_every = 30;
