@@ -10,7 +10,9 @@
 
 static uint8_t *mem;
 int gpu_trace;
+int gpu_skip_draws;
 static uint32_t trace_from;     /* GPU_TRACE=N (N > 1): start tracing at frame N */
+static uint32_t skip_until;     /* GPU_SKIP_UNTIL=N: draw nothing before frame N */
 
 void gpu_init(uint8_t *guest_mem)
 {
@@ -18,6 +20,9 @@ void gpu_init(uint8_t *guest_mem)
     const char *t = getenv("GPU_TRACE");
     trace_from = t ? (uint32_t)strtoul(t, NULL, 0) : 0;
     gpu_trace = t && trace_from <= 1;
+    const char *s = getenv("GPU_SKIP_UNTIL");
+    skip_until = s ? (uint32_t)strtoul(s, NULL, 0) : 0;
+    gpu_skip_draws = skip_until > 0;
 }
 
 void gpu_frame(uint32_t frame)
@@ -25,6 +30,10 @@ void gpu_frame(uint32_t frame)
     if (trace_from > 1 && frame == trace_from) {
         gpu_trace = 1;
         fprintf(stderr, "gpu: tracing from frame %" PRIu32 "\n", frame);
+    }
+    if (gpu_skip_draws && frame >= skip_until) {
+        gpu_skip_draws = 0;
+        fprintf(stderr, "gpu: drawing from frame %" PRIu32 "\n", frame);
     }
     gpu_stats_report(frame);
 }
@@ -73,10 +82,18 @@ void gx_memory_fill(uint32_t start, uint32_t value, uint32_t end, uint32_t contr
     uint32_t unit = (control >> 8 & 3) == 0 ? 2 : (control >> 8 & 3) == 1 ? 3 : 4;
     if (end < start)
         gpu_fatal("MemoryFill from %08" PRIx32 " to %08" PRIx32, start, end);
-    uint8_t *p = gpu_mem(start, end - start);
+    uint32_t size = end - start;
+    uint8_t *p = gpu_mem(start, size);
     uint8_t bytes[4] = { (uint8_t)value, (uint8_t)(value >> 8), (uint8_t)(value >> 16), (uint8_t)(value >> 24) };
-    for (uint32_t i = 0; i < end - start; i++)
-        p[i] = bytes[i % unit];
+    /* One unit, then copy what is filled onto the rest, doubling each time
+       (a byte loop with `i % unit` was a fifth of a whole game's run time). */
+    uint32_t done = unit < size ? unit : size;
+    memcpy(p, bytes, done);
+    while (done < size) {
+        uint32_t n = done < size - done ? done : size - done;
+        memcpy(p + done, p, n);
+        done += n;
+    }
     if (gpu_trace)
         fprintf(stderr, "    GX MemoryFill %08" PRIx32 "..%08" PRIx32 " with %08" PRIx32 " (%" PRIu32 "-bit)\n",
                 start, end, value, unit * 8);

@@ -18,10 +18,13 @@
  * live from a file (hid_input_file), read every frame: the held keys in
  * hex, then optionally "X Y" for a touch on the bottom screen.
  * tools/live_server.py writes that file from buttons in tools/live.html. */
+#define _POSIX_C_SOURCE 199309L     /* clock_gettime */
+
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "service.h"
 
@@ -75,12 +78,23 @@ void hid_input_file(const char *path)
    ones, and its touch (if any) wins. A missing file means nothing held. */
 static void read_input_file(uint32_t *keys, uint32_t *touch)
 {
-    FILE *f = fopen(input_path, "r");
-    if (!f)
-        return;
-    unsigned k, x, y;
-    int n = fscanf(f, "%x %u %u", &k, &x, &y);
-    fclose(f);
+    /* Read at most every 30 ms of real time (presses from the live view
+       last at least 350 ms): opening a file on the Windows side from WSL
+       every frame took a sixth of the run time. */
+    static struct timespec last;
+    static unsigned k, x, y;
+    static int n;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if ((now.tv_sec - last.tv_sec) * 1000000000L + (now.tv_nsec - last.tv_nsec) >= 30000000L) {
+        last = now;
+        n = 0;
+        FILE *f = fopen(input_path, "r");
+        if (f) {
+            n = fscanf(f, "%x %u %u", &k, &x, &y);
+            fclose(f);
+        }
+    }
     if (n >= 1)
         *keys |= k;
     if (n == 3 && x < 320 && y < 240) {

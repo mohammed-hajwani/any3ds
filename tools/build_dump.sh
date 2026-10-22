@@ -62,15 +62,18 @@ else
     } > "$out/modules.c"
 fi
 
-# Generated code: unoptimised and without sanitizers, or a big game takes
-# hours to compile. The OS layer is optimised a little: it runs every frame.
-GEN_FLAGS="-std=c11 -O0 -g0 -w -fno-math-errno -Iruntime"
+# Generated code: -O1 without sanitizers. Pokémon X runs about 7x faster
+# than at -O0 (near the 3DS's own 60 frames a second) and compiles in about
+# 4 minutes, 8 files at a time: the biggest files are over 100 MB of C and
+# need gigabytes each. The OS layer is optimised a little: it runs every frame.
+GEN_FLAGS="-std=c11 -O1 -g0 -w -fno-math-errno -Iruntime"
+gen_jobs=$(( jobs < 8 ? jobs : 8 ))
 OS_FLAGS="-std=c11 -O1 -g -Wall -Wextra -fno-math-errno -Iruntime -Ihle -Igpu -pthread"
 
 if [ "${OS_ONLY:-0}" != 1 ] || [ ! -f "$out/gen.o" ]; then
-    echo "== compiling $(ls "$out"/gen*.c "$out"/cro/*.c "$out/modules.c" 2>/dev/null | wc -l) C files with $jobs jobs"
+    echo "== compiling $(ls "$out"/gen*.c "$out"/cro/*.c "$out/modules.c" 2>/dev/null | wc -l) C files with $gen_jobs jobs"
     ls "$out"/gen*.c "$out"/cro/*.c "$out/modules.c" 2>/dev/null \
-        | xargs -P "$jobs" -I{} sh -c 'clang '"$GEN_FLAGS"' -c {} -o "$(echo {} | sed "s/\.c$/.o/")"'
+        | xargs -P "$gen_jobs" -I{} sh -c 'clang '"$GEN_FLAGS"' -c {} -o "$(echo {} | sed "s/\.c$/.o/")"'
     since
 fi
 for f in tests/m6/runner.c runtime/runtime.c hle/*.c gpu/*.c; do

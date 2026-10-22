@@ -30,7 +30,12 @@ void gpu_fatal(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 
 extern int gpu_trace;       /* GPU_TRACE=1: log every GX command and register write
                                (GPU_TRACE=N: from frame N on) */
 
-/* Each vblank: starts a GPU_TRACE=N trace, and reports GPU_STATS. */
+/* GPU_SKIP_UNTIL=N: fast-forward to frame N without drawing (draw calls
+   are accepted and do nothing; everything else runs as usual). */
+extern int gpu_skip_draws;
+
+/* Each vblank: starts a GPU_TRACE=N trace, ends GPU_SKIP_UNTIL, and
+   reports GPU_STATS. */
 void gpu_frame(uint32_t frame);
 
 /* ---- Pixels ---- */

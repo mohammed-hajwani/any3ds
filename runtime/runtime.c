@@ -66,6 +66,18 @@ __attribute__((weak)) const RecompModule *const *recomp_module_table(void)
 static struct { const RecompModule *m; uint32_t base, size; } attached[MAX_ATTACHED];
 static int nattached;
 
+/* recomp_find's answers, by address: indirect calls go to the same few
+   targets over and over, and the binary searches behind a miss were a sixth
+   of a game's run time. Cleared when modules come or go. Only one guest
+   thread runs at a time, so no locking. */
+#define FIND_CACHE 4096
+static struct { uint32_t addr; GuestFn fn; } find_cache[FIND_CACHE];
+
+static void find_cache_clear(void)
+{
+    memset(find_cache, 0, sizeof find_cache);
+}
+
 const RecompModule *recomp_module_named(const char *name)
 {
     const RecompModule *const *mods = recomp_module_table();
@@ -83,6 +95,7 @@ void recomp_module_attach(const RecompModule *m, uint32_t base, uint32_t size)
         abort();
     }
     *m->base = base;
+    find_cache_clear();
     attached[nattached].m = m;
     attached[nattached].base = base;
     attached[nattached].size = size;
@@ -94,6 +107,7 @@ void recomp_module_detach(const RecompModule *m)
     for (int i = 0; i < nattached; i++)
         if (attached[i].m == m) {
             attached[i] = attached[--nattached];
+            find_cache_clear();
             return;
         }
 }
@@ -106,7 +120,22 @@ __attribute__((weak)) GuestFn recomp_find_static(uint32_t addr)
     return NULL;
 }
 
+static GuestFn find_uncached(uint32_t addr);
+
 GuestFn recomp_find(uint32_t addr)
+{
+    uint32_t slot = (addr ^ addr >> 12) & (FIND_CACHE - 1);
+    if (find_cache[slot].fn && find_cache[slot].addr == addr)
+        return find_cache[slot].fn;
+    GuestFn fn = find_uncached(addr);
+    if (fn) {
+        find_cache[slot].addr = addr;
+        find_cache[slot].fn = fn;
+    }
+    return fn;
+}
+
+static GuestFn find_uncached(uint32_t addr)
 {
     GuestFn fn = recomp_find_static(addr);
     if (fn)

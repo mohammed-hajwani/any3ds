@@ -1050,6 +1050,8 @@ static void assemble(const Vertex *v)
 
 void pica_draw(int indexed)
 {
+    if (gpu_skip_draws)
+        return;
     check_unsupported();
     int gs = geometry_shader_on();
     gs_inputs = 0;
@@ -1098,6 +1100,8 @@ void pica_draw(int indexed)
 
 void pica_immediate_vertex(const Vec4 *attribs)
 {
+    if (gpu_skip_draws)
+        return;
     check_unsupported();
     Vec4 attr[12];
     memcpy(attr, attribs, sizeof attr);
