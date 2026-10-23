@@ -269,6 +269,19 @@ static Color unpack_color(uint32_t v)
 
 static int clamp255(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
 
+/* What a combiner reads from a texture unit or fragment lighting that is
+   off: zero, a guess (3dbrew doesn't say). GPU_UNSET=white reads white
+   instead, to compare the two on a scene. */
+static Color unset_color(void)
+{
+    static int white = -1;
+    if (white < 0) {
+        const char *e = getenv("GPU_UNSET");
+        white = e && strcmp(e, "white") == 0;
+    }
+    return white ? (Color){ 255, 255, 255, 255 } : (Color){ 0, 0, 0, 0 };
+}
+
 /* Sample texture unit `unit` for this fragment (once). */
 static Color frag_texture(Frag *f, int unit)
 {
@@ -287,7 +300,7 @@ static Color frag_texture(Frag *f, int unit)
             fprintf(stderr, "gpu: a colour combiner reads texture %d, which is %s %" PRIu32 "x%" PRIu32
                     " (address %08" PRIx32 "): reading zero\n", unit,
                     config >> unit & 1 ? "enabled," : "disabled,", t.width, t.height, t.addr[0]);
-        f->tex[unit] = (Color){ 0, 0, 0, 0 };
+        f->tex[unit] = unset_color();
         f->sampled |= 1 << unit;
         return f->tex[unit];
     }
@@ -321,7 +334,7 @@ static Color frag_light(Frag *f, int which)
         static int told;
         if (!told++)
             fprintf(stderr, "gpu: a colour combiner reads fragment lighting while it is disabled: reading zero\n");
-        f->light[0] = f->light[1] = (Color){ 0, 0, 0, 0 };
+        f->light[0] = f->light[1] = unset_color();
         f->lit = 1;
         band_stats->unlit++;
     }

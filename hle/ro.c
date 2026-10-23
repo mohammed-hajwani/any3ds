@@ -10,7 +10,10 @@
  *   - internal patches (its own pointers) are applied;
  *   - imports are resolved against the exports of the main program
  *     (static.crs, given to Initialize) and of every loaded module, and
- *     modules loaded earlier that import from this one get patched too.
+ *     modules loaded earlier that import from this one get patched too;
+ *   - the fixed-up .data goes back into the file's own .data, whose
+ *     address header 0xB8 then holds: the game copies it from there into
+ *     its .data buffer itself, after LoadCRO (Pokémon X's 0x1e730c).
  * The module's code was recompiled ahead of time relative to its load
  * address (recomp --cro); we attach it at the base, so its functions run
  * and recomp_find finds them. A module we have no recompiled code for is a
@@ -40,6 +43,8 @@ typedef struct {
     uint32_t seg_addr[16];      /* where each segment is */
     uint32_t seg_size[16];
     int nsegs;
+    int data_seg;               /* the .data segment's index, or -1 */
+    uint32_t data_in_file;      /* where .data sits in the mapped file */
     const RecompModule *code;   /* its recompiled code */
     uint8_t *pristine;          /* the file as the game gave it, to hand back on unload */
 } Loaded;
@@ -168,7 +173,7 @@ static void link_imports(const Loaded *importer, const Loaded *only)
 
 /* Header tables hold file offsets; after loading they are addresses. */
 static const uint32_t table_fields[] = {
-    0x84, 0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8, 0x100, 0x108, 0x110, 0x118, 0x120, 0x128, 0x130,
+    0x84, 0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8, 0x100, 0x108, 0x110, 0x118, 0x120, 0x128, 0x130,
 };
 
 static void rebase_offsets(Loaded *m)
@@ -204,6 +209,7 @@ static void read_segments(Loaded *m, uint32_t data_buf, uint32_t bss_buf)
 {
     uint32_t table = m->base + hdr(m, 0xC8);        /* (before rebase_offsets: still an offset) */
     m->nsegs = (int)hdr(m, 0xCC);
+    m->data_seg = -1;
     if (m->nsegs > 16) {
         fprintf(stderr, "hle: RO: %s: %d segments\n", m->name, m->nsegs);
         exit(3);
@@ -215,6 +221,8 @@ static void read_segments(Loaded *m, uint32_t data_buf, uint32_t bss_buf)
             addr = off;                         /* the CRS describes the main program: addresses */
         else if (kind == SEG_DATA) {
             addr = data_buf;
+            m->data_seg = i;
+            m->data_in_file = m->base + off;
             memcpy(g(data_buf), g(m->base + off), size);
         } else if (kind == SEG_BSS) {
             addr = bss_buf;
@@ -318,7 +326,13 @@ void ro_handle(KObj *session, uint32_t *cmd)
                 if (mods[i].used && &mods[i] != m)
                     link_imports(&mods[i], m);
         }
+        if (m->data_seg >= 0 && m->seg_size[m->data_seg])  /* what the game copies to its buffer */
+            memcpy(g(m->data_in_file), g(m->seg_addr[m->data_seg]), m->seg_size[m->data_seg]);
         fprintf(stderr, "hle: RO loaded module %s at %08" PRIx32 " (%" PRIu32 " bytes)\n", m->name, mapped, size);
+        if (getenv("RO_TRACE"))
+            fprintf(stderr, "    from %08" PRIx32 ", data %08" PRIx32 " (%" PRIu32 " bytes asked, %" PRIu32 " in the CRO),"
+                    " bss %08" PRIx32 " (%" PRIu32 " asked)\n", input, data_buf, cmd[6],
+                    m->nsegs > 2 ? m->seg_size[2] : 0, bss_buf, cmd[8]);
         cmd[0] = ipc_header(id, 2, 0);
         cmd[1] = RES_OK;
         cmd[2] = size;

@@ -5,6 +5,7 @@
  * are logged once each, so a run shows which ones an app relies on. */
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "service.h"
@@ -43,7 +44,10 @@ static void read_block(uint32_t id, uint8_t *out, uint32_t size)
            [2], [3] the top screen's width and height (mm: 3.53" diagonal, 5:3),
            [4] a default camera separation (mm; only used with the 3D slider up).
            [3] is a divisor, so zeros make every 3D vertex NaN. */
-        static const float stereo[8] = { 62.0f, 300.0f, 76.9f, 46.1f, 10.0f };
+        float stereo[8] = { 62.0f, 300.0f, 76.9f, 46.1f, 10.0f };
+        const char *e = getenv("CFG_STEREO");   /* experiments: "a,b,c,d,e" */
+        if (e)
+            sscanf(e, "%f,%f,%f,%f,%f", &stereo[0], &stereo[1], &stereo[2], &stereo[3], &stereo[4]);
         memcpy(out, stereo, size < sizeof stereo ? size : sizeof stereo);
         return;
     }
