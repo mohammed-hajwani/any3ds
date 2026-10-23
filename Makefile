@@ -344,6 +344,9 @@ out/gpu/%.shbin: tests/gpu/%.v.pica | out/gpu
 test-gpu: out/gpu/test_gpu out/gpu/shader_test.shbin out/gpu/passthrough.shbin
 	@echo '=== GPU: unit tests (tests/gpu/test_gpu.c) ==='
 	@./out/gpu/test_gpu out/gpu/shader_test.shbin out/gpu/passthrough.shbin
+	@echo '    again, every draw shading its vertices on all threads, then on one thread:'
+	@GPU_PARALLEL_MIN=1 ./out/gpu/test_gpu out/gpu/shader_test.shbin out/gpu/passthrough.shbin
+	@GPU_THREADS=1 ./out/gpu/test_gpu out/gpu/shader_test.shbin out/gpu/passthrough.shbin
 
 # ---------------------------------------------------------------- M6
 #

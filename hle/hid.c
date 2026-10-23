@@ -28,7 +28,7 @@
 
 #include "service.h"
 
-#define MAX_SCRIPT 256
+#define MAX_SCRIPT 4096
 #define PAD_SECTION   0
 #define TOUCH_SECTION 42
 

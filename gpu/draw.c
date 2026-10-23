@@ -756,6 +756,23 @@ static void interpolate(const WinVertex *v0, const WinVertex *v1, const WinVerte
    number is b modulo n (all rows when n is 1). */
 #define BAND_ROWS 8
 
+/* interpolate() for the texture coordinates only (sets 0-2, u and v each),
+   the same arithmetic: the neighbours' values, for the derivatives. */
+static const int tc_slots[6] = { SEM_TC0, SEM_TC0 + 1, SEM_TC1, SEM_TC1 + 1, SEM_TC2, SEM_TC2 + 1 };
+
+static void interpolate_tc(const WinVertex *v0, const WinVertex *v1, const WinVertex *v2, float area,
+                           float px, float py, float out[6])
+{
+    float b0 = edge(v1->x, v1->y, v2->x, v2->y, px, py) / area;
+    float b1 = edge(v2->x, v2->y, v0->x, v0->y, px, py) / area;
+    float b2 = 1.0f - b0 - b1;
+    float inv_w = b0 * v0->inv_w + b1 * v1->inv_w + b2 * v2->inv_w;
+    for (int k = 0; k < 6; k++) {
+        int s = tc_slots[k];
+        out[k] = (b0 * v0->a[s] + b1 * v1->a[s] + b2 * v2->a[s]) / inv_w;
+    }
+}
+
 static void raster_triangle(const Target *t, const WinVertex *v0, const WinVertex *v1, const WinVertex *v2,
                             int band, int nbands)
 {
@@ -807,10 +824,10 @@ static void raster_triangle(const Target *t, const WinVertex *v0, const WinVerte
                 continue;
             float b0 = w0 / area, b1 = w1 / area, b2 = w2 / area;
             float z = b0 * v0->z + b1 * v1->z + b2 * v2->z;            /* depth: linear in screen space */
-            float a[NSEM], ax[NSEM], ay[NSEM];
+            float a[NSEM], ax[6], ay[6];
             interpolate(v0, v1, v2, area, px, py, a);
-            interpolate(v0, v1, v2, area, px + 1, py, ax);         /* neighbours: texture derivatives */
-            interpolate(v0, v1, v2, area, px, py + 1, ay);
+            interpolate_tc(v0, v1, v2, area, px + 1, py, ax);      /* neighbours: texture derivatives */
+            interpolate_tc(v0, v1, v2, area, px, py + 1, ay);
             Frag f;
             float col[4];
             for (int ch = 0; ch < 4; ch++) {
@@ -819,15 +836,14 @@ static void raster_triangle(const Target *t, const WinVertex *v0, const WinVerte
             }
             f.primary = (Color){ (int)lroundf(col[0] * 255), (int)lroundf(col[1] * 255),
                                  (int)lroundf(col[2] * 255), (int)lroundf(col[3] * 255) };
-            static const int sems[3] = { SEM_TC0, SEM_TC1, SEM_TC2 };
             for (int k = 0; k < 3; k++) {
-                int s = sems[k];
+                int s = tc_slots[2 * k];
                 f.tc[k][0] = a[s];
                 f.tc[k][1] = a[s + 1];
-                f.d[k][0] = ax[s] - a[s];
-                f.d[k][1] = ax[s + 1] - a[s + 1];
-                f.d[k][2] = ay[s] - a[s];
-                f.d[k][3] = ay[s + 1] - a[s + 1];
+                f.d[k][0] = ax[2 * k] - a[s];
+                f.d[k][1] = ax[2 * k + 1] - a[s + 1];
+                f.d[k][2] = ay[2 * k] - a[s];
+                f.d[k][3] = ay[2 * k + 1] - a[s + 1];
             }
             f.tc0w = a[SEM_TC0W];
             f.sampled = 0;
@@ -855,7 +871,8 @@ static size_t nqueue, queue_cap;
 static uint64_t queue_pixels;          /* bounding-box area: small batches stay on this thread */
 static int nbands = 0;                  /* 0: not set up yet */
 
-static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER, stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static void (*pool_job)(int band);      /* what the bands run: rasterising, or shading vertices */
 static pthread_cond_t pool_go = PTHREAD_COND_INITIALIZER, pool_idle = PTHREAD_COND_INITIALIZER;
 static uint64_t pool_gen;
 static int pool_done;
@@ -889,10 +906,8 @@ static void *raster_worker(void *arg)
             pthread_cond_wait(&pool_go, &pool_lock);
         seen = pool_gen;
         pthread_mutex_unlock(&pool_lock);
-        Stats s = { 0 };
-        raster_band(band, &s);
+        pool_job(band);
         pthread_mutex_lock(&pool_lock);
-        stats_add(&s);
         if (++pool_done == nbands - 1)
             pthread_cond_signal(&pool_idle);
     }
@@ -912,6 +927,31 @@ static void pool_start(void)
     }
 }
 
+/* Run `job` on every band, this thread taking band 0, and wait for all. */
+static void pool_run(void (*job)(int band))
+{
+    pthread_mutex_lock(&pool_lock);
+    pool_job = job;
+    pool_done = 0;
+    pool_gen++;
+    pthread_cond_broadcast(&pool_go);
+    pthread_mutex_unlock(&pool_lock);
+    job(0);
+    pthread_mutex_lock(&pool_lock);
+    while (pool_done < nbands - 1)
+        pthread_cond_wait(&pool_idle, &pool_lock);
+    pthread_mutex_unlock(&pool_lock);
+}
+
+static void raster_job(int band)
+{
+    Stats s = { 0 };
+    raster_band(band, &s);
+    pthread_mutex_lock(&stats_lock);
+    stats_add(&s);
+    pthread_mutex_unlock(&stats_lock);
+}
+
 void pica_raster_flush(void)
 {
     if (!nqueue)
@@ -926,18 +966,7 @@ void pica_raster_flush(void)
         stats_add(&s);
         nbands = all;
     } else {
-        pthread_mutex_lock(&pool_lock);
-        pool_done = 0;
-        pool_gen++;
-        pthread_cond_broadcast(&pool_go);
-        pthread_mutex_unlock(&pool_lock);
-        Stats s = { 0 };
-        raster_band(0, &s);             /* this thread takes band 0 */
-        pthread_mutex_lock(&pool_lock);
-        stats_add(&s);
-        while (pool_done < nbands - 1)
-            pthread_cond_wait(&pool_idle, &pool_lock);
-        pthread_mutex_unlock(&pool_lock);
+        pool_run(raster_job);
     }
     nqueue = 0;
     queue_pixels = 0;
@@ -1202,6 +1231,69 @@ static void assemble(const Vertex *v)
     }
 }
 
+/* Shaded vertices by index, for the current indexed draw: a mesh uses
+   each vertex in several triangles, and the vertex shader (no side
+   effects, its state fixed for the draw) gives the same result every
+   time. The GPU keeps a small cache like it; this one keeps more. */
+#define VCACHE 4096
+static struct { uint32_t gen, index; Vertex v; } vcache[VCACHE];
+static uint32_t vcache_gen;
+
+/* A big draw (no geometry shader) shades its distinct vertices on every
+   band first, then assembles them in order: the same vertices, the same
+   triangles, in the same order, as shading one at a time. */
+#define PARALLEL_VERTICES 1024
+static uint32_t *job_index, *job_slot;   /* distinct indices; draw position -> their slot */
+static Vertex *job_out;
+static uint32_t job_n, job_cap;
+static struct { uint32_t gen, slot; } index_map[65536];
+static uint32_t index_gen;
+
+static void shade_job(int band)
+{
+    uint32_t lo = (uint32_t)((uint64_t)job_n * (uint32_t)band / (uint32_t)nbands);
+    uint32_t hi = (uint32_t)((uint64_t)job_n * (uint32_t)(band + 1) / (uint32_t)nbands);
+    for (uint32_t i = lo; i < hi; i++) {
+        Vec4 attr[12];
+        ShaderRegs s;
+        load_attributes(job_index[i], attr);
+        shade(attr, &s, &job_out[i]);
+    }
+}
+
+static void draw_parallel(const uint32_t *indices, uint32_t count, int dedup)
+{
+    if (count > job_cap) {
+        job_cap = count;
+        job_index = realloc(job_index, count * sizeof *job_index);
+        job_slot = realloc(job_slot, count * sizeof *job_slot);
+        job_out = realloc(job_out, count * sizeof *job_out);
+        if (!job_index || !job_slot || !job_out)
+            gpu_fatal("out of memory for a draw of %" PRIu32 " vertices", count);
+    }
+    if (dedup && ++index_gen == 0) {
+        memset(index_map, 0, sizeof index_map);
+        index_gen = 1;
+    }
+    job_n = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t index = indices[i];
+        if (dedup) {
+            if (index_map[index].gen == index_gen) {
+                job_slot[i] = index_map[index].slot;
+                continue;
+            }
+            index_map[index].gen = index_gen;
+            index_map[index].slot = job_n;
+        }
+        job_slot[i] = job_n;
+        job_index[job_n++] = index;
+    }
+    pool_run(shade_job);
+    for (uint32_t i = 0; i < count; i++)
+        assemble(&job_out[job_slot[i]]);
+}
+
 void pica_draw(int indexed)
 {
     if (gpu_skip_draws)
@@ -1224,6 +1316,43 @@ void pica_draw(int indexed)
         fprintf(stderr, "    PICA draw %s: %" PRIu32 " vertices, primitive mode %" PRIu32 "\n",
                 indexed ? "elements" : "arrays", count, pica.reg[REG_PRIMITIVE_CONFIG] >> 8 & 3);
     assembled = 0;
+    if (!nbands)
+        pool_start();
+    static uint32_t parallel_min;
+    if (!parallel_min) {
+        const char *e = getenv("GPU_PARALLEL_MIN");     /* tests set 1, to run this path */
+        parallel_min = e ? (uint32_t)strtoul(e, NULL, 0) : PARALLEL_VERTICES;
+        if (!parallel_min)
+            parallel_min = 1;
+    }
+    if (!gs && count >= parallel_min && nbands > 1) {
+        static uint32_t *all;
+        static uint32_t all_cap;
+        if (count > all_cap) {
+            all_cap = count;
+            all = realloc(all, count * sizeof *all);
+            if (!all)
+                gpu_fatal("out of memory for a draw of %" PRIu32 " vertices", count);
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            if (!indexed) {
+                all[i] = first + i;
+            } else if (ib >> 31) {
+                uint16_t v16;
+                memcpy(&v16, indices + 2 * i, 2);
+                all[i] = v16;
+            } else {
+                all[i] = indices[i];
+            }
+        }
+        draw_parallel(all, count, indexed);
+        return;
+    }
+    int cached = indexed && !gs;
+    if (cached && ++vcache_gen == 0) {      /* wrapped: forget everything */
+        memset(vcache, 0, sizeof vcache);
+        vcache_gen = 1;
+    }
     for (uint32_t i = 0; i < count; i++) {
         uint32_t index;
         if (!indexed) {
@@ -1240,15 +1369,29 @@ void pica_draw(int indexed)
                 gs_begin_variable(index);
             continue;
         }
+        if (cached) {
+            uint32_t slot = index & (VCACHE - 1);
+            if (vcache[slot].gen == vcache_gen && vcache[slot].index == index) {
+                assemble(&vcache[slot].v);
+                continue;
+            }
+        }
         Vec4 attr[12];
         Vertex v;
         ShaderRegs s;
         load_attributes(index, attr);
         shade(attr, &s, gs ? NULL : &v);
-        if (gs)
+        if (gs) {
             gs_feed(&s);
-        else
-            assemble(&v);
+            continue;
+        }
+        if (cached) {
+            uint32_t slot = index & (VCACHE - 1);
+            vcache[slot].gen = vcache_gen;
+            vcache[slot].index = index;
+            vcache[slot].v = v;
+        }
+        assemble(&v);
     }
 }
 

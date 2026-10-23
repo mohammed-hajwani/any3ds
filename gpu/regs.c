@@ -105,7 +105,12 @@ static int reg_write(uint32_t id, uint32_t value, uint32_t mask)
 {
     if (id >= PICA_REGS)
         gpu_fatal("command list writes register %03" PRIx32 ", which doesn't exist", id);
-    pica_raster_flush();                /* queued triangles see the state they were drawn with */
+    /* Queued triangles must see the state they were drawn with. Registers
+       from 0x200 up (vertex arrays, primitive setup, the shader units) only
+       shape triangles not yet queued, so writing them needn't draw the
+       queue: draws then batch together, which spreads them over threads. */
+    if (id < 0x200)
+        pica_raster_flush();
     pica.reg[id] = (pica.reg[id] & ~mask) | (value & mask);
     value = pica.reg[id];
     if (gpu_trace) {
