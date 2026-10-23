@@ -809,8 +809,11 @@ class Discovery:
             # the code, decoded by some other guess as Thumb instructions.
             # Nor is one that opens with a prologue saving lr: strings in the
             # code before a C++ method, decoded by another guess, run into it.
+            # Nor an empty function (`bx lr`, Pokémon X's DllSequence keeps
+            # one after strings): splitting there is always safe, whatever
+            # runs into it just calls it.
             middle = {g for g in accepted if g[0] in falls and not self._after_filler(g)
-                      and g[0] | g[1] not in hints and not self._prologue(g)}
+                      and g[0] | g[1] not in hints and not self._prologue(g) and not self._empty(g)}
             if middle:
                 for g in middle:
                     accepted.discard(g)
@@ -893,6 +896,12 @@ class Discovery:
         if insn is None or insn.id != ARM_INS_PUSH:
             return False
         return any(op.type == ARM_OP_REG and _reg_num(insn, op.reg) == 14 for op in insn.operands)
+
+    def _empty(self, start):
+        """Whether a function start is an unconditional `bx lr`."""
+        insn = self.decode(*start)
+        return (insn is not None and insn.id == ARM_INS_BX and insn.cc == ARM_CC_AL
+                and _reg_num(insn, insn.operands[0].reg) == 14)
 
     def _after_filler(self, start):
         """Whether the instruction just before a function start is a filler
