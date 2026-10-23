@@ -3,11 +3,11 @@
 <rect x="10" y="10" width="80" height="26" fill="#30363d"/>
 <text x="50.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">services</text>
 <rect x="90" y="10" width="48" height="26" fill="#b62324"/>
-<text x="114.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">8.6%</text>
+<text x="114.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">8.7%</text>
 <rect x="148" y="10" width="40" height="26" fill="#30363d"/>
 <text x="168.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">CPU</text>
 <rect x="188" y="10" width="56" height="26" fill="#9a6700"/>
-<text x="216.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">78.8%</text>
+<text x="216.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">79.7%</text>
 <rect x="254" y="10" width="72" height="26" fill="#30363d"/>
 <text x="290.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">shaders</text>
 <rect x="326" y="10" width="64" height="26" fill="#2ea043"/>
@@ -16,7 +16,7 @@
 <text x="472.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">examples running</text>
 <rect x="544" y="10" width="56" height="26" fill="#9a6700"/>
 <text x="572.0" y="28" fill="#ffffff" font-size="13" text-anchor="middle">49/62</text>
-<text x="10" y="66" fill="#ffffff" font-size="16">OS services: 8.6% (129/1501)</text>
+<text x="10" y="66" fill="#ffffff" font-size="16">OS services: 8.7% (130/1501)</text>
 <rect x="10.0" y="76.0" width="181.9" height="150.2" fill="#0d1117"/>
 <rect x="11.5" y="77.5" width="10.9" height="11.3" fill="#5b636e"><title>AC 0x0001 CreateDefaultConfig (not yet)</title></rect>
 <rect x="23.4" y="77.5" width="10.9" height="11.3" fill="#5b636e"><title>AC 0x0002 DebugSetApType (not yet)</title></rect>
@@ -1402,7 +1402,7 @@
 <rect x="437.7" y="353.3" width="11.3" height="9.1" fill="#5b636e"><title>GSP 0x000d SetDisplayTransfer (not yet)</title></rect>
 <rect x="450.0" y="353.3" width="11.3" height="9.1" fill="#5b636e"><title>GSP 0x000e SetTextureCopy (not yet)</title></rect>
 <rect x="462.3" y="353.3" width="11.3" height="9.1" fill="#5b636e"><title>GSP 0x000f SetMemoryFill (not yet)</title></rect>
-<rect x="413.1" y="363.4" width="11.3" height="9.1" fill="#5b636e"><title>GSP 0x0010 SetAxiConfigQoSMode (not yet)</title></rect>
+<rect x="413.1" y="363.4" width="11.3" height="9.1" fill="#2ea043"><title>GSP 0x0010 SetAxiConfigQoSMode</title></rect>
 <rect x="425.4" y="363.4" width="11.3" height="9.1" fill="#5b636e"><title>GSP 0x0011 SetPerfLogMode (not yet)</title></rect>
 <rect x="437.7" y="363.4" width="11.3" height="9.1" fill="#5b636e"><title>GSP 0x0012 GetPerfLog (not yet)</title></rect>
 <rect x="450.0" y="363.4" width="11.3" height="9.1" fill="#2ea043"><title>GSP 0x0013 RegisterInterruptRelayQueue</title></rect>
@@ -1569,7 +1569,7 @@
 <rect x="596.5" y="442.4" width="11.0" height="7.0" fill="#2ea043"><title>RO 0x0008 Shutdown</title></rect>
 <rect x="560.6" y="450.5" width="11.0" height="7.0" fill="#2ea043"><title>RO 0x0009 LoadCRO_New</title></rect>
 <text x="563.1" y="446.9" fill="#ffffff" font-size="11" style="paint-order:stroke" stroke="#0d1117" stroke-width="2.5">RO</text>
-<text x="625" y="66" fill="#ffffff" font-size="16">CPU instructions: 78.8% (182/231)</text>
+<text x="625" y="66" fill="#ffffff" font-size="16">CPU instructions: 79.7% (184/231)</text>
 <rect x="625.0" y="76.0" width="139.4" height="154.6" fill="#0d1117"/>
 <rect x="626.5" y="77.5" width="21.7" height="24.3" fill="#2ea043"><title>sadd16</title></rect>
 <rect x="649.2" y="77.5" width="21.7" height="24.3" fill="#2ea043"><title>sadd8</title></rect>
@@ -1808,8 +1808,8 @@
 <rect x="961.3" y="318.1" width="21.2" height="23.6" fill="#5b636e"><title>qdsub (not yet)</title></rect>
 <rect x="894.7" y="342.7" width="21.2" height="23.6" fill="#2ea043"><title>ssat</title></rect>
 <rect x="916.9" y="342.7" width="21.2" height="23.6" fill="#2ea043"><title>usat</title></rect>
-<rect x="939.1" y="342.7" width="21.2" height="23.6" fill="#5b636e"><title>ssat16 (not yet)</title></rect>
-<rect x="961.3" y="342.7" width="21.2" height="23.6" fill="#5b636e"><title>usat16 (not yet)</title></rect>
+<rect x="939.1" y="342.7" width="21.2" height="23.6" fill="#2ea043"><title>ssat16</title></rect>
+<rect x="961.3" y="342.7" width="21.2" height="23.6" fill="#2ea043"><title>usat16</title></rect>
 <text x="897.2" y="330.6" fill="#ffffff" font-size="11" style="paint-order:stroke" stroke="#0d1117" stroke-width="2.5">saturate</text>
 <rect x="893.2" y="368.8" width="45.9" height="91.2" fill="#0d1117"/>
 <rect x="894.7" y="370.3" width="20.5" height="21.1" fill="#2ea043"><title>mul</title></rect>
