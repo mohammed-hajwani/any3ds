@@ -17,6 +17,9 @@
 @   movlt pc, rX      to a fixed address built from pc in two steps
 @   b label           after such calls return: a plain jump again
 @   add pc, rT, rO    after lr is built from pc in two steps: a call too
+@   ldr rX, [rT, rI, lsl #2]; bx rX   with rT from a literal: a bytecode
+@                     interpreter's dispatch to a table of handlers, one
+@                     falling straight into the next
 
     .syntax unified
     .arm
@@ -34,6 +37,7 @@ _start:
     bl const_jump
     bl cont_then_jump
     bl two_step_call
+    bl dispatch
     pop {r4, pc}
 
 add_table:
@@ -167,3 +171,14 @@ two_step_call:
     bx lr
 84: sub r0, r0, #30
     bx lr
+
+dispatch:
+    and r2, r1, #1
+    ldr r3, =90f
+    ldr r2, [r3, r2, lsl #2]
+    bx r2                       @ to a handler, through the table
+91: add r0, r0, #7              @ handler 0 runs into handler 1
+92: eor r0, r0, #5
+    bx lr
+    .ltorg
+90: .word 91b, 92b

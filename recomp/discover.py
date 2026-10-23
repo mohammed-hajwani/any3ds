@@ -212,6 +212,7 @@ class Discovery:
                 work.append((nxt, iid == ARM_INS_BLX))
             if iid == ARM_INS_BX:
                 self._note_call_return(fn, insn, work)
+                self._handler_table(fn, insn)
             return
 
         if iid in _LDM and any(op.type == ARM_OP_REG and _reg_num(insn, op.reg) == PC for op in ops):
@@ -545,6 +546,44 @@ class Discovery:
         else:
             self.unresolved.add(insn.address)       # e.g. into a CRO module: not ours
         return True
+
+    def _handler_table(self, fn, insn):
+        """`ldr rX, [rT, rI, lsl #2]; bx rX` with rT loaded from a literal:
+        a bytecode interpreter's dispatch (Pokémon X's script engine), to a
+        table of handler addresses. Every handler is a function, even one
+        the handler before it runs straight into (`push 3` falling into
+        `push 2`): the fall-through becomes a tail call. The table runs
+        while its entries are ARM code in the program."""
+        ops = insn.operands
+        if fn.thumb or len(ops) != 1 or ops[0].type != ARM_OP_REG:
+            return
+        rx = _reg_num(insn, ops[0].reg)
+        load = next((p for p in self._back(fn, insn.address, 4) if self._writes(p, rx)), None)
+        if load is None or load.id != ARM_INS_LDR or len(load.operands) != 2 or load.writeback:
+            return
+        mem = load.operands[1]
+        if mem.type != ARM_OP_MEM or not mem.mem.index or mem.subtracted or mem.shift.value != 2:
+            return
+        base = _reg_num(load, mem.mem.base)
+        lit = next((p for p in self._back(fn, load.address, 12) if self._writes(p, base)), None)
+        if lit is None or lit.id != ARM_INS_LDR or len(lit.operands) != 2:
+            return
+        lmem = lit.operands[1]
+        if lmem.type != ARM_OP_MEM or _reg_num(lit, lmem.mem.base) != PC or lmem.mem.index:
+            return
+        raw = self.program.read(_address(lit).const, 4)
+        if raw is None:
+            return
+        table = int.from_bytes(raw, 'little')
+        targets = []
+        while len(targets) < 1024:
+            raw = self.program.read(table + 4 * len(targets), 4)
+            t = int.from_bytes(raw, 'little') if raw else 1
+            if t % 4 or not self.in_text(t) or self.decode(t, False) is None:
+                break
+            targets.append(t)
+        for t in targets:
+            self._call(fn, t, False, insn)
 
     def _address_table(self, fn, insn, work, nxt):
         """ARMCC's switch: `cmp rX, #N; ldrlo pc, [pc, rX, lsl #2]; b default`
