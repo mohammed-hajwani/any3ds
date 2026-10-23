@@ -4,7 +4,7 @@ A **static recompiler** for Nintendo 3DS code. It translates 32-bit ARM (ARMv6K)
 
 Why ahead of time? iOS doesn't allow JIT compilation, so 3DS emulators on iPhone fall back to slow interpreters. If the whole program is translated before it runs, nothing has to be generated at runtime.
 
-> **Status:** early, and a personal learning project. Milestones M0 (one function), M1 (branches, flags, conditional execution, calls), M2 (memory: loads/stores, literal pools, switch tables), M3 (instruction-by-instruction differential testing against Unicorn), M4 (Thumb + ARM/Thumb interworking), M5 (VFP floating point) and M6a (recompiling a real libctru homebrew app in full) are done. In M6b the recompiled libctru hello world **runs** on our own minimal OS layer (threads, APT, GSP, HID) and prints to its screen. In M7, 31 of devkitPro's 62 example programs ran correctly. In M8-M10 our own GPU emulation (no third-party GPU code) gained 3D drawing, textures, fog, fragment lighting and geometry shaders, bringing it to 49; of the rest, 8 don't build, 3 need the console's system font (firmware), and 2 use undocumented procedural-texture noise ([docs/compat.md](docs/compat.md)). Development currently targets x86-64 Linux; iOS comes much later.
+> **Status:** a personal learning project, now running a commercial game. Milestones M0-M10 built the translator (ARM, Thumb, VFP, real-world control flow, checked instruction by instruction against Unicorn), our own minimal OS layer and our own PICA200 GPU (no third-party emulator code): 49 of devkitPro's 62 examples run ([docs/compat.md](docs/compat.md)). Since then it recompiles retail games from the user's own dump (`code.bin` + CRO modules, no symbols) and **Pokémon X boots into its game world**: language select, title screen, Professor Sycamore's intro, name entry, and the bedroom in Vaniville Town, all in 3D, with its AAC music streams handled by our DSP. It renders in software on all CPU cores (about 15 fps in heavy 3D scenes, near 60 without drawing); a hardware renderer is planned. Development targets x86-64 Linux (WSL2); iOS comes much later.
 
 ## Progress
 
@@ -42,7 +42,7 @@ L_00100054:
 - **An unsupported instruction is a hard error** naming its address and mnemonic. Nothing is ever skipped silently.
 - Optimisation is clang's job. Generated code should stay readable.
 
-OS calls (`SVC`) go to `hle/`, a small high-level emulation of the 3DS kernel and services written from the public [3dbrew](https://www.3dbrew.org) docs: threads and synchronisation, IPC, and just enough of APT, GSP, HID and FS for a homebrew app to run. The long-term plan is to reuse [Azahar](https://github.com/azahar-emu/azahar)'s services and GPU code for the heavier parts. See [CLAUDE.md](CLAUDE.md) for the full design and roadmap.
+OS calls (`SVC`) go to `hle/`, our own high-level emulation of the 3DS kernel and services written from the public [3dbrew](https://www.3dbrew.org) docs: threads and synchronisation, IPC, APT, GSP, HID, FS (RomFS, saves, extdata), CFG, RO (CRO modules), Y2R and the DSP (audio inputs and an AAC decoder). The GPU in `gpu/` is our own too. No emulator code is reused, so the licence stays open. Where 3dbrew is silent, behaviour comes from what the game's own code expects, and each such guess is logged when it is used. See [CLAUDE.md](CLAUDE.md) for the full design and roadmap.
 
 ## Legal rules (read before contributing)
 
@@ -84,6 +84,15 @@ wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc "make test"
 
 `make run-m6` runs the recompiled hello world, presses START at frame 10 and saves both screens to `out/m6/frame.bmp`.
 
+### Running your own game dump
+
+Only ever your own, decrypted dump, kept in `dumps/` or outside the repo (never committed):
+```bash
+tools/build_dump.sh /path/to/your/game.3ds out/game     # recompile everything (~8 min); OS_ONLY=1 rebuilds just the OS layer
+out/game/run --romfs /path/to/your/game.3ds --save out/game/save --live out/game/live.bmp --input out/game/keys.txt --speed 1
+```
+`--live` saves both screens every 30 frames and `tools/live.html` (served by `tools/live_server.py`) shows them with buttons that write `--input`. `--speed 1` plays at the 3DS's own speed (0 = as fast as possible). Runs are deterministic: `--hold FRAME:KEYS` and `--touch FRAME:X,Y` replay a session exactly. `GPU_SKIP_UNTIL=N` fast-forwards to frame N without drawing; `GPU_TRACE=N` and `HLE_TRACE=N` trace the GPU or the OS from frame N; `GPU_THREADS=N` sets the drawing threads.
+
 `make compat` builds, recompiles and runs every example in devkitPro's `3ds-examples` (installed with `3ds-dev`) and writes the table in [docs/compat.md](docs/compat.md). It takes about 4 minutes, and seconds when nothing changed.
 
 ## Repo layout
@@ -102,7 +111,7 @@ hle/               the OS layer: high-level emulation of the 3DS kernel and serv
   kernel.c         kernel objects, handles, threads + scheduler, virtual clock
   svc.c            svc number -> kernel call; memory map
   ipc.c            IPC: ports, sessions, request dispatch
-  srv.c apt.c gsp.c hid.c fs.c cfg.c   one file per service
+  srv.c apt.c gsp.c hid.c fs.c cfg.c ro.c y2r.c dsp.c   one file per service
   config_mem.c     the kernel config page and shared page (versions, clock)
   framebuffer.c    3DS framebuffer -> upright .bmp
 gpu/               our own emulation of the 3DS GPU (PICA200), from the 3dbrew docs
@@ -145,7 +154,11 @@ dumps/  out/       gitignored: your own dumps and all generated code
 | M8 | Our own GPU, part 1: GX engines, command lists, vertex shaders, rasteriser, colour combiners, blending, depth | ✅ |
 | M9 | GPU textures (14 formats incl. ETC1, filtering, mipmaps, cube maps) and procedural textures; citro2d works | ✅ |
 | M10 | Fog, fragment lighting and geometry shaders (point, fixed- and variable-size modes) | ✅ |
-| later | Cycle counting, CRO relocation, indirect-jump table + interpreter fallback, Metal renderer, iOS shell app | |
+| M11 | Retail code: `code.bin` + CROs from your own dump, function discovery without symbols | ✅ |
+| M12 | Audio DSP: voices consumed at the right rate (silent), an AAC decoder (decodes to silence) | ✅ |
+| — | Pokémon X boots into its game world; 7x faster (`-O1` generated code), drawing on all cores | ✅ |
+| next | The game's script engine, sound output, a hardware renderer (Vulkan, later Metal), savestates | |
+| later | Cycle counting, interpreter fallback for unresolved jumps, iOS shell app | |
 
 ## Contributing
 
