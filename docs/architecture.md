@@ -59,7 +59,7 @@ problems are downstream of them:
 an indirect jump lands somewhere we have no function for, interpret from there
 until control reaches a known entry point. An interpreter is not JIT, so it is
 perfectly legal on iOS. We don't have one (today `recomp_bad_call` aborts). It
-is the single highest-value missing piece — see §10.4.
+is the single highest-value missing piece — see §9.6.
 
 ---
 
@@ -122,7 +122,7 @@ checking on a 1700-line translator.
 **Lever.** If you ever want "user drops a dump into the app and it builds
 itself", the translator has to move out of Python. Until then this is a
 non-issue. Worth doing sooner: `mypy`/`ruff` in CI, and splitting
-`translate.py` (§10.3).
+`translate.py` (§9.3).
 
 ### 2.2 Capstone as the decoder
 
@@ -180,7 +180,7 @@ decision in the project, for three reasons:
    (faster to compile than giant C functions, and far better control over flags).
 
 **Lever.** Introducing an IR is the enabling refactor for nearly every
-performance idea in §10. It does not have to be fancy: a dataclass per operation
+performance idea in §9. It does not have to be fancy: a dataclass per operation
 with `reads`, `writes`, and a `to_c()` method would already allow NZCV liveness
 and register localisation. Do this before you do any other performance work.
 
@@ -214,7 +214,7 @@ met (gcc, then libgcc hand-written asm, then newlib, then ARMCC in a retail
 game).
 
 **Lever.** Keep it. It is the right default and the reason the generated code is
-fast and debuggable. But pair it with the interpreter fallback (§10.4) so the
+fast and debuggable. But pair it with the interpreter fallback (§9.6) so the
 cases that do not fit degrade instead of aborting.
 
 ### 2.5 Function discovery
@@ -257,6 +257,19 @@ to is a function whatever appears to run into it, a start preceded by ARMCC's
 filler `mov r0, r0` is not a mid-function, and a based jump table may have
 unused zero entries in the middle of it (Pokémon X's video decoder has two, and
 everything after them used to be dropped).
+
+The hardest shape met so far is a **bytecode interpreter**, which is what the
+game's script engine is: each handler ends by loading the next handler's address
+out of a table (whose address comes from a literal) and jumping with `bx`, and
+the handlers **fall straight into one another** (`push 3` runs on into
+`push 2`). Discovery took each handler for the middle of the one before it and
+never translated them, so the game stopped in its bedroom scene on a jump to an
+address that had no function. The rule now: when a `bx` is fed by
+`ldr rX, [rT, rI, lsl #2]` with `rT` loaded from a literal, **every entry of
+that table is a function**, and the fall-through between them is a tail call.
+Expect more of this: a dispatch table is how every interpreter, state machine
+and message pump is written, and each one hides its code from static analysis in
+a slightly different way.
 
 **Why.** Retail games have no symbols at all. Without this there is no path to
 commercial software, and 3dsx homebrew only gets you so far.
@@ -323,7 +336,7 @@ bugs are findable.
 
 **Instead we could have** emitted a no-op (fast progress, undebuggable), or
 dropped to an interpreter per instruction (the hybrid again — correct *and*
-progress, which is why §10.4 matters).
+progress, which is why §9.6 matters).
 
 **What it costs.** Coverage comes in at the pace of the instruction set. The
 progress map (`make progress`) exists because of this choice.
@@ -355,7 +368,7 @@ you built from has no code.
 
 **Lever.** Fine. Note that `MAX_ATTACHED` is 64 and lookup walks the attached
 list linearly before binary-searching inside one — if a game loads many modules
-and calls across them constantly, that is a measurable cost (§10.5).
+and calls across them constantly, that is a measurable cost (§9.7).
 
 ---
 
@@ -403,7 +416,7 @@ ctx->r[2] = ctx->r[0] + 1;           /* add r2, r0, #1 */
 
 very likely reloads `r0` after the store. On a load/store-heavy game that is a
 large constant factor. **This is a hypothesis, not a measurement** — there is no
-benchmark in the repo yet (§10.1), so measure before you optimise.
+benchmark in the repo yet (§9.1), so measure before you optimise.
 
 **Lever (the big one).** *Register localisation*: at function entry, copy the
 registers this function uses into C locals; operate on locals; write them back
@@ -513,7 +526,7 @@ Every one of these was found by running real code, and each is a patch on the
 same assumption. Two things are still outside it: **`setjmp`/`longjmp`** and
 **C++ exception unwinding**, both of which return to a point in the *middle* of a
 function whose host frame is already gone. Retail games built with ARMCC do use
-C++; this is the most likely structural wall ahead (§9.2).
+C++; this is the most likely structural wall ahead (§8.2).
 
 **Lever.** Keep the model; plan for the two holes. A workable design: maintain a
 shadow stack of `(guest sp, host jmp_buf)` at function entries that could be
@@ -545,12 +558,16 @@ conservative: a value that *isn't* one of the addresses aborts, which is right.
 (`_target_switch` already does this where it can). That shrinks the tables and
 should get `-O2` back into reach.
 
-### 3.6 Indirect calls go through a sorted table and a binary search
+### 3.6 Indirect calls go through a sorted table, a binary search and a cache
 
 **What we do.** `emit_c.py` emits `by_addr[]`, sorted by entry address with the
 Thumb bit in bit 0; `recomp_find_static` binary-searches it;
 `recomp_find` tries that, then each attached CRO module's table. A miss is
 `recomp_bad_call`, which prints the guest registers and aborts.
+
+In front of all that sits a 4096-entry direct-mapped cache keyed on
+`addr ^ addr >> 12`, flushed whenever a CRO module is attached or detached. It
+needs no lock, because only one guest thread runs at a time (§4.2).
 
 **Why.** Simple, compact, and needs no runtime setup. Function pointers,
 vtables, callbacks and thread entry points all resolve through one mechanism.
@@ -558,15 +575,23 @@ vtables, callbacks and thread entry points all resolve through one mechanism.
 **Instead we could have** used a hash table, a direct-mapped array indexed by
 `(addr - text_base) >> 1`, or a perfect hash built at recompile time.
 
-**What it costs.** ~15-20 dependent loads per indirect call for a game with
-30k functions. C++ code (vtables everywhere) calls indirectly constantly. The
-module walk adds to it.
+**What it costs.** This was the first thing a profile found, and it was worse
+than the estimate here: before the cache, **the binary searches behind indirect
+calls were a sixth of a whole game's run time.** C++ code calls through vtables
+constantly, and each miss walked ~15-20 dependent loads plus the module list.
 
-**Lever.** A flat array of `GuestFn` indexed by halfword offset from the text
-base: for 8 MB of code that is 4 M entries × 8 bytes = 32 MB — too much. Two
-levels (a 4 KB-page table of small arrays) gets it to ~1-2 MB and makes lookup
-two loads and no branches. Or keep binary search but build a perfect hash
-offline. Easy, isolated, measurable win.
+The cache turns the common case (the same few targets over and over) into one
+load and a compare. The price is a correctness obligation that the plain table
+did not have: a stale entry would call the *wrong function*, so every path that
+can move code — module attach and detach today — must flush it. That is two
+call sites now; it will be more if code ever moves for another reason, and it is
+the kind of invariant worth a comment at every future caller.
+
+**Lever.** Still open if it matters again: a flat array of `GuestFn` indexed by
+halfword offset from the text base is 32 MB for 8 MB of code (too much), but two
+levels (a page table of small arrays) gets it to ~1-2 MB, makes lookup two loads
+with no branches *and* no invalidation problem, since it is rebuilt rather than
+cached. Worth it only if a profile puts `recomp_find` back near the top.
 
 ### 3.7 There is no guest PC
 
@@ -753,9 +778,16 @@ a cycle-accurate clock (§3.8's lever).
 runner is a batch tool, not a playable emulator. Anything that depends on the
 *ratio* of CPU speed to frame rate will be off.
 
-**Lever.** When you want interactive play, the clock becomes a hybrid: free-run
-virtual time, but pace vblank against real time and let audio drive it. Keep a
-`--deterministic` mode for the tests — do not lose it.
+**Lever (now taken, carefully).** `runner --speed N` paces the run against the
+real clock: at each vblank it waits until real time has caught up with virtual
+time divided by N, so `--speed 1` is the console's own speed and you can play.
+Two details make this safe rather than a determinism leak: it only ever
+*waits*, never skips (a run that cannot keep up just runs slow, with the same
+output), and the default is `0` — as fast as possible — so every test still
+runs in the old deterministic mode. That is the right shape: real time as an
+option on top of virtual time, not a replacement for it. Audio will eventually
+want to drive the pacing instead of the vblank; keep the same discipline when it
+does.
 
 ### 4.4 Flat tables for objects and handles
 
@@ -946,9 +978,11 @@ every pixel is deterministic, so a frame hash is a valid test.
   CPU code is not. So the GPU layer does not have to be AOT.
 - **Software, but SIMD and multithreaded**: the obvious middle step.
 
-**What it costs.** Speed. A software rasteriser at 400×240×2 screens, 60 fps,
-with per-pixel lighting, is far from real time, and the GPU will be the
-bottleneck long before the recompiled CPU code is.
+**What it costs.** Speed, and this is now measured rather than predicted:
+**~15 fps in heavy 3D scenes, against near 60 with drawing skipped** (§8.4).
+The GPU became the bottleneck exactly as expected, and before the recompiled
+CPU code did. Spreading rasterisation across cores (§5.2) bought a multiple, not
+an order of magnitude; software shading of every fragment is the floor.
 
 **Lever.** The architecture to aim for: keep this software path as the
 *reference* (it is a correctness oracle you cannot buy), and add a hardware
@@ -956,21 +990,61 @@ backend behind the same interface. Then any disagreement between them is a bug
 you can localise. That is a much stronger position than having only a fast
 renderer.
 
-### 5.2 Synchronous and in-order
+### 5.2 Synchronous in order, but rasterised on every core
 
 **What we do.** GSP drains the GX queue when the app triggers it; a command list
-runs to completion inside that call; `draw` rasterises immediately. Interrupts
-(PSC0/PSC1/PPF/P3D/DMA, VBlank0/1) are raised at the points the hardware raises
-them.
+runs to completion inside that call; interrupts (PSC0/PSC1/PPF/P3D/DMA,
+VBlank0/1) are raised where the hardware raises them. The *CPU-visible* order is
+therefore unchanged.
 
-**Why.** Determinism again, and it removes a whole class of synchronisation bug.
+Rasterisation, though, now runs on all cores — and does so without giving up a
+single bit of determinism, which is worth studying because it is the pattern to
+copy for everything else:
 
-**What it costs.** No overlap between CPU and GPU work, so no way to hide GPU
-latency, and a game that depends on the GPU being *slow* (racing the beam,
-reading a buffer before the GPU finished) sees different timing.
+- `draw_triangle` does not rasterise. It **queues** the triangle in window
+  space (post-shading, post-clip) together with a copy of the render target.
+- Every register write calls `pica_raster_flush()` **before** applying the
+  change, and the end of a command list flushes too. So the queue only ever
+  holds triangles that share one register state — the state they were drawn
+  with. That single discipline is what makes the rest safe.
+- A flush splits the work into N **bands by row stripe**: band b draws the rows
+  where `(y / 8) % N == b`. Each band walks the *whole queue in order* but
+  touches only its own rows. So every pixel belongs to exactly one band and
+  receives exactly the writes, in exactly the order, that one thread would have
+  produced. Blending, depth and stencil order per pixel are preserved by
+  construction, not by luck.
+- Stripes are 8 rows — one tile row — so two bands never write the same 8×8
+  tile, which also keeps them off each other's cache lines.
+- Small batches (bounding boxes under 16 384 pixels) stay on the calling thread
+  rather than paying for a wakeup.
+- `GPU_THREADS=N` sets the count, and the GPU test suite passes with 1 and with
+  many. That equivalence *is* the test, and it is only expressible because the
+  design promises identical output rather than merely correct output.
 
-**Lever.** If you later want a real GPU thread, do it behind the GX queue — that
-is already the natural boundary.
+**Why.** It was the one place where parallelism was available without touching
+the determinism the whole test strategy rests on (§4.2, §6.4). The CPU side
+stays single-threaded; the pixels, which have no ordering dependency across
+rows, do not.
+
+**Instead we could have** parallelised by tile with per-tile queues (better
+locality, more bookkeeping), run the GPU on one dedicated thread overlapped with
+the CPU (hides latency, but then the CPU can observe a half-drawn buffer and
+determinism goes), or split by triangle (fast, and wrong: two triangles can
+cover the same pixel, so write order stops being defined).
+
+**What it costs.** Still no CPU/GPU overlap — a game that reads a buffer before
+the GPU would have finished sees different timing. The flush-on-every-register-
+write rule means a command list that interleaves state changes with single
+triangles gets no parallelism at all (correctly). And the "log once" statics in
+`frag_texture`/`frag_light` (§4.6) are now written from several threads without
+synchronisation: harmless in effect — a line could print twice or interleave —
+but it is a real data race that a thread sanitizer would flag, so make those
+flags atomic before anyone goes looking for races.
+
+**Lever.** If the CPU ever needs the overlap, the honest boundary is still the GX
+queue, and the cost is a fence wherever the guest could observe the framebuffer.
+Don't take it until a profile says the serialisation costs more than the
+determinism is worth.
 
 ### 5.3 Shaders are interpreted, in float32
 
@@ -1106,7 +1180,7 @@ retail games as the metric (not committable, not shareable, not reproducible).
 them do not build for reasons that have nothing to do with us.
 
 **Lever.** This is the right metric and the right harness. The missing piece is
-that **nothing runs it automatically** — see §10.8.
+that **nothing runs it automatically** — see §9.9.
 
 ### 6.6 Tracing and introspection
 
@@ -1159,18 +1233,25 @@ it happens rather than later.
 
 **Notable sub-decisions:**
 
-- **Generated C is compiled `-O0`** in the sweep, because `-O2` took ~144 s per
-  example against ~15 s — a direct consequence of the giant switches (§3.5). So
-  the project's performance claim is currently *untested*: the fast path is
-  never built with optimisation.
+- **Optimisation level is a compile-time-versus-run-time trade, and it moved.**
+  The compat sweep still builds generated C at `-O0`, because `-O2` cost ~144 s
+  per example against ~15 s — a direct consequence of the giant switches (§3.5).
+  A retail game is built at **`-O1`**, which is worth about **7x at run time**
+  (Pokémon X went from ~8 frames a second to near 60 with drawing skipped) for
+  ~4 minutes of compiling. `-O2` is still out of reach for a game, and the
+  switches are still why.
 - **`--split N`** puts functions in chunks of N files so a big program compiles
-  in parallel.
+  in parallel — and the parallelism is now limited by *memory*, not cores:
+  the biggest generated files are over 100 MB of C and need gigabytes each, so
+  the build caps itself at 8 concurrent clang processes.
 - **`liboslayer.a`** builds the OS layer once for the whole sweep.
 
-**Lever.** Two things. (1) Fix the cause of the `-O2` cost (narrow the switches)
-and then measure an optimised build — until then nobody knows how fast this is.
-(2) The Makefile is near the limit of what is pleasant to extend; if you add
-much more, a generated build (CMake/ninja) would pay for itself. Not urgent.
+**Lever.** (1) Narrowing the computed-jump switches (§3.5) is now worth more
+than it was: it is what stands between `-O1` and `-O2` on a game, and `-O0` to
+`-O1` alone bought 7x. (2) Per-function optimisation levels — hot functions
+`-O2`, cold ones `-Oz` — once the census in §9.1 says which is which. (3) The
+Makefile is near the limit of what is pleasant to extend; a generated build
+(CMake/ninja) would pay for itself eventually. Not urgent.
 
 ---
 
@@ -1222,7 +1303,7 @@ None of this makes the project pointless — it is a genuinely interesting
 engineering result either way, and "fast 3DS on iPhone for your own dumps" is a
 real thing people would use. But if a shippable app is the goal, the realistic
 architecture is a **hybrid**: ship an interpreter-based runtime, and let the AOT
-path accelerate what it can. Which, conveniently, is the same thing §10.4 asks
+path accelerate what it can. Which, conveniently, is the same thing §9.6 asks
 for.
 
 ### 8.2 C++ exceptions and `setjmp`/`longjmp`
@@ -1232,20 +1313,48 @@ a function whose host frame no longer exists, which the mirrored-stack model
 (§3.4) cannot express. Expect this the moment a game takes an error path. Plan:
 the shadow-stack design in §3.4's lever, or the interpreter.
 
-### 8.3 Code size and compile time
+### 8.3 Code size and compile time (now measured, and it is as big as feared)
 
-The hello world is 303 functions → ~47k lines of C. A retail game is tens of
-thousands of functions. Extrapolating, expect millions of lines, a long
-compile even split and parallel, and a binary several times the size of the
-original ARM code. There are good answers (compile cold functions `-Oz`, hot
-ones `-O2`; narrow the switches; split more) but you need the numbers first.
+The hello world was 303 functions → ~47k lines of C. A retail game produces
+**single generated files over 100 MB of C that need gigabytes of RAM each to
+compile**, which is why the build caps at 8 parallel clang processes regardless
+of core count, and why a full game build is ~8 minutes (4 of them compiling).
 
-### 8.4 Performance is still unmeasured
+That is survivable on a desktop and it is a real problem for the iOS story
+(§8.1): the user's build machine needs the RAM, and the resulting binary is
+several times the size of the original ARM code. The answers are known —
+narrow the switches (§3.5), split finer, `-Oz` the cold 99% of functions once
+the census (§9.1) identifies them — and they are now worth doing with numbers
+rather than for tidiness.
 
-The project exists to be fast, and there is no benchmark. The generated code is
-currently built `-O0` in the sweep. Everything in §3 about register
-localisation and flag liveness is reasoning, not measurement. This is the
-cheapest gap to close and it gates every other performance decision.
+### 8.4 Performance: the first profile, and where the bottleneck went
+
+This section used to say the project's whole premise was unmeasured. That is no
+longer true, and what the first profiling round found is worth recording,
+because it mostly confirms that the costs predicted in §3 are the real ones:
+
+| Found | Share of run time | Fix |
+|---|---|---|
+| generated code built `-O0` | the bulk of the 7x | `-O1` (§6.7) |
+| `recomp_find` binary searches behind indirect calls | ~1/6 | a direct-mapped cache (§3.6) |
+| `MemoryFill`'s byte loop with `i % unit` | ~1/5 | doubling `memcpy` (one unit, then copy what is filled) |
+
+Two lessons in that table. The first is that **the biggest single win was a
+compiler flag**, which is what the "optimisation is clang's job" bet promised —
+it just had to be collected. The second is that `MemoryFill` is a reminder that
+a hot loop with a modulo in it will out-cost almost any clever thing elsewhere;
+it was a fifth of a whole game.
+
+Where it stands now: roughly **15 fps in heavy 3D scenes and near 60 with
+drawing skipped**. So the CPU translation — the thing this project is *about* —
+is at or near real time on a desktop, and **the software rasteriser is now the
+bottleneck**, exactly as §5.1 and §8.8 predicted. That changes the priority
+order in §9: the next big win is a hardware renderer, not more CPU work.
+
+What is still unmeasured: there is no committed, repeatable benchmark, so none
+of this is regression-protected — the next change that costs 20% will not
+announce itself. And register localisation and flag liveness (§3.1, §3.3) remain
+reasoning rather than measurement; they are now second-order against the GPU.
 
 ### 8.5 Zero is not a safe default for data the HLE invents
 
@@ -1278,12 +1387,18 @@ Every new game wants more services. This is expected and the design handles it;
 just do not be surprised when "boot one more game" is three weeks of FS and APT
 edge cases rather than anything architectural.
 
-### 8.8 Single-threaded by construction
+### 8.8 Guest code is single-threaded by construction
 
-Guest code will never use more than one host core (§4.2). On a phone, with a
-software GPU (§5.1) competing for the same core, that is a hard ceiling. The GPU
-is the one that can be parallelised without giving up determinism of the *CPU*
-side — do that before you consider parallel guest threads.
+Guest code will never use more than one host core (§4.2), and on a phone that is
+a hard ceiling. The advice here used to be "parallelise the GPU first, it is the
+one that can be done without giving up determinism" — that is now done (§5.2),
+and it was the right order: it bought a multiple with *byte-identical* output,
+which is a trade nothing on the CPU side can offer.
+
+What remains: one core for all guest code, forever, unless you are willing to
+lose deterministic runs. On a phone that is the number that decides whether a
+game is playable, and it is why §9.12 (moving shading off the CPU entirely)
+matters more than any further CPU-side micro-optimisation.
 
 ---
 
@@ -1291,26 +1406,45 @@ side — do that before you consider parallel guest threads.
 
 Ranked by (value ÷ effort), with what each depends on.
 
-### 9.1 Build a benchmark. First.
+**Re-ranked after the first speed round.** Two of these are done and one has
+moved to the top. `-O1`, the `recomp_find` cache and the `MemoryFill` fix
+together bought ~7x (§8.4), which retired most of 9.7 and the urgent half of
+9.1 — and moved the bottleneck to the software rasteriser. So the order is now
+roughly: **9.12 (hardware renderer)**, then 9.2 (the `-O1` → `-O2` unlock),
+then 9.1 (lock in what you measured), then 9.6 (interpreter fallback), then the
+IR chain 9.3 → 9.4 → 9.5, with 9.8/9.9/9.11 cheap and worth doing any time.
 
-`make bench`: a fixed workload (say, the hello world for N frames, plus a
-compute-heavy homebrew), built `-O2`, reporting guest instructions per second
-and wall-clock per frame, with a committed baseline. Also measure against
-Azahar's interpreter if you can, since beating it is the premise.
+### 9.1 Lock in what you measured (the benchmark, now for regressions)
 
-*Effort:* a day. *Value:* it turns every item below from an opinion into a
-measurement. Nothing else in this list should happen first.
+The profiling happened and it paid (§8.4), but ad hoc. What is still missing is
+a **committed, repeatable** measurement: `make bench` over a fixed workload
+(the hello world for N frames, a compute-heavy homebrew, and — locally only,
+never committed — a scripted N frames of the game) reporting frames per second
+and guest instructions per second against a stored baseline.
+
+The reason it still matters is no longer discovery, it is protection: you just
+earned 7x, and the next change that gives back 20% will not announce itself.
+Pair it with the **census** (what actually executes, ranked by count) — that is
+what tells you which functions deserve `-O2` and which deserve `-Oz` (§8.3),
+and which components are worth testing exhaustively.
+
+*Effort:* a day. *Value:* keeps the 7x, and aims the next round.
 
 ### 9.2 Narrow the computed-jump switches
 
 §3.5: emit `case` labels only for the targets discovery proved, not every
-instruction address in the function. This is probably what makes clang's `-O2`
-cost 10x, which is what forces `-O0`, which is what hides the project's actual
-speed. `_target_switch` already does the right thing where targets are known —
-extend it, and make "no proven targets" the exceptional path.
+instruction address in the function. `_target_switch` already does the right
+thing where targets are known — extend it, and make "no proven targets" the
+exceptional path.
 
-*Effort:* small, localised in `translate.py`. *Value:* potentially unlocks
-optimised builds entirely.
+This got *more* valuable, not less. `-O0` → `-O1` was worth 7x; `-O1` → `-O2`
+is the next increment and the giant switches are what still put it out of reach
+on a game (they are also why single generated files reach 100 MB and gigabytes
+of compiler memory, §8.3). Discovery now resolves far more jump tables than it
+did when this was written, so there is more to narrow.
+
+*Effort:* small, localised in `translate.py`. *Value:* plausibly the cheapest
+remaining CPU-side speedup, plus a smaller, faster build.
 
 ### 9.3 Introduce an IR between decode and emit
 
@@ -1355,13 +1489,15 @@ and it is the piece a distributable iOS app would need anyway. It is also legal
 on iOS, which is the whole reason it works.
 *Effort:* real but bounded, and the Unicorn harness tests it for free.
 
-### 9.7 O(1) indirect-call lookup
+### 9.7 O(1) indirect-call lookup — mostly done
 
-§3.6. Two-level table (page → array of `GuestFn`) keyed on the halfword offset
-from the text base. Measure first — if a game is vtable-heavy, this is free
-speed.
+§3.6. The profile said indirect-call lookup was a sixth of the run time, and a
+4096-entry direct-mapped cache took it off the list. What remains is the
+two-level table (page → array of `GuestFn`), which would be branch-free *and*
+need no invalidation — worth it only if `recomp_find` shows up near the top
+again, e.g. in a game that loads many CRO modules and calls across them.
 
-*Effort:* an afternoon in `emit_c.py` + `runtime.c`.
+*Effort:* an afternoon in `emit_c.py` + `runtime.c`, if it is ever needed.
 
 ### 9.8 An instruction fuzzer
 
@@ -1390,15 +1526,23 @@ end of fighting a disassembler for semantic facts.
 
 §7. It is a one-line change and a real decision; the cost of deferring grows.
 
-### 9.12 Plan the hardware GPU backend as a second implementation
+### 9.12 The hardware GPU backend — now the top item
 
-§5.1. Keep the software rasteriser as the reference oracle; add a Metal/Vulkan
-backend behind the same interface; diff frames between them. Remember that
-run-time *shader* compilation is allowed on iOS even though CPU JIT is not — so
-the GPU side does not have to be AOT.
+§5.1, §8.4. The measurement moved this from "someday" to "next": the CPU
+translation is at or near real time and the software rasteriser is what holds
+the frame rate at ~15 fps in 3D.
 
-*Effort:* large. *Value:* it is the difference between "correct" and "playable".
-Do it after the CPU side is measured and the interpreter exists.
+Keep the software path as the **reference oracle** — it is a correctness
+asset you cannot buy, and the §5.2 banding means it already produces
+deterministic, comparable frames. Add a Vulkan (later Metal) backend behind the
+same interface and diff frames between the two; any disagreement is a localised
+bug rather than a mystery. Two things in your favour: run-time *shader*
+compilation is allowed on iOS even though CPU JIT is not, so this half of the
+system may be dynamic; and the flush-on-state-change discipline (§5.2) is
+already close to how you would batch draws for a real GPU.
+
+*Effort:* large. *Value:* the difference between "correct" and "playable", and
+it is the only item on this list that can still buy an order of magnitude.
 
 ---
 
@@ -1419,15 +1563,16 @@ Do it after the CPU side is measured and the interpreter exists.
 | 3.3 | eager flags, 4 words | lazy flags | correct by construction | stores for flags nobody reads |
 | 3.4 | host stack mirrors guest | PC in a variable | native call/ret | longjmp/exceptions don't fit |
 | 3.5 | `goto` + big `switch` | structured recovery | exact CFG | huge switch tables; clang `-O2` cost |
-| 3.6 | sorted table + bsearch | hash / direct table | simple, compact | ~15 loads per indirect call |
+| 3.6 | sorted table + bsearch + a cache | two-level direct table | simple; the cache took it off the profile | a stale entry calls the wrong function, so flushes must be right |
 | 3.8 | back-edge budget | instruction count / real time | deterministic, cheap | loose relation to real time |
 | 3.9 | raw-bit VFP + ARM rules | soft-float / plain C | exact where it differs, fast where it doesn't | bit-twiddling; some modes unimplemented |
 | 4.1 | own HLE from docs | reuse Azahar / LLE | licence stays open | unbounded service surface |
 | 4.2 | pthread per guest thread, one at a time | preemptive / fibers | needs host stacks; fully deterministic | µs switches; one core only |
-| 4.3 | virtual clock | wall clock | deterministic; deadlock reports | not playable in real time |
+| 4.3 | virtual clock, `--speed N` paces it | wall clock | deterministic by default, playable on request | pacing only waits, never skips |
 | 4.6 | unknown = named stop (undocumented hardware: read zero, log once) | log and continue | always a named next task | one gap stops the app; the zero-reads are hypotheses |
 | 4.9 | services sample shared memory each frame | write traps / check per svc | flat memory has no write hooks | a guest that writes twice per frame loses a change |
-| 5.1 | own software GPU | Azahar's / host GPU | licence; pixel-exact oracle | far from real time |
+| 5.1 | own software GPU | Azahar's / host GPU | licence; pixel-exact oracle | ~15 fps in 3D: now the bottleneck |
+| 5.2 | rasterise in row-stripe bands on all cores | per-tile queues / a GPU thread | parallel with byte-identical output | no CPU/GPU overlap; state changes serialise |
 | 5.3 | interpret shaders, float32 | exact float24 / host shaders | shaders only exist at run time | precision artefacts possible |
 | 6.1 | Unicorn lockstep diff | exit-state compare | pinpoints the exact instruction | test-only dependency |
 | 6.5 | compat sweep as metric | curated suite | honest, external, regression-proof | needs devkitPro examples |
