@@ -1,4 +1,5 @@
 # any3ds
+[![Tests](https://github.com/mohammed-hajwani/any3ds/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/mohammed-hajwani/any3ds/actions/workflows/test.yml)
 
 A **static recompiler** for Nintendo 3DS code. It translates 32-bit ARM (ARMv6K) machine code ahead of time into C, which is then compiled into native code. The end goal is running 3DS software at native speed on iOS.
 
