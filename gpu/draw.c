@@ -607,13 +607,34 @@ static Color apply_fog(Color c, float depth)
 }
 
 /* One fragment at render-target pixel (x, y) (y measured from the bottom). */
+static uint64_t part_ns[GPU_T_COUNT];
+static uint64_t flushes, flushes_parallel;
+
+void gpu_time_add(int part, uint64_t ns)
+{
+    part_ns[part] += ns;
+}
+
 void gpu_stats_report(uint32_t frame)
 {
     static int on = -1;
+    static uint64_t since;
     if (on < 0)
         on = getenv("GPU_STATS") != NULL;
     if (!on || frame % 60)
         return;
+    uint64_t now = gpu_now_ns(), wall = since ? now - since : 0;
+    since = now;
+    if (wall) {
+        uint64_t gpu = part_ns[GPU_T_DRAW] + part_ns[GPU_T_RASTER] + part_ns[GPU_T_GX];
+        fprintf(stderr, "gpu time (frame %u): %.0f ms for 60 frames (%.1f fps): draw %.0f, raster %.0f, gx %.0f,"
+                " the rest (game code, OS) %.0f; %llu raster batches, %llu of them on all threads\n", frame,
+                wall / 1e6, 60e9 / (double)wall, part_ns[GPU_T_DRAW] / 1e6, part_ns[GPU_T_RASTER] / 1e6,
+                part_ns[GPU_T_GX] / 1e6, (double)(wall > gpu ? wall - gpu : 0) / 1e6,
+                (unsigned long long)flushes, (unsigned long long)flushes_parallel);
+    }
+    memset(part_ns, 0, sizeof part_ns);
+    flushes = flushes_parallel = 0;
     fprintf(stderr, "gpu stats (frame %u): %llu triangles (%llu clipped away, %llu culled), %llu fragments: "
             "%llu failed alpha, %llu stencil, %llu depth; %llu written (%llu read lighting while off)\n", frame,
             (unsigned long long)stats.tris, (unsigned long long)stats.clipped, (unsigned long long)stats.culled,
@@ -956,6 +977,8 @@ void pica_raster_flush(void)
 {
     if (!nqueue)
         return;
+    uint64_t t0 = gpu_now_ns();
+    flushes++;
     if (!nbands)
         pool_start();
     if (nbands == 1 || queue_pixels < 16384) {
@@ -967,7 +990,9 @@ void pica_raster_flush(void)
         nbands = all;
     } else {
         pool_run(raster_job);
+        flushes_parallel++;
     }
+    gpu_time_add(GPU_T_RASTER, gpu_now_ns() - t0);
     nqueue = 0;
     queue_pixels = 0;
 }
@@ -1294,10 +1319,19 @@ static void draw_parallel(const uint32_t *indices, uint32_t count, int dedup)
         assemble(&job_out[job_slot[i]]);
 }
 
+static void draw(int indexed);
+
 void pica_draw(int indexed)
 {
     if (gpu_skip_draws)
         return;
+    uint64_t t = gpu_now_ns();
+    draw(indexed);
+    gpu_time_add(GPU_T_DRAW, gpu_now_ns() - t);
+}
+
+static void draw(int indexed)
+{
     check_unsupported();
     int gs = geometry_shader_on();
     gs_inputs = 0;

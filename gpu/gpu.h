@@ -65,6 +65,12 @@ uint32_t f32_to_f24(float f);               /* truncates, as libctru's f32tof24 
    counts from the vblank). */
 void gpu_stats_report(uint32_t frame);
 
+/* GPU_STATS=1 also reports where the time went: wall-clock nanoseconds in
+   each part of the GPU (the rest is the game's code and the OS). */
+enum { GPU_T_DRAW, GPU_T_RASTER, GPU_T_GX, GPU_T_COUNT };
+uint64_t gpu_now_ns(void);
+void gpu_time_add(int part, uint64_t ns);
+
 /* Run a PICA command list: a stream of GPU register writes (regs.c). */
 void pica_run_command_list(uint32_t addr, uint32_t size);
 

@@ -1,10 +1,13 @@
 /* The GX commands: the GPU's 2D engines (memory fill, display transfer,
  * texture copy). */
+#define _POSIX_C_SOURCE 199309L     /* clock_gettime */
+
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "gpu.h"
 
@@ -75,7 +78,23 @@ uint32_t gpu_phys_to_virt(uint32_t paddr)
     return 0;
 }
 
+uint64_t gpu_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+static void memory_fill(uint32_t start, uint32_t value, uint32_t end, uint32_t control);
+
 void gx_memory_fill(uint32_t start, uint32_t value, uint32_t end, uint32_t control)
+{
+    uint64_t t = gpu_now_ns();
+    memory_fill(start, value, end, control);
+    gpu_time_add(GPU_T_GX, gpu_now_ns() - t);
+}
+
+static void memory_fill(uint32_t start, uint32_t value, uint32_t end, uint32_t control)
 {
     if (!start || !(control & 1))
         return;
@@ -99,7 +118,16 @@ void gx_memory_fill(uint32_t start, uint32_t value, uint32_t end, uint32_t contr
                 start, end, value, unit * 8);
 }
 
+static void display_transfer(uint32_t in, uint32_t out, uint32_t in_dim, uint32_t out_dim, uint32_t flags);
+
 void gx_display_transfer(uint32_t in, uint32_t out, uint32_t in_dim, uint32_t out_dim, uint32_t flags)
+{
+    uint64_t t = gpu_now_ns();
+    display_transfer(in, out, in_dim, out_dim, flags);
+    gpu_time_add(GPU_T_GX, gpu_now_ns() - t);
+}
+
+static void display_transfer(uint32_t in, uint32_t out, uint32_t in_dim, uint32_t out_dim, uint32_t flags)
 {
     uint32_t in_w = in_dim & 0xFFFF, in_h = in_dim >> 16, out_w = out_dim & 0xFFFF, out_h = out_dim >> 16;
     /* 3dbrew's flags: bit 1 linear -> tiled, bit 5 tiled -> tiled (both
