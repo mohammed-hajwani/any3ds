@@ -1,0 +1,11 @@
+name: Idea or feature
+description: Something any3ds should do
+labels: [idea]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What it would do and why. If you'd like to build it, say so and outline how.
+    validations:
+      required: true

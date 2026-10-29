@@ -172,6 +172,8 @@ dumps/  out/       gitignored: your own dumps and all generated code
 
 ## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full rules. In short:
+
 1. Branch off `main`, keep changes small, and make sure `make test` passes.
 2. A new instruction needs a test that exercises it, including its flag behaviour if it sets flags.
 3. Ask before adding dependencies or restructuring the layout.

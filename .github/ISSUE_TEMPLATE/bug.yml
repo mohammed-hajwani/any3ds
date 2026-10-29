@@ -1,0 +1,46 @@
+name: Game or bug report
+description: A game that stops, draws wrong or crashes, or a bug in the recompiler
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never post or ask for ROMs, keys or firmware, and don't attach game files or recompiled output. Such issues are closed.
+  - type: checkboxes
+    id: own
+    attributes:
+      label: Your dump
+      options:
+        - label: I dumped this game myself from a cartridge or console I own.
+          required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game, region and title ID
+      placeholder: "Game name (region), 00040000XXXXXXXX"
+    validations:
+      required: true
+  - type: input
+    id: hash
+    attributes:
+      label: SHA-256 of your dump
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: Where it stops or what looks wrong, and what you expected. A screenshot helps.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The last lines of output, including any `recomp:` / `hle:` / `gpu:` error.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: any3ds commit and host
+      placeholder: "4d8ac35, Windows 11 (run.exe)"
