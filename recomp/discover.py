@@ -800,6 +800,16 @@ class Discovery:
                     accepted.discard(g)
                     rejected[g[0] | g[1]] = 'inside the literal data of another function'
                 continue
+            # A guess that starts with text is a string kept in the code
+            # (Pokémon X's DllField has "swp_parts01" right before a real
+            # function, and decoded, the string ran into it and got that
+            # function dropped as "the middle").
+            text = {g for g in accepted if self._string_at(g[0])}
+            if text:
+                for g in text:
+                    accepted.discard(g)
+                    rejected[g[0] | g[1]] = 'a text string, not code'
+                continue
             falls = {a for fn in fns.values() for a in fn.falls_into}
             # ...unless the code before it ends in a filler nop: ARMCC puts
             # `mov r0, r0` where one function deliberately runs on into the
@@ -896,6 +906,22 @@ class Discovery:
         if insn is None or insn.id != ARM_INS_PUSH:
             return False
         return any(op.type == ARM_OP_REG and _reg_num(insn, op.reg) == 14 for op in insn.operands)
+
+    def _string_at(self, addr, least=6):
+        """Whether `least` or more printable ASCII characters and then a NUL
+        start at addr. ARM code never looks like that: an unconditional
+        instruction always has a byte of 0xE0 or more."""
+        raw = self.program.read(addr, 64)
+        if raw is None:
+            return False
+        n = 0
+        for b in raw:
+            if b == 0:
+                return n >= least
+            if not 0x20 <= b < 0x7F:
+                return False
+            n += 1
+        return False
 
     def _empty(self, start):
         """Whether a function start is an unconditional `bx lr`."""

@@ -93,10 +93,16 @@ def first_line(path, pattern):
 
 
 def classify_run(code, log):
-    """Turn the runner's exit code and log into (status, detail)."""
-    if 'exited via svcExitProcess' in log:
+    """Turn the runner's exit code and log into (status, detail). A clean
+    exit counts only with exit code 0 and no sanitizer report: a program
+    can print its exit and still fail afterwards."""
+    for pattern, what in ((r'ERROR: AddressSanitizer: (\S+)', 'ASan'), (r'runtime error: (.*)', 'UBSan')):
+        m = re.search(pattern, log)
+        if m:
+            return 'stops', f'{what}: {m[1]}'
+    if code == 0 and 'exited via svcExitProcess' in log:
         return 'runs', ''
-    if 'every thread has finished' in log:
+    if code == 0 and 'every thread has finished' in log:
         return 'runs', 'all threads ended without svcExitProcess'
     patterns = [
         (r'hle: svc (0x[0-9a-f]+) \((\S+)\) is not implemented', lambda m: f'svc {m[1]} {m[2]}'),
