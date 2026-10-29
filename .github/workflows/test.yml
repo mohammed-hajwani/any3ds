@@ -1,0 +1,93 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: make test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      # Official devkitPro 20260610 image, pinned to its linux/amd64 digest.
+      # It includes 3ds-dev; avoid the Cloudflare-protected installer.
+      image: devkitpro/devkitarm:20260610@sha256:15b79ce75822c289538d8153da5fa7aafe5e6adc32ad8a575a197beca0f0761b
+      # Let LeakSanitizer inspect processes without disabling leak checks.
+      options: --cap-add SYS_PTRACE
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEVKITPRO: /opt/devkitpro
+      DEVKITARM: /opt/devkitpro/devkitARM
+      PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install host tools
+        run: |
+          # The container is Debian 12, independently of the Ubuntu runner.
+          # libclang-rt-14-dev holds the ASan/UBSan runtimes the tests link.
+          apt-get update
+          apt-get install -y --no-install-recommends clang-14 libclang-rt-14-dev make python3-venv libunicorn-dev
+          # Some rules and scripts call plain `clang` (the compat sweep, for one).
+          ln -sf /usr/bin/clang-14 /usr/local/bin/clang
+          echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
+          echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchain and record versions
+        run: |
+          test -f "$DEVKITPRO/libctru/include/3ds.h"
+          test -x "$DEVKITPRO/tools/bin/picasso"
+          for example in graphics/printing/colored-text input/read-controls romfs threads/thread-basic; do
+            test -f "$DEVKITPRO/examples/3ds/$example/Makefile"
+          done
+          # The reference tests were developed against Unicorn 2.0.1.
+          unicorn_version=$(dpkg-query -W -f='${Version}' libunicorn-dev)
+          case "$unicorn_version" in
+            2.0.1|2.0.1-*|2.0.1.post1-*) ;;
+            *) echo "Unsupported Unicorn version: $unicorn_version"; exit 1 ;;
+          esac
+          {
+            echo '### Tool versions'
+            echo '```text'
+            cat /etc/os-release
+            clang-14 --version
+            make --version
+            bash --version
+            python3 --version
+            dpkg-query -W clang-14 libunicorn-dev python3
+            arm-none-eabi-gcc --version
+            dkp-pacman -Q devkitARM libctru picasso 3ds-examples
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache pip downloads
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ env.PIP_CACHE_DIR }}
+          key: devkitarm-20260610-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            devkitarm-20260610-pip-
+
+      - name: Build and run public tests
+        run: |
+          # Only pip downloads are cached. out/ and .venv build from scratch.
+          # GitHub pulls the pinned job image before any cache step can run.
+          started=$SECONDS
+          trap 'echo "Test step runtime: $((SECONDS - started)) seconds" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          make venv
+          .venv/bin/python -m pip freeze | tee -a "$GITHUB_STEP_SUMMARY"
+          # The Makefile assigns HOST_CC, so select clang on the command line.
+          make test HOST_CC=clang-14
