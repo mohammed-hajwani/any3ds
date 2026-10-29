@@ -273,6 +273,10 @@ static void pace(void)
     static uint64_t start_ticks;
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
+    if (gpu_skip_draws) {               /* fast-forwarding (GPU_SKIP_UNTIL): no pacing, start afresh after */
+        start.tv_sec = start.tv_nsec = 0;
+        return;
+    }
     if (!start.tv_sec && !start.tv_nsec) {
         start = now;
         start_ticks = now_ticks;
