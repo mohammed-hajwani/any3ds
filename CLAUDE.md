@@ -12,7 +12,7 @@ The pipeline:
 2. **Lift**: disassemble ARM/Thumb instructions (Capstone) and recover functions and control flow.
 3. **Emit**: write each guest function as a C function that operates on a CPU context struct.
 4. **Compile**: clang builds the C. During development the target is x86-64 Linux (WSL2); iOS comes much later.
-5. **Runtime**: OS calls (`SVC`) are routed to our own high-level emulation of the 3DS OS (`hle/`) and GPU (`gpu/`), written from public docs. No Azahar code is reused (the owner chose that at M8), so the licence stays open.
+5. **Runtime**: OS calls (`SVC`) are routed to our own high-level emulation of the 3DS OS (`hle/`) and GPU (`gpu/`), written from public docs. No Azahar code is reused (the owner chose that at M8).
 6. **Fallback**: indirect jumps go through a lookup table (guest address → host function). A miss is currently a hard stop naming the address; an interpreter fallback is planned.
 
 Started as "a CPU translator plus glue"; in practice the OS and GPU are ours too, kept as small as the programs need.
@@ -22,7 +22,7 @@ Started as "a CPU translator plus glue"; in practice the OS and GPU are ours too
 - Never commit game code, ROMs, dumps, decryption keys, firmware or recompiled output of commercial games. Keep all of that in `dumps/` and `out/`, which are gitignored.
 - Never download, search for or link to ROMs or keys.
 - Compatibility lists, per-game configs (addresses, patch points) and dump hashes are fine. They're metadata, not game code.
-- If any Azahar code is reused, the project must be GPLv2.
+- The project is GPL v2 or later (`LICENSE`, chosen by the owner). Code from elsewhere must be compatible with that.
 - Game analysis (decompiled code, Ghidra projects, memory dumps, traces, replay input files) stays in `out/`. It is never committed or published. Reading it while working is fine.
 
 ## Environment
@@ -229,7 +229,7 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
   2. Savestates, or at least a fixed benchmark replay, so iteration doesn't mean replaying 25,000 frames.
   3. An interpreter fallback for indirect calls to undiscovered code (most crashes so far were exactly that).
   4. A hardware renderer on the owner's RTX 4060 (Vulkan), then Metal for iOS. This needs a plan first.
-  5. CI (brief in `docs/handoff/ci.md`). The licence is the owner's choice: GPLv2-or-later was recommended.
+  5. CI: the workflow is in PR #1 (from `docs/handoff/ci.md`).
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function

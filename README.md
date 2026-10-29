@@ -45,14 +45,21 @@ L_00100054:
 Every architectural choice, the alternatives it was picked over, what it costs and where the
 levers are: [docs/architecture.md](docs/architecture.md).
 
-OS calls (`SVC`) go to `hle/`, our own high-level emulation of the 3DS kernel and services written from the public [3dbrew](https://www.3dbrew.org) docs: threads and synchronisation, IPC, APT, GSP, HID, FS (RomFS, saves, extdata), CFG, RO (CRO modules), Y2R and the DSP (audio inputs, and the AAC codec protocol, answered with silence). The GPU in `gpu/` is our own too. No emulator code is reused, so the licence stays open. Where 3dbrew is silent, behaviour comes from what the game's own code expects, and each such guess is logged when it is used. See [CLAUDE.md](CLAUDE.md) for the full design and roadmap.
+OS calls (`SVC`) go to `hle/`, our own high-level emulation of the 3DS kernel and services written from the public [3dbrew](https://www.3dbrew.org) docs: threads and synchronisation, IPC, APT, GSP, HID, FS (RomFS, saves, extdata), CFG, RO (CRO modules), Y2R and the DSP (audio inputs, and the AAC codec protocol, answered with silence). The GPU in `gpu/` is our own too: no other emulator's code is used. Where 3dbrew is silent, behaviour comes from what the game's own code expects, and each such guess is logged when it is used. See [CLAUDE.md](CLAUDE.md) for the full design and roadmap.
 
-## Legal rules (read before contributing)
+## Legal
+
+any3ds contains no Nintendo code, firmware or keys, and it doesn't help you
+get any. To run a commercial game you need a decrypted dump of a cartridge
+you own, made on your own console. Don't ask for ROMs or keys in issues or
+anywhere else: such requests are closed.
+
+### Rules for contributors
 
 - **Never commit** game code, ROMs, dumps, decryption keys, firmware, or recompiled output of commercial games. Keep all of it in `dumps/` and `out/`, which are gitignored.
 - **Never download, search for, or link to** ROMs or keys, including in issues and PRs.
 - Metadata is fine: compatibility lists, per-game configs (addresses, patch points) and dump hashes.
-- If any Azahar code is reused, the project becomes GPLv2.
+- Code from other emulators can only come in if its licence is compatible with GPL v2 or later.
 
 ## Setup
 
@@ -172,4 +179,6 @@ dumps/  out/       gitignored: your own dumps and all generated code
 
 ## License
 
-Not chosen yet. If Azahar code ends up being reused, it will be GPLv2.
+GPL v2 or later ([LICENSE](LICENSE)): you can use, change and share it,
+including in your own programs, as long as what you share stays open under
+the same terms.
