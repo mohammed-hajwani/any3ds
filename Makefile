@@ -458,6 +458,7 @@ $(M13)/cro_%.c: $(M13)/sdmc/mod_%.cro $(RECOMP_DEP)
 	$(PYTHON) -m recomp $< -o $@ > $(M13)/recomp_$*.log
 
 $(M13)/ro_test.elf: tests/m13/ro_test.c tests/m13/sequence.h
+	@mkdir -p $(M13)
 	$(ARM_CC) $(CTRU_FLAGS) -specs=3dsx.specs -L$(CTRU)/lib $< -lctru -lm -o $@
 
 $(M13)/gen_ro_test.c: $(M13)/ro_test.elf $(RECOMP_DEP)
