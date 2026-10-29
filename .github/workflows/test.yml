@@ -40,6 +40,8 @@ jobs:
           # The container is Debian 12, independently of the Ubuntu runner.
           apt-get update
           apt-get install -y --no-install-recommends clang-14 make python3-venv libunicorn-dev
+          # Some rules and scripts call plain `clang` (the compat sweep, for one).
+          ln -sf /usr/bin/clang-14 /usr/local/bin/clang
           echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
           echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
 
