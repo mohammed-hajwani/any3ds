@@ -16,7 +16,7 @@
  * Paths arrive as FS_Path: a type (1 empty, 2 binary, 3 ASCII, 4 UTF-16)
  * plus bytes the kernel copies across as a static buffer. SD paths are kept
  * inside the host folder: ".." is refused. */
-#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE             /* POSIX 2008, plus MAP_ANONYMOUS for host.h */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -24,9 +24,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "host.h"
 
 #include "service.h"
 
@@ -85,7 +86,7 @@ void fs_set_sdmc(const char *dir)
 void fs_set_save(const char *dir)
 {
     save_dir = dir;
-    mkdir(dir, 0755);
+    host_mkdir(dir);
     snprintf(save_data_dir, sizeof save_data_dir, "%s/data", dir);
 }
 
@@ -223,7 +224,7 @@ static int romfs_offset(const uint8_t *data, uint64_t size, uint64_t *offset, ui
 int fs_set_romfs(const char *path)
 {
     /* Mapped, not read: a game's RomFS is often over a gigabyte. */
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | HOST_O_BINARY);
     if (fd < 0)
         return 0;
     struct stat st;
@@ -231,13 +232,13 @@ int fs_set_romfs(const char *path)
         close(fd);
         return 0;
     }
-    uint8_t *data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    uint8_t *data = host_map_file(fd, (uint64_t)st.st_size);
     close(fd);
-    if (data == MAP_FAILED)
+    if (!data)
         return 0;
     uint64_t offset, length;
     if (!romfs_offset(data, (uint64_t)st.st_size, &offset, &length)) {
-        munmap(data, (size_t)st.st_size);
+        host_unmap_file(data, (uint64_t)st.st_size);
         return 0;
     }
     romfs = data + offset;
@@ -330,7 +331,7 @@ static void open_file(const char *root, uint32_t *cmd, uint32_t type, uint32_t s
     int mode = (flags & OPEN_WRITE) ? O_RDWR : O_RDONLY;
     if (flags & OPEN_CREATE)
         mode |= O_CREAT;
-    f->fd = open(f->path, mode, 0644);
+    f->fd = open(f->path, mode | HOST_O_BINARY, 0644);
     if (f->fd < 0) {
         free(f);
         ipc_reply(cmd, RES_FS_NOT_FOUND);
@@ -507,9 +508,9 @@ void fs_handle(KObj *session, uint32_t *cmd)
             exit(3);
         }
         snprintf(dir, sizeof dir, "%s/extdata", save_dir);
-        mkdir(dir, 0755);
+        host_mkdir(dir);
         extdata_dir(cmd[2], cmd[3], dir, sizeof dir);
-        if (mkdir(dir, 0755) != 0 && errno == EEXIST) {
+        if (host_mkdir(dir) != 0 && errno == EEXIST) {
             ipc_reply(cmd, RES_FS_EXISTS);
             return;
         }
@@ -544,7 +545,7 @@ void fs_handle(KObj *session, uint32_t *cmd)
             exit(3);
         }
         remove_tree(save_data_dir);
-        mkdir(save_data_dir, 0755);
+        host_mkdir(save_data_dir);
         SaveFormat fmt = { 0x100000, cmd[5], cmd[6], cmd[9] & 0xFF };
         char fpath[600];
         snprintf(fpath, sizeof fpath, "%s/format.bin", save_dir);
@@ -556,12 +557,12 @@ void fs_handle(KObj *session, uint32_t *cmd)
             ipc_reply(cmd, RES_FS_NOT_FOUND);
             return;
         }
-        int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+        int fd = open(path, O_RDWR | O_CREAT | O_EXCL | HOST_O_BINARY, 0644);
         if (fd < 0) {
             ipc_reply(cmd, errno == EEXIST ? RES_FS_EXISTS : RES_FS_NOT_FOUND);
             return;
         }
-        int ok = ftruncate(fd, (off_t)((uint64_t)cmd[8] << 32 | cmd[7])) == 0;
+        int ok = host_truncate(fd, (uint64_t)cmd[8] << 32 | cmd[7]) == 0;
         close(fd);
         ipc_reply(cmd, ok ? RES_OK : RES_FS_NOT_FOUND);
         return;
@@ -571,7 +572,7 @@ void fs_handle(KObj *session, uint32_t *cmd)
             ipc_reply(cmd, RES_FS_NOT_FOUND);
             return;
         }
-        ipc_reply(cmd, mkdir(path, 0755) == 0 ? RES_OK : errno == EEXIST ? RES_FS_EXISTS : RES_FS_NOT_FOUND);
+        ipc_reply(cmd, host_mkdir(path) == 0 ? RES_OK : errno == EEXIST ? RES_FS_EXISTS : RES_FS_NOT_FOUND);
         return;
     default:
         ipc_unhandled("fs:USER", cmd);
@@ -623,7 +624,7 @@ void fs_file_handle(KObj *session, uint32_t *cmd)
         return;
     }
     case 0x0805:    /* SetSize(u64) */
-        ipc_reply(cmd, f->fd >= 0 && ftruncate(f->fd, (off_t)offset) == 0 ? RES_OK : RES_FS_NOT_SUPPORTED);
+        ipc_reply(cmd, f->fd >= 0 && host_truncate(f->fd, offset) == 0 ? RES_OK : RES_FS_NOT_SUPPORTED);
         return;
     case 0x0808:    /* Close */
         if (f->fd >= 0)

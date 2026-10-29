@@ -5,18 +5,17 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/mman.h>
 
 #include "context.h"
+#include "host.h"
 
 #define GUEST_SPACE (UINT64_C(1) << 32)
 
 uint8_t *guest_mem_alloc(void)
 {
-    void *p = mmap(NULL, GUEST_SPACE, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (p == MAP_FAILED) {
-        perror("guest_mem_alloc: mmap 4 GiB");
+    void *p = host_reserve(GUEST_SPACE);
+    if (!p) {
+        perror("guest_mem_alloc: reserving 4 GiB");
         exit(1);
     }
     return p;
@@ -24,7 +23,7 @@ uint8_t *guest_mem_alloc(void)
 
 void guest_mem_free(uint8_t *mem)
 {
-    munmap(mem, GUEST_SPACE);
+    host_release(mem, GUEST_SPACE);
 }
 
 void recomp_bad_jump(Ctx *ctx, uint32_t from, uint32_t value)

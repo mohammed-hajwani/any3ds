@@ -1,6 +1,6 @@
 /* HLE kernel: objects, handles, the scheduler and the virtual clock.
  * See kernel.h for the threading model. */
-#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE             /* POSIX 2008, plus MAP_ANONYMOUS for host.h */
 #include <inttypes.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "gpu.h"
+#include "host.h"
 #include "kernel.h"
 
 #define MAX_THREADS 4096            /* every thread ever created (finished ones stay, for joins) */
@@ -305,7 +306,7 @@ static void vblank(void *arg)
         char tmp[1024];
         snprintf(tmp, sizeof tmp, "%s.tmp", config.live_path);
         if (gsp_dump_screens(tmp))
-            rename(tmp, config.live_path);
+            host_replace(tmp, config.live_path);
     }
 }
 

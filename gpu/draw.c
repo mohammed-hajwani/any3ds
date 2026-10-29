@@ -12,7 +12,7 @@
  *
  * Rasterising is spread over threads (raster_flush), with the same result
  * as one thread: each pixel is drawn by one thread, in triangle order. */
-#define _POSIX_C_SOURCE 200809L     /* sysconf */
+#define _DEFAULT_SOURCE             /* POSIX 2008, plus MAP_ANONYMOUS for host.h */
 
 #include <inttypes.h>
 #include <math.h>
@@ -20,8 +20,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
+#include "host.h"
 #include "pica.h"
 #include "lighting.h"
 #include "texture.h"
@@ -938,7 +938,7 @@ static void *raster_worker(void *arg)
 static void pool_start(void)
 {
     const char *env = getenv("GPU_THREADS");
-    long n = env ? strtol(env, NULL, 0) : sysconf(_SC_NPROCESSORS_ONLN);
+    long n = env ? strtol(env, NULL, 0) : host_cpus();
     nbands = n < 1 ? 1 : n > 16 ? 16 : (int)n;
     for (int b = 1; b < nbands; b++) {
         pthread_t th;
