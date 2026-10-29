@@ -100,6 +100,7 @@ typedef struct {
     const char *live_path;          /* if set: the screens are saved here every live_every frames */
     uint32_t live_every;
     uint32_t speed;                 /* 0: as fast as possible; N: N times the 3DS's own speed */
+    int window;                     /* show the screens in a window (window_open was called) */
 } HleConfig;
 void hle_run(uint8_t *mem, const HleConfig *config) __attribute__((noreturn));
 
@@ -133,6 +134,18 @@ void hid_hold_keys(uint32_t frame, uint32_t keys);
 void hid_touch(uint32_t frame, int down, uint32_t x, uint32_t y);
 void hid_input_file(const char *path);
 int  gsp_dump_screens(const char *path);
+/* The last frame both screens showed, 400x480 RGB (top above bottom), or
+   NULL before the first. */
+const uint8_t *gsp_screens_rgb(void);
+
+/* An on-screen window (runner --window; native Windows builds): shows the
+   screens each vblank and turns keys and the mouse into 3DS input.
+   window_open returns 0 where there is no window support. */
+int  window_open(int scale);
+void window_present(const uint8_t *rgb);
+uint32_t window_keys(void);                     /* held 3DS keys (libctru KEY_* bits) */
+int  window_touch(uint32_t *x, uint32_t *y);    /* 1 while the mouse is down on the bottom screen */
+int  window_closed(void);
 void fs_set_sdmc(const char *dir);          /* back the SD card with a host folder */
 void fs_set_save(const char *dir);          /* back the app's save data with a host folder */
 int  fs_set_romfs(const char *path);        /* the app's RomFS: an image, a .3dsx or a decrypted .cxi/.3ds */

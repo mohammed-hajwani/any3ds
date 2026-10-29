@@ -107,6 +107,11 @@ int gsp_dump_screens(const char *path)
     return 1;
 }
 
+const uint8_t *gsp_screens_rgb(void)
+{
+    return have_frame ? frame_rgb : NULL;
+}
+
 /* The GX command queue (shared memory + 0x800 + thread * 0x200): u8 first,
    u8 count, then 15 slots of 8 words from word 8. Word 0's low byte is
    the command. The app only triggers the queue when it was empty, so each

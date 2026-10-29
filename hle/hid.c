@@ -132,6 +132,12 @@ void hid_vblank(uint32_t frame)
     uint32_t touch[2] = { t && t->down ? t->value : 0, t ? t->down : 0 };
     if (input_path)
         read_input_file(&keys, touch);
+    keys |= window_keys();              /* the window's keyboard and mouse (runner --window) */
+    uint32_t wx, wy;
+    if (window_touch(&wx, &wy)) {
+        touch[0] = wx | wy << 16;
+        touch[1] = 1;
+    }
 
     uint32_t pad[4] = { keys, keys & ~last_keys, last_keys & ~keys, 0 };
     if (keys != last_keys)

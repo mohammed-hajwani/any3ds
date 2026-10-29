@@ -298,6 +298,8 @@ static void vblank(void *arg)
         fprintf(stderr, "hle: tracing from frame %" PRIu32 "\n", frame_count);
     }
     gsp_vblank();
+    if (config.window)
+        window_present(gsp_screens_rgb());
     hid_vblank(frame_count);
     gpu_frame(frame_count);
     if (config.live_path && frame_count % config.live_every == 0) {

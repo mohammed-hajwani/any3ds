@@ -2,7 +2,7 @@
  *
  *   runner [--max-seconds N] [--hold FRAME:KEYS]... [--touch FRAME:X,Y|FRAME:up]...
  *          [--sdmc DIR] [--save DIR] [--romfs FILE] [--shared-font FILE] [--dump FILE.bmp]
- *          [--live FILE.bmp] [--input FILE] [--speed N]
+ *          [--live FILE.bmp] [--input FILE] [--speed N] [--window SCALE]
  *
  * --hold presses buttons from a frame on (KEYS in hex, libctru's KEY_*
  * bits; 0 releases them), e.g. --hold 10:8 holds START from frame 10.
@@ -17,6 +17,10 @@
  * buttons live from FILE every frame: the held keys in hex, then
  * optionally "X Y" to touch the bottom screen (tools/live_server.py writes
  * it from the buttons on that page).
+ * --window SCALE (native Windows builds) shows the screens in a window,
+ * SCALE times their size, drawn with Vulkan, and plays them with the
+ * keyboard and mouse (keys in hle/window.c); it runs at the 3DS's own speed
+ * unless --speed says otherwise.
  * --speed N paces the run against the real clock: 1 is the 3DS's own
  * speed (to play), 2 twice that; 0 (the default) runs as fast as it can.
  * --dump saves the last frame shown when the program exits: the top
@@ -45,13 +49,14 @@ static void usage(void)
 {
     fprintf(stderr, "usage: runner [--max-seconds N] [--hold FRAME:KEYS]... [--touch FRAME:X,Y|FRAME:up]...\n"
                     "              [--sdmc DIR] [--save DIR] [--romfs FILE] [--shared-font FILE] [--dump FILE.bmp]\n"
-                    "              [--live FILE.bmp] [--input FILE]\n");
+                    "              [--live FILE.bmp] [--input FILE] [--speed N] [--window SCALE]\n");
     exit(2);
 }
 
 int main(int argc, char **argv)
 {
     HleConfig config = { .max_seconds = 30, .on_exit = on_exit_dump };
+    int speed_set = 0, window_scale = 0;
     for (int i = 1; i < argc; i++) {
         if (i + 1 >= argc)
             usage();
@@ -86,6 +91,10 @@ int main(int argc, char **argv)
             }
         } else if (strcmp(argv[i], "--speed") == 0) {
             config.speed = (uint32_t)strtoul(argv[++i], NULL, 0);
+            speed_set = 1;
+        } else if (strcmp(argv[i], "--window") == 0) {
+            window_scale = (int)strtol(argv[++i], NULL, 0);
+            config.window = 1;
         } else if (strcmp(argv[i], "--live") == 0) {
             config.live_path = argv[++i];
             config.live_every = 30;
@@ -96,6 +105,13 @@ int main(int argc, char **argv)
         } else {
             usage();
         }
+    }
+
+    if (config.window) {
+        if (!window_open(window_scale))
+            return 2;
+        if (!speed_set)
+            config.speed = 1;
     }
 
     uint8_t *mem = guest_mem_alloc();
