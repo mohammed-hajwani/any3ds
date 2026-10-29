@@ -8,14 +8,14 @@ Why: iOS forbids JIT, so 3DS emulators on iPhone fall back to slow interpreters.
 
 The pipeline:
 
-1. **Load**: read the program (homebrew ELF for now; later `code.bin` + CROs from a user's own dump).
+1. **Load**: read the program: a homebrew ELF, or `code.bin` + CRO modules from a user's own decrypted dump.
 2. **Lift**: disassemble ARM/Thumb instructions (Capstone) and recover functions and control flow.
 3. **Emit**: write each guest function as a C function that operates on a CPU context struct.
 4. **Compile**: clang builds the C. During development the target is x86-64 Linux (WSL2); iOS comes much later.
-5. **Runtime**: OS calls (`SVC`) are routed to high-level emulation of the 3DS OS. The long-term plan is to reuse Azahar's HLE services, kernel and GPU code, and replace only its CPU backend with our precompiled code.
-6. **Fallback**: indirect jumps that can't be resolved statically go through a lookup table (guest address → host function); misses drop into an interpreter.
+5. **Runtime**: OS calls (`SVC`) are routed to our own high-level emulation of the 3DS OS (`hle/`) and GPU (`gpu/`), written from public docs. No Azahar code is reused (the owner chose that at M8), so the licence stays open.
+6. **Fallback**: indirect jumps go through a lookup table (guest address → host function). A miss is currently a hard stop naming the address; an interpreter fallback is planned.
 
-We are **not** writing a full emulator. We are writing a CPU translator plus glue.
+Started as "a CPU translator plus glue"; in practice the OS and GPU are ours too, kept as small as the programs need.
 
 ## Hard rules (legal)
 
@@ -23,6 +23,7 @@ We are **not** writing a full emulator. We are writing a CPU translator plus glu
 - Never download, search for or link to ROMs or keys.
 - Compatibility lists, per-game configs (addresses, patch points) and dump hashes are fine. They're metadata, not game code.
 - If any Azahar code is reused, the project must be GPLv2.
+- Game analysis (decompiled code, Ghidra projects, memory dumps, traces, replay input files) stays in `out/`. It is never committed or published. Reading it while working is fine.
 
 ## Environment
 
@@ -32,24 +33,29 @@ We are **not** writing a full emulator. We are writing a CPU translator plus glu
 - **clang** compiles the generated C on the host.
 - iOS builds come much later (Theos on Linux + SideStore sideloading). Ignore them for now.
 
-## Repo layout (planned)
+## Repo layout
 
 ```
 recomp/            Python recompiler
-  elf_loader.py    read ELF sections and symbols
-  disasm.py        Capstone wrapper (ARM mode first, Thumb later)
-  translate.py     instruction → C statement(s)
-  emit_c.py        writes functions + a dispatch table to a .c file
-  __main__.py      CLI: python -m recomp <input.elf> -o out/gen.c
-runtime/
-  context.h        CPU context struct + memory helpers
-hle/               the OS layer: kernel (threads, sync, IPC) + services (srv, APT, GSP, HID, FS)
-gpu/               our own PICA200 GPU: GX engines, command lists, shader interpreter, rasteriser
-tests/
-  compat/          the compatibility sweep over devkitPro's 3ds-examples (make compat)
-  m0/              milestone 0 test program + harness
-dumps/             (gitignored) user's own dumps
-out/               (gitignored) generated code
+  elf_loader.py    ELF sections and symbols (homebrew, tests)
+  ctr_loader.py    code.bin from a decrypted .3ds/.cxi (ExeFS)
+  romfs.py         RomFS reader (CROs, game files)
+  cro.py           CRO modules: segments, relocations, imports/exports
+  discover.py      function discovery without symbols (see "Discovery" under Status)
+  disasm.py        Capstone wrapper
+  translate.py     instruction -> C statement(s)
+  emit_c.py        functions, dispatch table, program image
+  __main__.py      CLI: python -m recomp <elf|dump> [--cro NAME] -o out/gen.c
+runtime/           CPU context, VFP rules, guest memory, recomp_find (with a cache)
+hle/               the OS: kernel.c svc.c ipc.c + one file per service (srv apt gsp hid fs cfg ro y2r dsp stubs)
+gpu/               the PICA200: gx.c (2D engines) regs.c (command lists) shader.c draw.c (pipeline,
+                   multithreaded) texture.c lighting.c pixel.c
+tools/             build_dump.sh (recompile a dump), live_server.py + live.html (live view and buttons),
+                   progress.py (docs/progress.svg), gen_regnames.py
+tests/             m0-m5, real, m6 (libctru on the HLE), m11 (code.bin without symbols), m13 (CROs),
+                   gpu, dsp, y2r, compat (devkitPro examples)
+docs/              compat.md, architecture.md, progress.svg, handoff/ (briefs for other assistants)
+dumps/  out/       (gitignored) the user's own dumps; all generated code and analysis
 ```
 
 ## Core conventions for generated code
@@ -196,6 +202,34 @@ static inline void     write32(Ctx *c, uint32_t a, uint32_t v) { memcpy(c->mem +
     - Fixed-size mode: each vertex's outputs go into float uniforms from `start`, `stride` registers apart; after `count` vertices the shader runs. particles gets past it, then stops at procedural noise.
     - Variable-size mode: 3dbrew barely documents it, so the layout comes from the loop_subdivision example's data. The first index of each primitive is the vertex count (into c0, not shaded). The first GSH_MISC1 + 1 vertices write `stride` registers each from c1, and later vertices write one register each. loop_subdivision renders.
   - **Left:** procedural noise is undocumented and stays a named stop; the system font is firmware. Compat: 49 run, 5 stop, 8 don't build.
+- **M11 done: retail code without symbols.** `recomp/ctr_loader.py` reads `code.bin` from a decrypted dump; `recomp/discover.py` finds functions by recursive descent from the entry and exports, plus guesses from pointers. `make test-m11` runs the hello world from symbol-less code; `make compat COMPAT_ARGS=--from-code` runs every example that way.
+- **M12 done: the DSP (`hle/dsp.c`), silent.** Inputs are consumed at the real rate (so code waiting for buffers carries on); no samples are produced. `make test-dsp` drives it with libctru's ndsp.
+- **M13 done: CRO modules.** `recomp --cro NAME` recompiles a module relative to its load address; `hle/ro.c` loads, relocates and links them. `make test-m13` uses two modules built from our own C.
+- **Pokémon X (the owner's own dump) is playable** from boot through the intro, name entry, Vaniville Town, Route 1 and Aquacorde Town, all in 3D. Build with `tools/build_dump.sh DUMP out/game` (about 8 minutes; `OS_ONLY=1` relinks just the OS layer in seconds). What it took, and the lessons:
+  - **Discovery** (`recomp/discover.py`). Every rule came from a crash naming an untranslated address:
+    - Pointer guesses that real code "runs into" are dropped as the middle of a function, except: after a filler nop; addresses the CRO loader links to; a `push {…, lr}` prologue; an empty function (`bx lr`).
+    - Guesses inside another function's literal pool, or starting with a NUL-terminated text string (6+ printable characters), are data.
+    - Jump tables: gcc/ARMCC forms, hand-written "based" tables (`add pc, rT, rO`; zero entries are unused slots), and an interpreter's dispatch (`ldr rX, [rT, rI, lsl #2]; bx rX`, Pokémon X's script engine): every table entry is a function.
+    - Calls in disguise: `lr` set from pc (in one or two steps) before a jump.
+    - To ask discovery why an address isn't a function, check `out/game/gen.discovery.txt` (main program) or run discovery on the module and read `report['rejected']`.
+  - **OS lessons:**
+    - CFG block 0x00050005 (stereo display settings, undocumented) holds physical values; zeros made every 3D vertex NaN.
+    - RO: after LoadCRO the game copies a module's .data itself, from header 0xB8. That field must be an address, and the fixed-up .data must be in the file's .data. Getting this wrong garbled the field's camera and tables.
+    - DSP: the app may write both shared regions between two DSP frames, so changes from both are applied (older first). Codec 1 is AAC: its message layout was read from the game's own client (3dbrew doesn't document it); we answer with silence, which the music streams need to become "prepared".
+    - GPU: a combiner reading a texture unit that is off, or lighting that is off, reads zero (logged once). DisplayTransfer tiled->tiled and equal-size downscaling; projection textures.
+  - **Speed:** generated code builds at `-O1` (7x faster than `-O0`). Drawing runs on all cores: triangles are queued and drawn in bands of rows before the next write to a register below 0x200 (the pixel stage reads nothing above), so output is identical to one thread. Big draws shade their vertices on all cores; indexed draws reuse shaded vertices. About 10-15 fps in towns.
+  - **Debugging tools:**
+    - Runs are deterministic. The live log records every input (`-> HID: frame …`), and `--hold FRAME:KEYS` / `--touch FRAME:X,Y` replay them exactly (`out/game/inputs_*.args`).
+    - Switches: `GPU_SKIP_UNTIL=N` fast-forwards to frame N without drawing. `GPU_TRACE=N` and `HLE_TRACE=N` trace from frame N. `GPU_STATS=1` prints counts each second. `RO_TRACE=1` logs module buffers. `RECOMP_NAN=1` reports where NaNs are made. `GPU_THREADS=N` / `GPU_PARALLEL_MIN=N` control threading. `CFG_STEREO=…` and `GPU_UNSET=white` are for experiments.
+    - Runner options: `--live FILE.bmp` + `--input FILE` (the browser live view, `tools/live_server.py`), `--speed 1` (real 3DS speed).
+    - For a stuck game: attach gdb, and call `report_threads()` for every thread's wait. Breakpoints on `f_XXXXXXXX` / `cro_MODULE_XXXXXXXX` count calls. A hardware watchpoint on `kernel_mem() + addr` catches whoever writes a guest address.
+    - Ghidra 12 headless (in the owner's tools folder; project `out/rea/ghidra_project`) decompiles the main program for reading.
+- **Next:**
+  1. Keep playing Pokémon X: the starter Pokémon and the first battle (new modules).
+  2. Savestates, or at least a fixed benchmark replay, so iteration doesn't mean replaying 25,000 frames.
+  3. An interpreter fallback for indirect calls to undiscovered code (most crashes so far were exactly that).
+  4. A hardware renderer on the owner's RTX 4060 (Vulkan), then Metal for iOS. This needs a plan first.
+  5. CI (brief in `docs/handoff/ci.md`). The licence is the owner's choice: GPLv2-or-later was recommended.
 - Run everything with `make test`, inside WSL (`wsl -d Ubuntu-24.04 -u root --cd /mnt/c/any3ds -- bash -lc 'make test'`).
 
 ## Milestone 0: recompile one function
@@ -230,7 +264,7 @@ Only implement the instructions this function actually compiles to (check with `
 4. **M4:** Thumb mode and ARM/Thumb interworking (`bx` with bit 0 set).
 5. **M5:** VFP floating point.
 6. **M6:** a full libctru homebrew app, with `SVC` routed to a stub OS layer, then to Azahar's HLE.
-7. **Later:** cycle counting per block (Azahar's timers and vblank depend on it), CRO relocation, an indirect-jump table + interpreter fallback, a Metal renderer via MoltenVK, and the iOS shell app.
+7. **Later** (see Status for the current plan): an interpreter fallback, a hardware renderer (Vulkan, then Metal), savestates, and the iOS shell app.
 
 ## How to work on this
 
