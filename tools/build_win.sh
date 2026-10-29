@@ -29,7 +29,7 @@ ln -sfn /usr/include/vk_video "$vkinc/vk_video"
 
 CC="clang --target=x86_64-w64-mingw32"
 GEN_FLAGS="-std=c11 -O1 -g0 -w -fno-math-errno -Iruntime"
-OS_FLAGS="-std=c11 -O1 -Wall -Wextra -fno-math-errno -isystem $vkinc -Iruntime -Ihle -Igpu -pthread"
+OS_FLAGS="-std=c11 -O1 -Wall -Wextra -fno-math-errno -D_FILE_OFFSET_BITS=64 -isystem $vkinc -Iruntime -Ihle -Igpu -pthread"
 
 if [ "${OS_ONLY:-0}" != 1 ] || [ ! -f "$win/gen.o" ]; then
     echo "== compiling the game for Windows ($gen_jobs jobs)"
@@ -41,6 +41,8 @@ for f in tests/m6/runner.c runtime/runtime.c hle/*.c gpu/*.c; do echo "$f"; done
     | xargs -P "$jobs" -I{} sh -c "$CC $OS_FLAGS -c {} -o $win/os_\$(basename {} .c).o"
 
 echo "== linking $win/run.exe"
-$CC -static -pthread "$win"/gen*.o "$win"/cro/*.o "$win/modules.o" "$win"/os_*.o -lm -o "$win/run.exe"
+# The guest main thread runs on the process main thread: give it the 16 MB
+# that guest threads get (HOST_STACK in hle/kernel.c), not Windows' 1 MB.
+$CC -static -pthread -Wl,--stack,16777216 -Wl,-Map,"$win/run.map" "$win"/gen*.o "$win"/cro/*.o "$win/modules.o" "$win"/os_*.o -lm -o "$win/run.exe"
 echo "built $win/run.exe"
 since

@@ -45,6 +45,30 @@ static void on_exit_dump(void)
         fprintf(stderr, "hle: no frame was ever shown, nothing to dump\n");
 }
 
+#ifdef _WIN32
+#include <windows.h>
+
+/* Windows has no core dumps: say where the crash was. The host address,
+   less the image base, finds the function in the linker map
+   (tools/build_win.sh writes run.map); a guest address is shown too. */
+static LONG WINAPI on_crash(EXCEPTION_POINTERS *e)
+{
+    EXCEPTION_RECORD *r = e->ExceptionRecord;
+    uintptr_t at = (uintptr_t)r->ExceptionAddress, base = (uintptr_t)GetModuleHandleA(NULL);
+    fprintf(stderr, "hle: crash: exception %08lx at host %p (image base + 0x%" PRIxPTR ")\n",
+            (unsigned long)r->ExceptionCode, r->ExceptionAddress, at - base);
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2) {
+        uintptr_t addr = (uintptr_t)r->ExceptionInformation[1], mem = (uintptr_t)kernel_mem();
+        fprintf(stderr, "hle: crash: %s host %p", r->ExceptionInformation[0] ? "writing" : "reading", (void *)addr);
+        if (addr - mem < ((uintptr_t)1 << 32))
+            fprintf(stderr, " (guest 0x%08" PRIxPTR ")", addr - mem);
+        fputc('\n', stderr);
+    }
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 static void usage(void)
 {
     fprintf(stderr, "usage: runner [--max-seconds N] [--hold FRAME:KEYS]... [--touch FRAME:X,Y|FRAME:up]...\n"
@@ -55,6 +79,9 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(on_crash);
+#endif
     HleConfig config = { .max_seconds = 30, .on_exit = on_exit_dump };
     int speed_set = 0, window_scale = 0;
     for (int i = 1; i < argc; i++) {
