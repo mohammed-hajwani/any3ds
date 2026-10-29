@@ -46,6 +46,13 @@ test: test-m0 test-m1 test-m2 test-m3 test-m4 test-m5 test-real test-gpu test-m6
 
 venv: $(VENV)/.installed
 
+# Random public instruction programs, checked by the existing M3 driver.
+SEED ?= 1
+N ?= 200
+.PHONY: fuzz
+fuzz: $(VENV)/.installed
+	HOST_CC='$(HOST_CC)' HOST_FLAGS='$(HOST_FLAGS)' ARM_CC='$(ARM_CC)' OBJDUMP='$(OBJDUMP)' $(PYTHON) tests/fuzz/gen.py --seed $(SEED) -n $(N)
+
 $(VENV)/.installed: requirements.txt
 	python3 -m venv $(VENV)
 	$(PYTHON) -m pip install -q -r requirements.txt

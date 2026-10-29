@@ -29,7 +29,9 @@ ln -sfn /usr/include/vk_video "$vkinc/vk_video"
 
 CC="clang --target=x86_64-w64-mingw32"
 GEN_FLAGS="-std=c11 -O1 -g0 -w -fno-math-errno -Iruntime"
-OS_FLAGS="-std=c11 -O1 -Wall -Wextra -fno-math-errno -D_FILE_OFFSET_BITS=64 -isystem $vkinc -Iruntime -Ihle -Igpu -pthread"
+# MinGW's GCC runtime uses emulated TLS. Clang's native _Thread_local
+# accesses crash even in a standalone pthread probe with this static link.
+OS_FLAGS="-std=c11 -O1 -Wall -Wextra -fno-math-errno -femulated-tls -D_FILE_OFFSET_BITS=64 -isystem $vkinc -Iruntime -Ihle -Igpu -pthread"
 
 if [ "${OS_ONLY:-0}" != 1 ] || [ ! -f "$win/gen.o" ]; then
     echo "== compiling the game for Windows ($gen_jobs jobs)"
