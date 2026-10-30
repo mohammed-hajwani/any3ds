@@ -61,8 +61,18 @@ it.
    lavapipe; all 400-odd GPU batches give frames identical to software.
    Shaders: `gpu/shaders/`, compiled into the committed `gpu/vkr_shaders.h`
    by `make shaders`.
-3. **Textures and combiners:** the uber-shader, the texture cache. Check: the
-   textured and citro2d examples.
+3. **Textures and combiners** (done): units 0-2 are decoded by texture.c's
+   decoder into RGBA8 images (every reachable mip level, cube faces as
+   layers), cached by address, size, format and a hash of their bytes. The
+   shader reads texels with texelFetch and does texture.c's wrap, border,
+   filtering, LOD and mip selection itself. Attributes reach the shader
+   divided by w with 1/w beside them, and it divides as draw.c does; the
+   neighbours for mipmapping come from the exact slopes of those affine
+   values. Units that are off read zero, as in software. Check: textured_cube
+   and cubemap within one step of rounding on 2-3 pixels. Pokémon X in
+   Lumiose's first square: about half its batches on the GPU (the frame
+   within 4/255 of software); the rest need fragment lighting. A batch that
+   stays on software is counted by reason, printed at exit.
 4. **Fragment ops, lighting and fog** in the shader; stencil, blending and
    logic ops in Vulkan state. Check: all 49 working examples match.
 5. **Pokémon X:** the surface cache's read-back points, render to texture,

@@ -39,6 +39,7 @@ typedef struct { float a[NSEM]; } Vertex;
    attributes divided by w (so they interpolate perspective-correctly)
    along with 1/w. */
 typedef struct { float x, y, z, inv_w; float a[NSEM]; } WinVertex;
+_Static_assert(NSEM == VKR_SLOTS, "gpu/vkr.h's vertices carry every attribute slot");
 
 /* ---------------------------------------------------------------- vertices */
 
@@ -975,9 +976,9 @@ static void raster_job(int band)
 }
 
 /* The batch on the GPU (gpu/vkr.c): culled here by raster_triangle's test,
-   then put in clip space for Vulkan, whose first row is the target's first
-   memory row (the window's y = 0 is the last). Colours go back from a/w to
-   a: Vulkan interpolates perspective-correctly with w itself. */
+   then put in Vulkan's coordinates, whose first row is the target's first
+   memory row (the window's y = 0 is the last). The attributes stay divided
+   by w: the pixel shader interpolates them as interpolate() does. */
 static void draw_vulkan(void)
 {
     static VkrVertex *verts;
@@ -1000,15 +1001,12 @@ static void draw_vulkan(void)
             continue;
         }
         for (int k = 0; k < 3; k++) {
-            float w = 1.0f / v[k].inv_w;
             VkrVertex *o = &verts[n++];
-            o->pos[0] = (2 * v[k].x / (float)t->width - 1) * w;
-            o->pos[1] = (1 - 2 * v[k].y / (float)t->height) * w;
-            o->pos[2] = 0;
-            o->pos[3] = w;
-            for (int c = 0; c < 4; c++)
-                o->color[c] = v[k].a[SEM_COLOR + c] * w;
+            o->x = 2 * v[k].x / (float)t->width - 1;
+            o->y = 1 - 2 * v[k].y / (float)t->height;
             o->z = v[k].z;
+            o->inv_w = v[k].inv_w;
+            memcpy(o->a, v[k].a, sizeof o->a);
         }
     }
     VkrTarget vt = { t->color, t->depth, t->width, t->height, t->color_fmt, t->depth_fmt,

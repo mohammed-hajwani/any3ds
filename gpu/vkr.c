@@ -36,6 +36,7 @@
 #endif
 
 #include "pica.h"
+#include "texture.h"
 #include "vkr.h"
 #include "vkr_shaders.h"
 
@@ -55,7 +56,7 @@ static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
     X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) \
     X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdSetViewport) \
     X(vkCmdSetScissor) X(vkCmdSetBlendConstants) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) \
-    X(vkCmdSetStencilReference) X(vkCmdDraw)
+    X(vkCmdSetStencilReference) X(vkCmdDraw) X(vkCreateSampler)
 static PFN_vkCreateInstance vkCreateInstance;
 INSTANCE_FNS(VKFN)
 DEVICE_FNS(VKFN)
@@ -69,15 +70,20 @@ static VkDevice device;
 static VkQueue queue;
 static uint32_t family;
 static int has_logic_op;
+static void make_dummy(void);
 static VkCommandPool pool;
-static VkCommandBuffer cmd;
-static VkFence done;
+static VkCommandBuffer cmd, tcmd;       /* drawing; texture uploads */
+static VkFence done, tdone;
+static VkSampler sampler;
+static VkImageView dummy_view;          /* for units the combiners don't read */
 static VkRenderPass pass;
 static VkDescriptorSetLayout set_layout;
 static VkPipelineLayout layout;
 static VkDescriptorSet set;
 static VkShaderModule vert, frag;
 static uint64_t batches;                /* drawn here, reported at exit */
+#define NWHY 16
+static struct { const char *why; uint64_t n; } refusals[NWHY];     /* left to software, by reason */
 
 typedef struct {
     VkBuffer buf;
@@ -89,7 +95,8 @@ typedef struct {
 static Buffer ubo = { .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT },
               vbo = { .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT },
               up = { .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT },
-              down = { .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+              down = { .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT },
+              tup = { .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
 
 /* A render target's GPU images, by size: the colour (RGBA8) and the
    depth/stencil. */
@@ -271,17 +278,21 @@ static void make_pass(void)
 
 static void make_layout(void)
 {
-    VkDescriptorSetLayoutBinding b = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    VkDescriptorSetLayoutBinding b[2] = {
+        { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+        { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+    };
     VkDescriptorSetLayoutCreateInfo li = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                           .bindingCount = 1, .pBindings = &b };
+                                           .bindingCount = 2, .pBindings = b };
     check(vkCreateDescriptorSetLayout(device, &li, NULL, &set_layout), "vkCreateDescriptorSetLayout");
     VkPipelineLayoutCreateInfo pi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                       .setLayoutCount = 1, .pSetLayouts = &set_layout };
     check(vkCreatePipelineLayout(device, &pi, NULL, &layout), "vkCreatePipelineLayout");
 
-    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
+                                   { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
-                                       .poolSizeCount = 1, .pPoolSizes = &ps };
+                                       .poolSizeCount = 2, .pPoolSizes = ps };
     VkDescriptorPool dpool;
     check(vkCreateDescriptorPool(device, &dpi, NULL, &dpool), "vkCreateDescriptorPool");
     VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool,
@@ -297,6 +308,9 @@ static void make_layout(void)
 static void report(void)
 {
     fprintf(stderr, "gpu: %llu batches drawn with Vulkan\n", (unsigned long long)batches);
+    for (int i = 0; i < NWHY && refusals[i].why; i++)
+        fprintf(stderr, "gpu: %llu batches left to software for %s\n", (unsigned long long)refusals[i].n,
+                refusals[i].why);
 }
 
 static void init(void)
@@ -339,11 +353,19 @@ static void init(void)
     VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool,
                                        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
     check(vkAllocateCommandBuffers(device, &ai, &cmd), "vkAllocateCommandBuffers");
+    check(vkAllocateCommandBuffers(device, &ai, &tcmd), "vkAllocateCommandBuffers");
     VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     check(vkCreateFence(device, &fi, NULL, &done), "vkCreateFence");
+    check(vkCreateFence(device, &fi, NULL, &tdone), "vkCreateFence");
+    /* The shader reads texels with texelFetch: the sampler only has to exist. */
+    VkSamplerCreateInfo smi = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST,
+                                .minFilter = VK_FILTER_NEAREST, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                                .maxLod = 16 };
+    check(vkCreateSampler(device, &smi, NULL, &sampler), "vkCreateSampler");
 
     make_pass();
     make_layout();
+    make_dummy();
     vert = shader(draw_vert_spv, sizeof draw_vert_spv);
     frag = shader(draw_frag_spv, sizeof draw_frag_spv);
 
@@ -429,6 +451,232 @@ static Surface *get_surface(uint32_t w, uint32_t h)
     return s;
 }
 
+/* ---------------------------------------------------------------- textures */
+
+/* Texture units 0-2's textures, decoded to RGBA8 by texture.c's decoder:
+   rows in memory order, cube faces as layers, and every mip level
+   texture.c's sampling can reach. Kept by address, size, format and a hash
+   of the bytes, so a texture the game rewrites is decoded again. */
+typedef struct {
+    uint32_t addr[6], width, height, format, faces, levels;
+    uint64_t hash;
+} TexKey;
+typedef struct {
+    TexKey key;
+    VkImage img;
+    VkDeviceMemory mem;
+    VkImageView view;
+    uint64_t used;
+} Texture;
+#define NTEX 512
+static Texture textures[NTEX];
+
+static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
+{
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+
+/* The levels texture.c's tex_sample can read: up to the unit's largest
+   level, stopping at 8 texels (its loop), plus the next for trilinear. */
+static uint32_t tex_levels(const TexUnit *t)
+{
+    uint32_t max_level = t->lod >> 16 & 15, n = 1, w = t->width, h = t->height;
+    for (uint32_t l = 0; l < max_level && w > 8 && h > 8; l++, n++) {
+        w /= 2;
+        h /= 2;
+    }
+    return n;
+}
+
+static void upload_texture(Texture *x, const TexUnit *t, const uint8_t *const *data)
+{
+    const TexKey *k = &x->key;
+    VkImageCreateInfo ii = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                             .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { k->width, k->height, 1 },
+                             .mipLevels = k->levels, .arrayLayers = k->faces, .samples = VK_SAMPLE_COUNT_1_BIT,
+                             .tiling = VK_IMAGE_TILING_OPTIMAL,
+                             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    check(vkCreateImage(device, &ii, NULL, &x->img), "vkCreateImage");
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(device, x->img, &req);
+    x->mem = allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vkBindImageMemory(device, x->img, x->mem, 0);
+    VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = x->img,
+                                 .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, .format = VK_FORMAT_R8G8B8A8_UNORM,
+                                 .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, k->levels, 0, k->faces } };
+    check(vkCreateImageView(device, &vi, NULL, &x->view), "vkCreateImageView");
+
+    /* decode every face and level into the staging buffer */
+    VkDeviceSize total = 0;
+    for (uint32_t l = 0; l < k->levels; l++)
+        total += 4 * (VkDeviceSize)(k->width >> l) * (k->height >> l) * k->faces;
+    ensure(&tup, total);
+    VkBufferImageCopy regions[6 * 16];
+    uint32_t nreg = 0;
+    VkDeviceSize at = 0;
+    for (uint32_t f = 0; f < k->faces; f++) {
+        const uint8_t *level = data[f];
+        for (uint32_t l = 0; l < k->levels; l++) {
+            uint32_t w = k->width >> l, h = k->height >> l;
+            Rgba *out = (Rgba *)(tup.ptr + at);
+            for (uint32_t y = 0; y < h; y++)
+                for (uint32_t xx = 0; xx < w; xx++)
+                    out[y * w + xx] = tex_decode(level, t->format, w, xx, y);
+            regions[nreg++] = (VkBufferImageCopy){ .bufferOffset = at,
+                .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, l, f, 1 }, .imageExtent = { w, h, 1 } };
+            at += 4 * (VkDeviceSize)w * h;
+            level += tex_level_size(t->format, w, h);
+        }
+    }
+
+    check(vkResetFences(device, 1, &tdone), "vkResetFences");
+    vkResetCommandBuffer(tcmd, 0);
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(tcmd, &bi);
+    VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = x->img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, k->levels, 0, k->faces } };
+    vkCmdPipelineBarrier(tcmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    vkCmdCopyBufferToImage(tcmd, tup.buf, x->img, VK_IMAGE_LAYOUT_GENERAL, nreg, regions);
+    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                           .dstAccessMask = VK_ACCESS_SHADER_READ_BIT };
+    vkCmdPipelineBarrier(tcmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb,
+                         0, NULL, 0, NULL);
+    vkEndCommandBuffer(tcmd);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &tcmd };
+    check(vkQueueSubmit(queue, 1, &si, tdone), "vkQueueSubmit");
+    check(vkWaitForFences(device, 1, &tdone, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+}
+
+/* Texture unit `unit`'s texture on the GPU, decoded if it isn't yet. */
+static VkImageView get_texture(int unit)
+{
+    TexUnit t;
+    tex_unit_read(unit, &t);
+    TexKey k;
+    memset(&k, 0, sizeof k);
+    k.width = t.width;
+    k.height = t.height;
+    k.format = t.format;
+    k.faces = t.type == 1 ? 6 : 1;
+    k.levels = tex_levels(&t);
+    const uint8_t *data[6];
+    uint32_t bytes = 0, w = t.width, h = t.height;
+    for (uint32_t l = 0; l < k.levels; l++, w /= 2, h /= 2)
+        bytes += tex_level_size(t.format, w, h);
+    uint64_t hash = 0xCBF29CE484222325ull;
+    for (uint32_t f = 0; f < k.faces; f++) {
+        k.addr[f] = t.addr[f];
+        uint32_t v = gpu_phys_to_virt(t.addr[f]);
+        if (!v)
+            gpu_fatal("texture at physical %08" PRIx32 " is unmapped", t.addr[f]);
+        data[f] = gpu_mem(v, bytes);
+        hash = hash_bytes(data[f], bytes, hash);
+    }
+    k.hash = hash;
+
+    Texture *x = NULL, *lru = &textures[0];
+    for (int i = 0; i < NTEX && !x; i++) {
+        if (textures[i].img && memcmp(&textures[i].key, &k, sizeof k) == 0)
+            x = &textures[i];
+        else if (textures[i].used < lru->used)
+            lru = &textures[i];
+    }
+    if (!x) {
+        x = lru;
+        if (x->img) {
+            vkDestroyImageView(device, x->view, NULL);
+            vkDestroyImage(device, x->img, NULL);
+            vkFreeMemory(device, x->mem, NULL);
+        }
+        x->key = k;
+        upload_texture(x, &t, data);
+    }
+    x->used = ++clock_;
+    return x->view;
+}
+
+/* What unread units are bound to: 8x8 black, never matched (it has no
+   address) and never evicted. */
+static void make_dummy(void)
+{
+    Texture *dummy = &textures[0];
+    static const uint8_t zeros[4 * 8 * 8 * 2];
+    const uint8_t *zp = zeros;
+    TexUnit zt = { .width = 8, .height = 8, .format = 0 };
+    dummy->key = (TexKey){ .width = 8, .height = 8, .faces = 1, .levels = 1, .hash = 1 };
+    upload_texture(dummy, &zt, &zp);
+    dummy_view = dummy->view;
+    dummy->used = UINT64_MAX;               /* never evicted */
+}
+
+/* What units the combiners read (bits 0-2), as vkr_can_draw has checked
+   them; -1 if one is something only the software path does. */
+static int units_read(void)
+{
+    int used = 0;
+    for (int i = 0; i < 6; i++) {
+        const uint32_t *r = &pica.reg[tev_base[i]];
+        uint32_t rgb_mode = r[2] & 0xF, alpha_mode = r[2] >> 16 & 0xF;
+        int nr = rgb_mode == 0 ? 1 : (rgb_mode == 4 || rgb_mode == 8 || rgb_mode == 9) ? 3 : 2;
+        int na = alpha_mode == 0 ? 1 : (alpha_mode == 4 || alpha_mode == 8 || alpha_mode == 9) ? 3 : 2;
+        for (int k = 0; k < 3; k++) {
+            uint32_t rs = r[0] >> (4 * k) & 0xF, as = r[0] >> (16 + 4 * k) & 0xF;
+            if (k < nr && rs >= 3 && rs <= 5)
+                used |= 1 << (rs - 3);
+            if (k < na && as >= 3 && as <= 5)
+                used |= 1 << (as - 3);
+        }
+    }
+    return used;
+}
+
+/* A unit that is off, or on with no size: gpu/draw.c's frag_texture reads
+   unset_color() from it (zero, or white with GPU_UNSET=white). */
+static int unit_unset(int unit)
+{
+    static const uint32_t dim_reg[3] = { 0x082, 0x092, 0x09A };
+    uint32_t dim = pica.reg[dim_reg[unit]];
+    return !(pica.reg[REG_TEXUNIT_CONFIG] >> unit & 1) || !(dim & 0x7FF) || !(dim >> 16 & 0x7FF);
+}
+
+static uint32_t unset_color(void)
+{
+    const char *e = getenv("GPU_UNSET");
+    return e && strcmp(e, "white") == 0 ? 0xFFFFFFFFu : 0;
+}
+
+/* A unit the GPU path can sample: what texture.c's tex_unit_read and
+   frag_texture accept without stopping or reading zero. */
+static int unit_ok(int unit)
+{
+    static const uint32_t dim_reg[3] = { 0x082, 0x092, 0x09A }, param_reg[3] = { 0x083, 0x093, 0x09B },
+                          type_reg[3] = { 0x08E, 0x096, 0x09E }, addr_reg[3] = { 0x085, 0x095, 0x09D };
+    if (!(pica.reg[REG_TEXUNIT_CONFIG] >> unit & 1))
+        return 0;
+    uint32_t dim = pica.reg[dim_reg[unit]], h = dim & 0x7FF, w = dim >> 16 & 0x7FF, param = pica.reg[param_reg[unit]];
+    uint32_t type = unit == 0 ? param >> 28 & 7 : 0;
+    if (!w || !h || w % 8 || h % 8 || (pica.reg[type_reg[unit]] & 0xF) > 13 || (type != 0 && type != 1 && type != 3))
+        return 0;
+    if ((param >> 12 & 7) > 3 || (param >> 8 & 7) > 3)
+        return 0;
+    if (!gpu_phys_to_virt(pica.reg[addr_reg[unit]] << 3))
+        return 0;
+    return 1;
+}
+
 /* ---------------------------------------------------------------- pipelines */
 
 static VkPipeline make_pipeline(const PipeKey *k)
@@ -440,14 +688,13 @@ static VkPipeline make_pipeline(const PipeKey *k)
           .module = frag, .pName = "main" },
     };
     VkVertexInputBindingDescription bind = { 0, sizeof(VkrVertex), VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription attrs[3] = {
-        { 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VkrVertex, pos) },
-        { 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VkrVertex, color) },
-        { 2, 0, VK_FORMAT_R32_SFLOAT, offsetof(VkrVertex, z) },
-    };
+    VkVertexInputAttributeDescription attrs[1 + VKR_SLOTS / 4];
+    for (uint32_t i = 0; i < 1 + VKR_SLOTS / 4; i++)
+        attrs[i] = (VkVertexInputAttributeDescription){ i, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
+                                                        i ? (uint32_t)offsetof(VkrVertex, a) + 16 * (i - 1) : 0 };
     VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &bind,
-        .vertexAttributeDescriptionCount = 3, .pVertexAttributeDescriptions = attrs };
+        .vertexAttributeDescriptionCount = 1 + VKR_SLOTS / 4, .pVertexAttributeDescriptions = attrs };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
@@ -502,47 +749,83 @@ static VkPipeline get_pipeline(const PipeKey *k)
 
 /* ---------------------------------------------------------------- drawing */
 
-static int src_ok(uint32_t src)          /* the vertex colour, the buffer, the constant, the previous stage */
+/* Why a combiner source keeps a batch on the software path, or NULL. */
+static const char *src_refused(uint32_t src)
 {
-    return src == 0 || src == 13 || src == 14 || src == 15;
+    switch (src) {
+    case 0: case 13: case 14: case 15:
+        return NULL;                    /* the vertex colour, the buffer, the constant, the previous stage */
+    case 1: case 2:                     /* with lighting off, they read unset_color() */
+        return pica.reg[REG_LIGHTING_ENABLE0] & 1 ? "fragment lighting" : NULL;
+    case 3: case 4: case 5:
+        return unit_unset((int)src - 3) || unit_ok((int)src - 3) ? NULL : "a shadow texture or an unmapped one";
+    case 6:
+        return "the procedural texture";
+    default:
+        return "an unknown combiner source";
+    }
 }
 
-int vkr_can_draw(void)
+/* Why the current state keeps a batch on the software path, or NULL. */
+static const char *refused(void)
 {
     for (int i = 0; i < 6; i++) {
         const uint32_t *r = &pica.reg[tev_base[i]];
         uint32_t rgb_mode = r[2] & 0xF, alpha_mode = r[2] >> 16 & 0xF;
         if (rgb_mode > 9 || alpha_mode > 9 || alpha_mode == 6 || alpha_mode == 7)
-            return 0;                   /* the software path names it */
+            return "an unknown combiner mode";     /* (the software path names it) */
         int nr = rgb_mode == 0 ? 1 : (rgb_mode == 4 || rgb_mode == 8 || rgb_mode == 9) ? 3 : 2;
         int na = alpha_mode == 0 ? 1 : (alpha_mode == 4 || alpha_mode == 8 || alpha_mode == 9) ? 3 : 2;
         for (int k = 0; k < nr; k++) {
             uint32_t op = r[1] >> (4 * k) & 0xF;
-            if (!src_ok(r[0] >> (4 * k) & 0xF) || (op >> 1 != 0 && op >> 1 != 1 && op >> 1 != 2 && op >> 1 != 4 && op >> 1 != 6))
-                return 0;
+            const char *why = src_refused(r[0] >> (4 * k) & 0xF);
+            if (why)
+                return why;
+            if (op >> 1 != 0 && op >> 1 != 1 && op >> 1 != 2 && op >> 1 != 4 && op >> 1 != 6)
+                return "an unknown combiner operand";
         }
-        for (int k = 0; k < na; k++)
-            if (!src_ok(r[0] >> (16 + 4 * k) & 0xF))
-                return 0;
+        for (int k = 0; k < na; k++) {
+            const char *why = src_refused(r[0] >> (16 + 4 * k) & 0xF);
+            if (why)
+                return why;
+        }
     }
-    if ((pica.reg[REG_TEXENV_UPDATE_BUFFER] & 7) || (pica.reg[REG_COLOR_OPERATION] & 3) ||
-        (pica.reg[REG_FRAGOP_CLIP] & 1) || (pica.reg[REG_SCISSOR_MODE] & 3) == 1)
-        return 0;                       /* fog, gas, shadows, clip planes, scissoring the outside */
+    uint32_t fog = pica.reg[REG_TEXENV_UPDATE_BUFFER] & 7;
+    if (fog)
+        return fog == 5 ? "fog" : "gas";
+    if (pica.reg[REG_COLOR_OPERATION] & 3)
+        return "gas or shadow rendering";
+    if (pica.reg[REG_FRAGOP_CLIP] & 1)
+        return "a user clip plane";
+    if ((pica.reg[REG_SCISSOR_MODE] & 3) == 1)
+        return "scissoring the outside of a box";
     if (pica.reg[REG_COLOR_OPERATION] >> 8 & 1) {
         uint32_t bf = pica.reg[REG_BLEND_FUNC];
-        for (int s = 16; s < 32; s += 4)
-            if ((bf >> s & 0xF) > 14)
-                return 0;
+        for (int sh = 16; sh < 32; sh += 4)
+            if ((bf >> sh & 0xF) > 14)
+                return "an unknown blend factor";
         /* Vulkan's min and max ignore the blend factors; the PICA's apply them. */
         uint32_t eq = bf & 7, aeq = bf >> 8 & 7;
-        if ((eq == 3 || eq == 4) && (bf >> 16 & 0xFF) != 0x11)
-            return 0;
-        if ((aeq == 3 || aeq == 4) && (bf >> 24) != 0x11)
-            return 0;
+        if (((eq == 3 || eq == 4) && (bf >> 16 & 0xFF) != 0x11) || ((aeq == 3 || aeq == 4) && (bf >> 24) != 0x11))
+            return "min/max blending with blend factors";
     } else if (!has_logic_op && (pica.reg[REG_LOGIC_OP] & 0xF) != 3) {
-        return 0;
+        return "a logic op (this GPU has none)";
     }
-    return 1;
+    return NULL;
+}
+
+int vkr_can_draw(void)
+{
+    const char *why = refused();
+    if (!why)
+        return 1;
+    for (int i = 0; i < NWHY; i++)
+        if (refusals[i].why == why || !refusals[i].why) {
+            refusals[i].why = why;
+            refusals[i].n++;
+            break;
+        }
+    return 0;
 }
 
 static void barrier(VkPipelineStageFlags src, VkAccessFlags src_access, VkPipelineStageFlags dst, VkAccessFlags dst_access)
@@ -672,6 +955,35 @@ void vkr_draw(const VkrTarget *t, const VkrVertex *v, uint32_t n)
     u[31] = pica.reg[REG_TEXENV_UPDATE_BUFFER];
     u[32] = pica.reg[REG_ALPHA_TEST];
     u[33] = bits;
+    int used = units_read();
+    u[34] = (uint32_t)used;
+    u[35] = 0;
+    u[36] = unset_color();
+    VkDescriptorImageInfo views[3];
+    for (int i = 0; i < 3; i++) {
+        views[i] = (VkDescriptorImageInfo){ sampler, dummy_view, VK_IMAGE_LAYOUT_GENERAL };
+        if (!(used >> i & 1))
+            continue;
+        if (unit_unset(i)) {
+            u[35] |= 1u << i;
+            continue;
+        }
+        TexUnit tu;
+        tex_unit_read(i, &tu);
+        uint32_t *w8 = &u[40 + 8 * i];
+        w8[0] = tu.width;
+        w8[1] = tu.height;
+        w8[2] = tu.param;
+        w8[3] = tu.lod;
+        w8[4] = tu.border;
+        w8[5] = (uint32_t)tu.type;
+        w8[7] = i == 2 && (pica.reg[REG_TEXUNIT_CONFIG] >> 13 & 1) ? 1 : (uint32_t)i;
+        views[i].imageView = get_texture(i);
+    }
+    VkWriteDescriptorSet dw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1,
+                                .descriptorCount = 3, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                .pImageInfo = views };
+    vkUpdateDescriptorSets(device, 1, &dw, 0, NULL);
 
     check(vkResetFences(device, 1, &done), "vkResetFences");
     vkResetCommandBuffer(cmd, 0);

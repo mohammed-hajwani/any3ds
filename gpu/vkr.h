@@ -5,10 +5,11 @@
 
 #include <stdint.h>
 
-/* One vertex, as the vertex shader takes it: position in clip space
-   ((x_ndc * w, y_ndc * w, 0, w), y_ndc = +1 at the target's first memory
-   row), the vertex colour (0..1), and the PICA's window depth. */
-typedef struct { float pos[4], color[4], z; } VkrVertex;
+/* One vertex, as the vertex shader takes it: position in normalised device
+   coordinates (y = -1 at the target's first memory row), the PICA's window
+   depth, 1/w, and gpu/draw.c's 24 attribute slots divided by w. */
+#define VKR_SLOTS 24
+typedef struct { float x, y, z, inv_w, a[VKR_SLOTS]; } VkrVertex;
 
 /* The render target, in 3DS memory (tiled), as gpu/draw.c's Target has it. */
 typedef struct {

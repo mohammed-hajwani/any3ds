@@ -1,19 +1,20 @@
 // The vertex stage of the Vulkan renderer (gpu/vkr.c). Vertices arrive
-// shaded, clipped and in window space (gpu/draw.c); position is
-// (x_ndc * w, y_ndc * w, 0, w), so the hardware's perspective-correct
-// interpolation is the same arithmetic as the software rasteriser's.
+// shaded, clipped and in window space (gpu/draw.c). Every attribute goes to
+// the pixel shader divided by w, interpolated linearly in screen space, with
+// 1/w beside it: the pixel shader divides, as gpu/draw.c's interpolate()
+// does, so both renderers compute the same values.
 #version 450
 
-layout(location = 0) in vec4 a_pos;
-layout(location = 1) in vec4 a_color;
-layout(location = 2) in float a_z;
+layout(location = 0) in vec4 a_pos;                // x, y (normalised device coordinates), depth, 1/w
+layout(location = 1) in vec4 a_attr[6];             // gpu/draw.c's 24 attribute slots, divided by w
 
-layout(location = 0) out vec4 v_color;
-layout(location = 1) noperspective out float v_z;   // the PICA's depth: linear in screen space
+layout(location = 0) noperspective out vec4 v_zw;   // x: depth, y: 1/w
+layout(location = 1) noperspective out vec4 v_attr[6];
 
 void main()
 {
-    gl_Position = a_pos;
-    v_color = a_color;
-    v_z = a_z;
+    gl_Position = vec4(a_pos.xy, 0.0, 1.0);
+    v_zw = vec4(a_pos.zw, 0.0, 0.0);
+    for (int i = 0; i < 6; i++)
+        v_attr[i] = a_attr[i];
 }
