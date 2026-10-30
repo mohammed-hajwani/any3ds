@@ -48,10 +48,19 @@ it.
 
 1. **Window and device** (done): `hle/window.c` presents the software frames
    through Vulkan on the 4060, with keyboard and mouse.
-2. **First triangles:** a `gpu/vk.c` backend behind the same queue that the
-   software rasteriser drains (`pica_raster_flush`). Untextured, colour only,
-   depth test. Check: devkitPro's `simple_tri` and `both_screens` match the
-   software frames.
+2. **First triangles** (done): `gpu/vkr.c` drains the same queue as the
+   software rasteriser (`pica_raster_flush`), batch by batch, with
+   `GPU_BACKEND=vulkan`. What it covers (`vkr_can_draw`; the rest falls back
+   to software per batch): combiners on the vertex colour, constants, the
+   previous stage and the buffer, in the shader with the software path's
+   integer arithmetic; alpha test; depth (D32_SFLOAT holding the integer
+   depth times 2^-bits, so tests compare the same integers), stencil,
+   blending, logic ops, write masks, scissor. Each batch uploads its target
+   from 3DS memory and reads it back, so GPU, software and CPU writes mix
+   freely. Check: `make test-vulkan` draws every GPU example again on
+   lavapipe; all 400-odd GPU batches give frames identical to software.
+   Shaders: `gpu/shaders/`, compiled into the committed `gpu/vkr_shaders.h`
+   by `make shaders`.
 3. **Textures and combiners:** the uber-shader, the texture cache. Check: the
    textured and citro2d examples.
 4. **Fragment ops, lighting and fog** in the shader; stencil, blending and

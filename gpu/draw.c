@@ -25,6 +25,7 @@
 #include "pica.h"
 #include "lighting.h"
 #include "texture.h"
+#include "vkr.h"
 
 /* Vertex attributes by output semantic (SH_OUTMAP_Oi): position x/y/z/w,
    normal quaternion, colour r/g/b/a, texcoord0 u/v, texcoord1 u/v,
@@ -608,7 +609,7 @@ static Color apply_fog(Color c, float depth)
 
 /* One fragment at render-target pixel (x, y) (y measured from the bottom). */
 static uint64_t part_ns[GPU_T_COUNT];
-static uint64_t flushes, flushes_parallel;
+static uint64_t flushes, flushes_parallel, flushes_gpu;
 
 void gpu_time_add(int part, uint64_t ns)
 {
@@ -628,13 +629,13 @@ void gpu_stats_report(uint32_t frame)
     if (wall) {
         uint64_t gpu = part_ns[GPU_T_DRAW] + part_ns[GPU_T_RASTER] + part_ns[GPU_T_GX];
         fprintf(stderr, "gpu time (frame %u): %.0f ms for 60 frames (%.1f fps): draw %.0f, raster %.0f, gx %.0f,"
-                " the rest (game code, OS) %.0f; %llu raster batches, %llu of them on all threads\n", frame,
+                " the rest (game code, OS) %.0f; %llu raster batches, %llu of them on all threads, %llu on the GPU\n", frame,
                 wall / 1e6, 60e9 / (double)wall, part_ns[GPU_T_DRAW] / 1e6, part_ns[GPU_T_RASTER] / 1e6,
                 part_ns[GPU_T_GX] / 1e6, (double)(wall > gpu ? wall - gpu : 0) / 1e6,
-                (unsigned long long)flushes, (unsigned long long)flushes_parallel);
+                (unsigned long long)flushes, (unsigned long long)flushes_parallel, (unsigned long long)flushes_gpu);
     }
     memset(part_ns, 0, sizeof part_ns);
-    flushes = flushes_parallel = 0;
+    flushes = flushes_parallel = flushes_gpu = 0;
     fprintf(stderr, "gpu stats (frame %u): %llu triangles (%llu clipped away, %llu culled), %llu fragments: "
             "%llu failed alpha, %llu stencil, %llu depth; %llu written (%llu read lighting while off)\n", frame,
             (unsigned long long)stats.tris, (unsigned long long)stats.clipped, (unsigned long long)stats.culled,
@@ -973,12 +974,62 @@ static void raster_job(int band)
     pthread_mutex_unlock(&stats_lock);
 }
 
+/* The batch on the GPU (gpu/vkr.c): culled here by raster_triangle's test,
+   then put in clip space for Vulkan, whose first row is the target's first
+   memory row (the window's y = 0 is the last). Colours go back from a/w to
+   a: Vulkan interpolates perspective-correctly with w itself. */
+static void draw_vulkan(void)
+{
+    static VkrVertex *verts;
+    static size_t cap;
+    if (cap < 3 * nqueue) {
+        cap = 3 * nqueue;
+        verts = realloc(verts, cap * sizeof *verts);
+        if (!verts)
+            gpu_fatal("out of memory for the Vulkan vertices");
+    }
+    const Target *t = &queue[0].t;
+    uint32_t cull = pica.reg[REG_FACECULLING] & 3, n = 0;
+    for (size_t i = 0; i < nqueue; i++) {
+        const WinVertex *v = queue[i].v;
+        float area = edge(v[0].x, v[0].y, v[1].x, v[1].y, v[2].x, v[2].y);
+        if (area == 0)
+            continue;
+        if ((cull == 1 && area > 0) || (cull == 2 && area < 0)) {
+            stats.culled++;
+            continue;
+        }
+        for (int k = 0; k < 3; k++) {
+            float w = 1.0f / v[k].inv_w;
+            VkrVertex *o = &verts[n++];
+            o->pos[0] = (2 * v[k].x / (float)t->width - 1) * w;
+            o->pos[1] = (1 - 2 * v[k].y / (float)t->height) * w;
+            o->pos[2] = 0;
+            o->pos[3] = w;
+            for (int c = 0; c < 4; c++)
+                o->color[c] = v[k].a[SEM_COLOR + c] * w;
+            o->z = v[k].z;
+        }
+    }
+    VkrTarget vt = { t->color, t->depth, t->width, t->height, t->color_fmt, t->depth_fmt,
+                     t->color_write, t->depth_read, t->depth_write, t->stencil_write };
+    vkr_draw(&vt, verts, n);
+}
+
 void pica_raster_flush(void)
 {
     if (!nqueue)
         return;
     uint64_t t0 = gpu_now_ns();
     flushes++;
+    if (vkr_enabled() && vkr_can_draw()) {
+        draw_vulkan();
+        flushes_gpu++;
+        gpu_time_add(GPU_T_RASTER, gpu_now_ns() - t0);
+        nqueue = 0;
+        queue_pixels = 0;
+        return;
+    }
     if (!nbands)
         pool_start();
     if (nbands == 1 || queue_pixels < 16384) {

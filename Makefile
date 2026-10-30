@@ -571,5 +571,17 @@ progress: $(VENV)/.installed
 compat: $(VENV)/.installed
 	$(COMPAT_ENV) $(PYTHON) tests/compat/sweep.py $(COMPAT_ARGS)
 
+# The Vulkan renderer (gpu/vkr.c) against the software one: every GPU
+# example the sweep runs, drawn again with GPU_BACKEND=vulkan on Mesa's
+# lavapipe (no GPU needed); the frames must match. Run `make compat` first.
+.PHONY: test-vulkan
+test-vulkan: $(VENV)/.installed
+	$(PYTHON) tests/compat/vulkan.py
+
+# gpu/vkr_shaders.h, the compiled shaders (needs glslangValidator).
+.PHONY: shaders
+shaders:
+	tools/gen_shaders.sh
+
 clean:
 	rm -rf out

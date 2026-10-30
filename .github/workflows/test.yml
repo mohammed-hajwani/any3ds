@@ -38,9 +38,10 @@ jobs:
       - name: Install host tools
         run: |
           # The container is Debian 12, independently of the Ubuntu runner.
-          # libclang-rt-14-dev holds the ASan/UBSan runtimes the tests link.
+          # libclang-rt-14-dev holds the ASan/UBSan runtimes the tests link;
+          # libvulkan-dev the Vulkan headers gpu/vkr.c builds with.
           apt-get update
-          apt-get install -y --no-install-recommends clang-14 libclang-rt-14-dev make python3-venv libunicorn-dev
+          apt-get install -y --no-install-recommends clang-14 libclang-rt-14-dev libvulkan-dev make python3-venv libunicorn-dev
           # Some rules and scripts call plain `clang` (the compat sweep, for one).
           ln -sf /usr/bin/clang-14 /usr/local/bin/clang
           echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
