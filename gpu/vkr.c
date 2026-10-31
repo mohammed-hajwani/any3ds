@@ -205,14 +205,22 @@ static void pick_gpu(void)
     gpu = devs[best];
 }
 
-static int memory_type(uint32_t bits, VkMemoryPropertyFlags want)
+static int find_memory_type(uint32_t bits, VkMemoryPropertyFlags want)
 {
     VkPhysicalDeviceMemoryProperties p;
     vkGetPhysicalDeviceMemoryProperties(gpu, &p);
     for (uint32_t i = 0; i < p.memoryTypeCount; i++)
         if ((bits >> i & 1) && (p.memoryTypes[i].propertyFlags & want) == want)
             return (int)i;
-    gpu_fatal("Vulkan: no memory type with properties %x", (unsigned)want);
+    return -1;
+}
+
+static int memory_type(uint32_t bits, VkMemoryPropertyFlags want)
+{
+    int i = find_memory_type(bits, want);
+    if (i < 0)
+        gpu_fatal("Vulkan: no memory type with properties %x", (unsigned)want);
+    return i;
 }
 
 static VkDeviceMemory allocate(VkMemoryRequirements req, VkMemoryPropertyFlags want)
@@ -241,7 +249,12 @@ static void ensure(Buffer *b, VkDeviceSize need)
     check(vkCreateBuffer(device, &bi, NULL, &b->buf), "vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(device, b->buf, &req);
-    b->mem = allocate(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    /* The CPU reads read-back buffers: uncached memory makes that ~10x slower (NVIDIA) */
+    VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if ((b->usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+        && find_memory_type(req.memoryTypeBits, want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) >= 0)
+        want |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    b->mem = allocate(req, want);
     vkBindBufferMemory(device, b->buf, b->mem, 0);
     void *p;
     check(vkMapMemory(device, b->mem, 0, b->size, 0, &p), "vkMapMemory");
