@@ -1020,13 +1020,16 @@ void pica_raster_flush(void)
         return;
     uint64_t t0 = gpu_now_ns();
     flushes++;
-    if (vkr_enabled() && vkr_can_draw()) {
-        draw_vulkan();
-        flushes_gpu++;
-        gpu_time_add(GPU_T_RASTER, gpu_now_ns() - t0);
-        nqueue = 0;
-        queue_pixels = 0;
-        return;
+    if (vkr_enabled()) {
+        if (vkr_can_draw()) {
+            draw_vulkan();
+            flushes_gpu++;
+            gpu_time_add(GPU_T_RASTER, gpu_now_ns() - t0);
+            nqueue = 0;
+            queue_pixels = 0;
+            return;
+        }
+        vkr_sync();                     /* the software path reads and writes the targets */
     }
     if (!nbands)
         pool_start();

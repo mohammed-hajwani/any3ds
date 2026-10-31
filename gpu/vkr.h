@@ -22,5 +22,9 @@ typedef struct {
 int  vkr_enabled(void);                 /* GPU_BACKEND=vulkan (and a device came up) */
 int  vkr_can_draw(void);                /* the current register state is one the GPU path covers */
 void vkr_draw(const VkrTarget *t, const VkrVertex *v, uint32_t n);    /* n vertices: n / 3 triangles */
+/* Submit the recorded batches and put what they drew into 3DS memory. Call
+   it before anything else reads or writes render targets: the end of a
+   command list, a batch drawn in software. */
+void vkr_sync(void);
 
 #endif

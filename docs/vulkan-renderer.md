@@ -84,8 +84,23 @@ it.
    X in Lumiose: every batch on the GPU, the frame visually identical. Still
    slow (about 3 fps), as each batch copies its target in and out: step 5.
    Left on software: the procedural texture (citro2d) and gas.
-5. **Pokémon X:** the surface cache's read-back points, render to texture,
-   then profile. Target: a steady 60 fps.
+5. **Surface cache** (done): render targets stay on the GPU. Batches are
+   recorded into one command buffer (render passes stay open while the
+   target doesn't change; vertices, registers and tables go into per-
+   submission ring buffers, one descriptor set per batch) and submitted by
+   `vkr_sync`: at the end of each command list, before a batch drawn in
+   software, before a texture is read from memory the GPU drew on, and when
+   a surface or texture still in use would be evicted. It reads back only
+   the targets that were drawn on. A surface checks a hash of its memory
+   before its first use after a sync, so writes by the CPU, GX or software
+   are uploaded. Pokémon X in Lumiose: 34.7 fps (software: 9.7), the frame
+   identical to step 4; 7142 batches in 360 submissions.
+6. **Pokémon X at 60 fps:** profile. At 34.7 fps a second of Lumiose
+   spends about 0.67 s shading vertices on the CPU, 0.73 s in the GPU path
+   (hashing, uploads, read-backs, waiting) and 0.31 s in game code and the OS.
+   Candidates: read back only at the end of a frame or when memory is read,
+   check memory by watching writes instead of hashing, vertex shading on
+   the GPU.
 
 `GPU_BACKEND=software` keeps the current renderer, for tests and for
 comparing pictures.

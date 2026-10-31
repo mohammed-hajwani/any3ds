@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "pica.h"
+#include "vkr.h"
 
 Pica pica;
 
@@ -235,4 +236,5 @@ void pica_run_command_list(uint32_t addr, uint32_t size)
 {
     run_list(addr, size);
     pica_raster_flush();                /* the list's last triangles */
+    vkr_sync();                         /* and what the GPU drew, into 3DS memory */
 }

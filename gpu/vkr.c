@@ -56,7 +56,7 @@ static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
     X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) \
     X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdSetViewport) \
     X(vkCmdSetScissor) X(vkCmdSetBlendConstants) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) \
-    X(vkCmdSetStencilReference) X(vkCmdDraw) X(vkCreateSampler)
+    X(vkCmdSetStencilReference) X(vkCmdDraw) X(vkCreateSampler) X(vkResetDescriptorPool)
 static PFN_vkCreateInstance vkCreateInstance;
 INSTANCE_FNS(VKFN)
 DEVICE_FNS(VKFN)
@@ -79,7 +79,10 @@ static VkImageView dummy_view;          /* for units the combiners don't read */
 static VkRenderPass pass;
 static VkDescriptorSetLayout set_layout;
 static VkPipelineLayout layout;
-static VkDescriptorSet set;
+static VkDescriptorPool dpool;          /* one set per batch, freed at each submission */
+#define NSETS 1024
+static uint32_t nsets;
+static VkDeviceSize ubo_align, sbo_align;
 static VkShaderModule vert, frag;
 static uint64_t batches;                /* drawn here, reported at exit */
 #define NWHY 16
@@ -89,7 +92,7 @@ typedef struct {
     VkBuffer buf;
     VkDeviceMemory mem;
     uint8_t *ptr;
-    VkDeviceSize size;
+    VkDeviceSize size, used;            /* used: what this submission's batches took */
     VkBufferUsageFlags usage;
 } Buffer;
 static Buffer ubo = { .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT },
@@ -102,19 +105,36 @@ static Buffer ubo = { .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT },
    0x140-0x1D9, FOG_COLOR at 154, the lighting tables from 256, fog's at 6400. */
 enum { TAB_FOG_COLOR = 154, TAB_LIGHTING = 256, TAB_FOG = 6400, TAB_WORDS = 6528 };
 
-/* A render target's GPU images, by size: the colour (RGBA8) and the
-   depth/stencil. */
+/* The surface cache: a render target's GPU images (colour RGBA8,
+   depth/stencil), kept from batch to batch. While batches are recorded the
+   GPU's copy is the newer one; vkr_sync submits them and reads back what
+   they drew, whenever someone else may look at 3DS memory (the end of a
+   command list, a batch drawn in software, a texture read from a target).
+   After that a surface checks its memory against a hash before its next
+   use, so what the CPU, the GX engines or the software renderer wrote
+   meanwhile is uploaded again. */
 typedef struct {
     uint32_t w, h;
-    VkImage color, ds;
+    uint8_t *color, *depth;             /* the 3DS memory it mirrors (NULL: none) */
+    int color_fmt, depth_fmt;
+    VkImage cimg, ds;
     VkDeviceMemory cmem, dmem;
     VkImageView cview, dview;
     VkFramebuffer fb;
-    uint64_t used;
+    uint64_t used, hash;                /* hash: of its memory when the images last matched it */
+    int valid;                          /* the images hold its content */
+    int verified;                       /* checked against memory since the last vkr_sync */
+    int dirty_color, dirty_depth;       /* drawn on the GPU since: memory is behind */
+    VkDeviceSize down_at;               /* where vkr_sync reads it back to */
 } Surface;
 #define NSURF 8
 static Surface surf[NSURF];
 static uint64_t clock_;
+static int recording;                   /* cmd holds batches not yet submitted */
+static Surface *in_pass;                /* the surface whose render pass is open */
+static uint64_t epoch = 1;              /* counts submissions */
+static uint64_t submits, uploads;       /* reported at exit */
+static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h);
 
 /* The pipeline state that can't be dynamic, and its pipelines. */
 typedef struct {
@@ -307,32 +327,18 @@ static void make_layout(void)
                                       .setLayoutCount = 1, .pSetLayouts = &set_layout };
     check(vkCreatePipelineLayout(device, &pi, NULL, &layout), "vkCreatePipelineLayout");
 
-    VkDescriptorPoolSize ps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
-                                   { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 },
-                                   { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 } };
-    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
+    VkDescriptorPoolSize ps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NSETS },
+                                   { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * NSETS },
+                                   { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NSETS } };
+    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = NSETS,
                                        .poolSizeCount = 3, .pPoolSizes = ps };
-    VkDescriptorPool dpool;
     check(vkCreateDescriptorPool(device, &dpi, NULL, &dpool), "vkCreateDescriptorPool");
-    VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool,
-                                       .descriptorSetCount = 1, .pSetLayouts = &set_layout };
-    check(vkAllocateDescriptorSets(device, &ai, &set), "vkAllocateDescriptorSets");
-    ensure(&ubo, 256);
-    ensure(&tables, TAB_WORDS * 4);
-    memset(tables.ptr, 0, TAB_WORDS * 4);
-    VkDescriptorBufferInfo bi = { ubo.buf, 0, 256 }, ti = { tables.buf, 0, TAB_WORDS * 4 };
-    VkWriteDescriptorSet w[2] = {
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi },
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 2, .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &ti },
-    };
-    vkUpdateDescriptorSets(device, 2, w, 0, NULL);
 }
 
 static void report(void)
 {
-    fprintf(stderr, "gpu: %llu batches drawn with Vulkan\n", (unsigned long long)batches);
+    fprintf(stderr, "gpu: %llu batches drawn with Vulkan, in %llu submissions; %llu target uploads\n",
+            (unsigned long long)batches, (unsigned long long)submits, (unsigned long long)uploads);
     for (int i = 0; i < NWHY && refusals[i].why; i++)
         fprintf(stderr, "gpu: %llu batches left to software for %s\n", (unsigned long long)refusals[i].n,
                 refusals[i].why);
@@ -388,14 +394,21 @@ static void init(void)
                                 .maxLod = 16 };
     check(vkCreateSampler(device, &smi, NULL, &sampler), "vkCreateSampler");
 
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(gpu, &p);
+    ubo_align = p.limits.minUniformBufferOffsetAlignment;
+    sbo_align = p.limits.minStorageBufferOffsetAlignment;
+    ensure(&ubo, 256 * NSETS);
+    ensure(&tables, TAB_WORDS * 4 * 16);
+    ensure(&vbo, 4 << 20);
+    ensure(&up, 8 << 20);
+
     make_pass();
     make_layout();
     make_dummy();
     vert = shader(draw_vert_spv, sizeof draw_vert_spv);
     frag = shader(draw_frag_spv, sizeof draw_frag_spv);
 
-    VkPhysicalDeviceProperties p;
-    vkGetPhysicalDeviceProperties(gpu, &p);
     fprintf(stderr, "gpu: drawing with Vulkan on %s\n", p.deviceName);
     atexit(report);
 }
@@ -422,11 +435,50 @@ static void free_surface(Surface *s)
     vkDestroyFramebuffer(device, s->fb, NULL);
     vkDestroyImageView(device, s->cview, NULL);
     vkDestroyImageView(device, s->dview, NULL);
-    vkDestroyImage(device, s->color, NULL);
+    vkDestroyImage(device, s->cimg, NULL);
     vkDestroyImage(device, s->ds, NULL);
     vkFreeMemory(device, s->cmem, NULL);
     vkFreeMemory(device, s->dmem, NULL);
     memset(s, 0, sizeof *s);
+}
+
+static size_t color_bytes(const Surface *s)
+{
+    return s->color ? (size_t)s->w * s->h * (size_t)pixel_size(s->color_fmt) : 0;
+}
+
+static uint32_t depth_size(int fmt) { return fmt == 0 ? 2 : fmt == 2 ? 3 : 4; }
+
+static size_t depth_bytes(const Surface *s)
+{
+    return s->depth ? (size_t)s->w * s->h * depth_size(s->depth_fmt) : 0;
+}
+
+static uint64_t surface_hash(const Surface *s)
+{
+    uint64_t h = hash_bytes(s->color, color_bytes(s), 0xCBF29CE484222325ull);
+    return hash_bytes(s->depth, depth_bytes(s), h);
+}
+
+static int overlap(const uint8_t *a, size_t an, const uint8_t *b, size_t bn)
+{
+    return an && bn && a < b + bn && b < a + an;
+}
+
+/* Whether surface `s` mirrors any of the n bytes at p. */
+static int surface_covers(const Surface *s, const uint8_t *p, size_t n)
+{
+    return overlap(s->color, color_bytes(s), p, n) || overlap(s->depth, depth_bytes(s), p, n);
+}
+
+/* Read back the surfaces the GPU drew on before anyone reads these bytes. */
+static void sync_if_drawn(const uint8_t *p, size_t n)
+{
+    for (int i = 0; i < NSURF; i++)
+        if ((surf[i].dirty_color || surf[i].dirty_depth) && surface_covers(&surf[i], p, n)) {
+            vkr_sync();
+            return;
+        }
 }
 
 static void make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
@@ -448,28 +500,37 @@ static void make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlag
     check(vkCreateImageView(device, &vi, NULL, view), "vkCreateImageView");
 }
 
-static Surface *get_surface(uint32_t w, uint32_t h)
+static Surface *get_surface(const VkrTarget *t)
 {
     Surface *s = NULL;
     for (int i = 0; i < NSURF && !s; i++)
-        if (surf[i].w == w && surf[i].h == h)
+        if (surf[i].fb && surf[i].w == t->width && surf[i].h == t->height && surf[i].color == t->color &&
+            surf[i].depth == t->depth && surf[i].color_fmt == t->color_fmt && surf[i].depth_fmt == t->depth_fmt)
             s = &surf[i];
     if (!s) {
         s = &surf[0];                   /* a free slot, or else the least recently used */
         for (int i = 1; i < NSURF; i++)
             if (surf[i].used < s->used)
                 s = &surf[i];
-        if (s->fb)
+        if (s->fb) {
+            if (recording)              /* its batches, and what they drew, first */
+                vkr_sync();
             free_surface(s);
-        s->w = w;
-        s->h = h;
-        make_image(w, h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
-                   &s->color, &s->cmem, &s->cview);
-        make_image(w, h, DS_FORMAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        }
+        s->w = t->width;
+        s->h = t->height;
+        s->color = t->color;
+        s->depth = t->depth;
+        s->color_fmt = t->color_fmt;
+        s->depth_fmt = t->depth_fmt;
+        make_image(s->w, s->h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+                   &s->cimg, &s->cmem, &s->cview);
+        make_image(s->w, s->h, DS_FORMAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                    VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, &s->ds, &s->dmem, &s->dview);
         VkImageView views[2] = { s->cview, s->dview };
         VkFramebufferCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = pass,
-                                       .attachmentCount = 2, .pAttachments = views, .width = w, .height = h, .layers = 1 };
+                                       .attachmentCount = 2, .pAttachments = views, .width = s->w, .height = s->h,
+                                       .layers = 1 };
         check(vkCreateFramebuffer(device, &fi, NULL, &s->fb), "vkCreateFramebuffer");
     }
     s->used = ++clock_;
@@ -491,7 +552,7 @@ typedef struct {
     VkImage img;
     VkDeviceMemory mem;
     VkImageView view;
-    uint64_t used;
+    uint64_t used, epoch;               /* epoch: the last submission that reads it */
 } Texture;
 #define NTEX 512
 static Texture textures[NTEX];
@@ -586,7 +647,7 @@ static void upload_texture(Texture *x, const TexUnit *t, const uint8_t *const *d
 }
 
 /* Texture unit `unit`'s texture on the GPU, decoded if it isn't yet. */
-static VkImageView get_texture(int unit)
+static Texture *get_texture(int unit)
 {
     TexUnit t;
     tex_unit_read(unit, &t);
@@ -608,6 +669,7 @@ static VkImageView get_texture(int unit)
         if (!v)
             gpu_fatal("texture at physical %08" PRIx32 " is unmapped", t.addr[f]);
         data[f] = gpu_mem(v, bytes);
+        sync_if_drawn(data[f], bytes);      /* rendering to a texture */
         hash = hash_bytes(data[f], bytes, hash);
     }
     k.hash = hash;
@@ -621,6 +683,8 @@ static VkImageView get_texture(int unit)
     }
     if (!x) {
         x = lru;
+        if (x->img && x->epoch == epoch && recording)
+            vkr_sync();                     /* recorded batches still read it */
         if (x->img) {
             vkDestroyImageView(device, x->view, NULL);
             vkDestroyImage(device, x->img, NULL);
@@ -630,7 +694,7 @@ static VkImageView get_texture(int unit)
         upload_texture(x, &t, data);
     }
     x->used = ++clock_;
-    return x->view;
+    return x;
 }
 
 /* What unread units are bound to: 8x8 black, never matched (it has no
@@ -901,36 +965,42 @@ static void barrier(VkPipelineStageFlags src, VkAccessFlags src_access, VkPipeli
     vkCmdPipelineBarrier(cmd, src, dst, 0, 1, &b, 0, NULL, 0, NULL);
 }
 
-/* 3DS memory -> the upload buffer: colour as RGBA8, then depth as floats,
+#define ATTACH_STAGES (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | \
+                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
+#define ATTACH_RW (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | \
+                   VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+
+/* 3DS memory -> an upload area: colour as RGBA8, then depth as floats,
    then stencil bytes, each in rows from the target's first memory row. */
-static void upload(const VkrTarget *t, uint8_t *p, uint32_t bits)
+static void upload(const Surface *s, uint8_t *p)
 {
-    uint32_t w = t->width, h = t->height, npix = w * h;
+    uint32_t w = s->w, h = s->h, npix = w * h, bits = s->depth_fmt == 0 ? 16 : 24;
     float *depth = (float *)(p + 4 * (size_t)npix);
     uint8_t *stencil = p + 8 * (size_t)npix;
-    uint32_t csize = (uint32_t)pixel_size(t->color_fmt), dsize = t->depth_fmt == 0 ? 2 : t->depth_fmt == 2 ? 3 : 4;
+    uint32_t csize = s->color ? (uint32_t)pixel_size(s->color_fmt) : 0, dsize = depth_size(s->depth_fmt);
     uint32_t dmax = (1u << bits) - 1;
     float scale = ldexpf(1, -(int)bits);
     for (uint32_t y = 0; y < h; y++)
         for (uint32_t x = 0; x < w; x++) {
             uint32_t idx = tile_index(x, y, w), i = y * w + x;
-            Rgba c = t->color ? color_decode(t->color + idx * csize, t->color_fmt) : (Rgba){ 0, 0, 0, 0 };
+            Rgba c = s->color ? color_decode(s->color + idx * csize, s->color_fmt) : (Rgba){ 0, 0, 0, 0 };
             memcpy(p + 4 * (size_t)i, &c, 4);
             uint32_t raw = 0;
-            if (t->depth)
-                memcpy(&raw, t->depth + idx * dsize, dsize);
+            if (s->depth)
+                memcpy(&raw, s->depth + idx * dsize, dsize);
             depth[i] = (float)(raw & dmax) * scale;
-            stencil[i] = t->depth_fmt == 3 ? (uint8_t)(raw >> 24) : 0;
+            stencil[i] = s->depth_fmt == 3 ? (uint8_t)(raw >> 24) : 0;
         }
 }
 
-/* The read-back buffer -> 3DS memory, for what the batch could write. */
-static void download(const VkrTarget *t, const uint8_t *p, uint32_t bits, int color, int depth)
+/* A read-back area -> 3DS memory, for what the GPU drew on. */
+static void download(const Surface *s, const uint8_t *p)
 {
-    uint32_t w = t->width, h = t->height, npix = w * h;
+    uint32_t w = s->w, h = s->h, npix = w * h, bits = s->depth_fmt == 0 ? 16 : 24;
+    int color = s->dirty_color && s->color, depth = s->dirty_depth && s->depth;
     const float *dv = (const float *)(p + 4 * (size_t)npix);
     const uint8_t *sv = p + 8 * (size_t)npix;
-    uint32_t csize = (uint32_t)pixel_size(t->color_fmt), dsize = t->depth_fmt == 0 ? 2 : t->depth_fmt == 2 ? 3 : 4;
+    uint32_t csize = s->color ? (uint32_t)pixel_size(s->color_fmt) : 0, dsize = depth_size(s->depth_fmt);
     float scale = ldexpf(1, (int)bits);
     for (uint32_t y = 0; y < h; y++)
         for (uint32_t x = 0; x < w; x++) {
@@ -938,16 +1008,125 @@ static void download(const VkrTarget *t, const uint8_t *p, uint32_t bits, int co
             if (color) {
                 Rgba c;
                 memcpy(&c, p + 4 * (size_t)i, 4);
-                color_encode(t->color + idx * csize, t->color_fmt, c);
+                color_encode(s->color + idx * csize, s->color_fmt, c);
             }
             if (depth) {
                 uint32_t z = (uint32_t)(dv[i] * scale);
-                uint8_t *dp = t->depth + idx * dsize;
+                uint8_t *dp = s->depth + idx * dsize;
                 memcpy(dp, &z, dsize == 2 ? 2 : 3);
-                if (t->depth_fmt == 3)
+                if (s->depth_fmt == 3)
                     dp[3] = sv[i];
             }
         }
+}
+
+/* The copies between a surface's images and an area at `at`, laid out as
+   upload() and download() have it. */
+static void regions(const Surface *s, VkDeviceSize at, VkBufferImageCopy *cc, VkBufferImageCopy dc[2])
+{
+    VkDeviceSize npix = (VkDeviceSize)s->w * s->h;
+    VkExtent3D e = { s->w, s->h, 1 };
+    *cc = (VkBufferImageCopy){ .bufferOffset = at, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                               .imageExtent = e };
+    dc[0] = (VkBufferImageCopy){ .bufferOffset = at + 4 * npix,
+                                 .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, .imageExtent = e };
+    dc[1] = (VkBufferImageCopy){ .bufferOffset = at + 8 * npix,
+                                 .imageSubresource = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 }, .imageExtent = e };
+}
+
+/* Batches share their submission's buffers, each taking the next part.
+   ring_room: whether n bytes at `align` still fit; with nothing recorded the
+   buffer can grow instead. */
+static int ring_room(Buffer *b, VkDeviceSize n, VkDeviceSize align)
+{
+    VkDeviceSize at = (b->used + align - 1) / align * align;
+    if (at + n <= b->size)
+        return 1;
+    if (recording)
+        return 0;
+    ensure(b, n);
+    return 1;
+}
+
+static VkDeviceSize ring_take(Buffer *b, VkDeviceSize n, VkDeviceSize align)
+{
+    VkDeviceSize at = (b->used + align - 1) / align * align;
+    b->used = at + n;
+    return at;
+}
+
+static VkDeviceSize tables_at = (VkDeviceSize)-1;     /* this submission's last copy of the tables */
+
+static void begin_recording(void)
+{
+    if (recording)
+        return;
+    check(vkResetFences(device, 1, &done), "vkResetFences");
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(cmd, &bi);
+    recording = 1;
+}
+
+static void end_pass(void)
+{
+    if (in_pass) {
+        vkCmdEndRenderPass(cmd);
+        in_pass = NULL;
+    }
+}
+
+void vkr_sync(void)
+{
+    if (state != 1)
+        return;
+    if (recording) {
+        end_pass();
+        VkDeviceSize total = 0;
+        for (int i = 0; i < NSURF; i++)
+            if (surf[i].dirty_color || surf[i].dirty_depth) {
+                surf[i].down_at = total;
+                total += 9 * (VkDeviceSize)surf[i].w * surf[i].h;
+            }
+        if (total) {
+            ensure(&down, total);       /* (no recorded command uses it yet) */
+            barrier(ATTACH_STAGES, ATTACH_RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            for (int i = 0; i < NSURF; i++) {
+                Surface *s = &surf[i];
+                if (!s->dirty_color && !s->dirty_depth)
+                    continue;
+                VkBufferImageCopy cc, dc[2];
+                regions(s, s->down_at, &cc, dc);
+                vkCmdCopyImageToBuffer(cmd, s->cimg, VK_IMAGE_LAYOUT_GENERAL, down.buf, 1, &cc);
+                vkCmdCopyImageToBuffer(cmd, s->ds, VK_IMAGE_LAYOUT_GENERAL, down.buf, 2, dc);
+            }
+            barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                    VK_ACCESS_HOST_READ_BIT);
+        }
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
+        check(vkQueueSubmit(queue, 1, &si, done), "vkQueueSubmit");
+        check(vkWaitForFences(device, 1, &done, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        submits++;
+        for (int i = 0; i < NSURF; i++) {
+            Surface *s = &surf[i];
+            if (!s->dirty_color && !s->dirty_depth)
+                continue;
+            download(s, down.ptr + s->down_at);
+            s->dirty_color = s->dirty_depth = 0;
+            s->hash = surface_hash(s);
+        }
+        recording = 0;
+        epoch++;
+        ubo.used = vbo.used = up.used = tables.used = 0;
+        tables_at = (VkDeviceSize)-1;
+        vkResetDescriptorPool(device, dpool, 0);
+        nsets = 0;
+    }
+    /* From here others may write 3DS memory: check it before the next use. */
+    for (int i = 0; i < NSURF; i++)
+        surf[i].verified = 0;
 }
 
 void vkr_draw(const VkrTarget *t, const VkrVertex *v, uint32_t n)
@@ -1005,15 +1184,84 @@ void vkr_draw(const VkrTarget *t, const VkrVertex *v, uint32_t n)
     }
     int stencil_write = k.stencil && t->stencil_write;
 
-    Surface *s = get_surface(w, h);
+    /* The target's surface. Another one on the same memory must have put
+       what it drew there first (this one checks memory below). */
+    Surface *s = get_surface(t);
+    for (int i = 0; i < NSURF; i++)
+        if (&surf[i] != s && (surf[i].dirty_color || surf[i].dirty_depth) &&
+            (surface_covers(&surf[i], s->color, color_bytes(s)) || surface_covers(&surf[i], s->depth, depth_bytes(s)))) {
+            vkr_sync();
+            break;
+        }
+
+    /* Room in this submission (its buffers and descriptor sets) for the batch. */
+    VkDeviceSize vsize = n * sizeof *v, upsize = 9 * (VkDeviceSize)npix;
+    if (!ring_room(&vbo, vsize, 16) || !ring_room(&ubo, 256, ubo_align) || !ring_room(&up, upsize, 16) ||
+        !ring_room(&tables, TAB_WORDS * 4, sbo_align) || nsets == NSETS) {
+        vkr_sync();
+        ring_room(&vbo, vsize, 16);
+        ring_room(&up, upsize, 16);
+    }
+
+    /* the textures (decoding one may submit what is recorded) */
+    int used = units_read();
+    Texture *tex[3] = { NULL, NULL, NULL };
+    for (int i = 0; i < 3; i++)
+        if ((used >> i & 1) && !unit_unset(i))
+            tex[i] = get_texture(i);
+    for (int i = 0; i < 3; i++)
+        if (tex[i])
+            tex[i]->epoch = epoch;
+
+    begin_recording();
     uint32_t bits = t->depth_fmt == 0 ? 16 : 24;
-    VkDeviceSize total = 9 * (VkDeviceSize)npix;
-    ensure(&up, total);
-    ensure(&down, total);
-    ensure(&vbo, n * sizeof *v);
-    upload(t, up.ptr, bits);
-    memcpy(vbo.ptr, v, n * sizeof *v);
-    uint32_t *u = (uint32_t *)ubo.ptr;
+    if (!s->verified) {
+        uint64_t hash = surface_hash(s);
+        if (!s->valid || hash != s->hash) {
+            end_pass();
+            VkDeviceSize at = ring_take(&up, upsize, 16);
+            upload(s, up.ptr + at);
+            /* Everything is uploaded, so the old contents can go: UNDEFINED -> GENERAL. */
+            VkImageMemoryBarrier ib[2] = {
+                { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                  .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                  .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                  .image = s->cimg, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
+                { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                  .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                  .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                  .image = s->ds,
+                  .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 } },
+            };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL,
+                                 0, NULL, 2, ib);
+            VkBufferImageCopy cc, dc[2];
+            regions(s, at, &cc, dc);
+            vkCmdCopyBufferToImage(cmd, up.buf, s->cimg, VK_IMAGE_LAYOUT_GENERAL, 1, &cc);
+            vkCmdCopyBufferToImage(cmd, up.buf, s->ds, VK_IMAGE_LAYOUT_GENERAL, 2, dc);
+            barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, ATTACH_STAGES, ATTACH_RW);
+            s->hash = hash;
+            s->valid = 1;
+            uploads++;
+        }
+        s->verified = 1;
+    }
+    if (in_pass != s) {
+        end_pass();
+        barrier(ATTACH_STAGES | VK_PIPELINE_STAGE_TRANSFER_BIT, ATTACH_RW | VK_ACCESS_TRANSFER_WRITE_BIT,
+                ATTACH_STAGES, ATTACH_RW);
+        VkRenderPassBeginInfo rp = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = pass,
+                                     .framebuffer = s->fb, .renderArea = { { 0, 0 }, { w, h } } };
+        vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        in_pass = s;
+    }
+
+    /* this batch's vertices, registers and tables */
+    VkDeviceSize voff = ring_take(&vbo, vsize, 16);
+    memcpy(vbo.ptr + voff, v, vsize);
+    VkDeviceSize uoff = ring_take(&ubo, 256, ubo_align);
+    uint32_t *u = (uint32_t *)(ubo.ptr + uoff);
+    memset(u, 0, 256);
     for (int i = 0; i < 6; i++)
         for (int j = 0; j < 5; j++)
             u[5 * i + j] = pica.reg[tev_base[i] + j];
@@ -1021,24 +1269,26 @@ void vkr_draw(const VkrTarget *t, const VkrVertex *v, uint32_t n)
     u[31] = pica.reg[REG_TEXENV_UPDATE_BUFFER];
     u[32] = pica.reg[REG_ALPHA_TEST];
     u[33] = bits;
-    int used = units_read();
     u[34] = (uint32_t)used;
-    u[35] = 0;
     u[36] = unset_color();
     u[37] = (uint32_t)lighting_read();
     if (u[37] || (pica.reg[REG_TEXENV_UPDATE_BUFFER] & 7) == 5) {
-        uint32_t *tw = (uint32_t *)tables.ptr;
+        static uint32_t tw[TAB_WORDS];
         memcpy(tw, &pica.reg[0x140], (0x1DA - 0x140) * 4);
         tw[TAB_FOG_COLOR] = pica.reg[REG_FOG_COLOR];
         memcpy(tw + TAB_LIGHTING, pica.lighting_lut, sizeof pica.lighting_lut);
         memcpy(tw + TAB_FOG, pica.fog_lut, sizeof pica.fog_lut);
+        if (tables_at == (VkDeviceSize)-1 || memcmp(tables.ptr + tables_at, tw, sizeof tw) != 0) {
+            tables_at = ring_take(&tables, sizeof tw, sbo_align);
+            memcpy(tables.ptr + tables_at, tw, sizeof tw);
+        }
     }
     VkDescriptorImageInfo views[3];
     for (int i = 0; i < 3; i++) {
         views[i] = (VkDescriptorImageInfo){ sampler, dummy_view, VK_IMAGE_LAYOUT_GENERAL };
         if (!(used >> i & 1))
             continue;
-        if (unit_unset(i)) {
+        if (!tex[i]) {
             u[35] |= 1u << i;
             continue;
         }
@@ -1052,54 +1302,28 @@ void vkr_draw(const VkrTarget *t, const VkrVertex *v, uint32_t n)
         w8[4] = tu.border;
         w8[5] = (uint32_t)tu.type;
         w8[7] = i == 2 && (pica.reg[REG_TEXUNIT_CONFIG] >> 13 & 1) ? 1 : (uint32_t)i;
-        views[i].imageView = get_texture(i);
+        views[i].imageView = tex[i]->view;
     }
-    VkWriteDescriptorSet dw = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1,
-                                .descriptorCount = 3, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                .pImageInfo = views };
-    vkUpdateDescriptorSets(device, 1, &dw, 0, NULL);
-
-    check(vkResetFences(device, 1, &done), "vkResetFences");
-    vkResetCommandBuffer(cmd, 0);
-    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    vkBeginCommandBuffer(cmd, &bi);
-
-    /* Everything is uploaded, so the old contents can go: UNDEFINED -> GENERAL. */
-    VkImageMemoryBarrier ib[2] = {
-        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .image = s->color, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
-        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .image = s->ds, .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 } },
+    VkDescriptorSet set;
+    VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool,
+                                       .descriptorSetCount = 1, .pSetLayouts = &set_layout };
+    check(vkAllocateDescriptorSets(device, &ai, &set), "vkAllocateDescriptorSets");
+    nsets++;
+    VkDescriptorBufferInfo bi = { ubo.buf, uoff, 256 },
+                           ti = { tables.buf, tables_at == (VkDeviceSize)-1 ? 0 : tables_at, TAB_WORDS * 4 };
+    VkWriteDescriptorSet dw[3] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1, .descriptorCount = 3,
+          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = views },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 2, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &ti },
     };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, ib);
-    VkBufferImageCopy cc = { .bufferOffset = 0, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                             .imageExtent = { w, h, 1 } };
-    VkBufferImageCopy dc[2] = {
-        { .bufferOffset = 4 * (VkDeviceSize)npix, .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
-          .imageExtent = { w, h, 1 } },
-        { .bufferOffset = 8 * (VkDeviceSize)npix, .imageSubresource = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 },
-          .imageExtent = { w, h, 1 } },
-    };
-    vkCmdCopyBufferToImage(cmd, up.buf, s->color, VK_IMAGE_LAYOUT_GENERAL, 1, &cc);
-    vkCmdCopyBufferToImage(cmd, up.buf, s->ds, VK_IMAGE_LAYOUT_GENERAL, 2, dc);
-    VkPipelineStageFlags attach = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkAccessFlags attach_rw = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, attach, attach_rw);
+    vkUpdateDescriptorSets(device, 3, dw, 0, NULL);
 
-    VkRenderPassBeginInfo rp = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = pass,
-                                 .framebuffer = s->fb, .renderArea = { { 0, 0 }, { w, h } } };
-    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, get_pipeline(&k));
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
-    VkDeviceSize zero = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo.buf, &zero);
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo.buf, &voff);
     VkViewport vp = { 0, 0, (float)w, (float)h, 0, 1 };
     vkCmdSetViewport(cmd, 0, 1, &vp);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
@@ -1111,18 +1335,10 @@ void vkr_draw(const VkrTarget *t, const VkrVertex *v, uint32_t n)
     vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_write ? st >> 8 & 0xFF : 0);
     vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, st >> 16 & 0xFF);
     vkCmdDraw(cmd, n, 1, 0, 0);
-    vkCmdEndRenderPass(cmd);
 
-    barrier(attach, attach_rw, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    vkCmdCopyImageToBuffer(cmd, s->color, VK_IMAGE_LAYOUT_GENERAL, down.buf, 1, &cc);
-    vkCmdCopyImageToBuffer(cmd, s->ds, VK_IMAGE_LAYOUT_GENERAL, down.buf, 2, dc);
-    barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
-    check(vkQueueSubmit(queue, 1, &si, done), "vkQueueSubmit");
-    check(vkWaitForFences(device, 1, &done, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-
-    download(t, down.ptr, bits, k.mask != 0, k.depth_write || stencil_write);
+    if (k.mask)
+        s->dirty_color = 1;
+    if (k.depth_write || stencil_write)
+        s->dirty_depth = 1;
     batches++;
 }
