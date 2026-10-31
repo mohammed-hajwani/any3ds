@@ -73,8 +73,17 @@ it.
    Lumiose's first square: about half its batches on the GPU (the frame
    within 4/255 of software); the rest need fragment lighting. A batch that
    stays on software is counted by reason, printed at exit.
-4. **Fragment ops, lighting and fog** in the shader; stencil, blending and
-   logic ops in Vulkan state. Check: all 49 working examples match.
+4. **Lighting and fog** (done): the shader does lighting.c's per-pixel
+   lighting (up to 8 lights, the 24 lookup tables, spotlights, distance
+   attenuation, Fresnel, normal maps) and draw.c's fog, reading the lighting
+   registers and tables from a storage buffer. What lighting.c stops on
+   (shadows, tangent maps, geometric factors, cos(phi)) stays on software.
+   Read-back goes through host-cached memory (0.7 to 6.1 fps on its own).
+   Check: every lit example within one step of rounding, apart from a pixel
+   or two where a table lookup lands on the other side of an entry. Pokémon
+   X in Lumiose: every batch on the GPU, the frame visually identical. Still
+   slow (about 3 fps), as each batch copies its target in and out: step 5.
+   Left on software: the procedural texture (citro2d) and gas.
 5. **Pokémon X:** the surface cache's read-back points, render to texture,
    then profile. Target: a steady 60 fps.
 

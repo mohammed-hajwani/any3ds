@@ -96,7 +96,11 @@ static Buffer ubo = { .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT },
               vbo = { .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT },
               up = { .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT },
               down = { .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT },
-              tup = { .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
+              tup = { .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT },
+              tables = { .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT };
+/* The lighting and fog state for the shader (draw.frag's Tables): registers
+   0x140-0x1D9, FOG_COLOR at 154, the lighting tables from 256, fog's at 6400. */
+enum { TAB_FOG_COLOR = 154, TAB_LIGHTING = 256, TAB_FOG = 6400, TAB_WORDS = 6528 };
 
 /* A render target's GPU images, by size: the colour (RGBA8) and the
    depth/stencil. */
@@ -291,31 +295,39 @@ static void make_pass(void)
 
 static void make_layout(void)
 {
-    VkDescriptorSetLayoutBinding b[2] = {
+    VkDescriptorSetLayoutBinding b[3] = {
         { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
         { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
     };
     VkDescriptorSetLayoutCreateInfo li = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                           .bindingCount = 2, .pBindings = b };
+                                           .bindingCount = 3, .pBindings = b };
     check(vkCreateDescriptorSetLayout(device, &li, NULL, &set_layout), "vkCreateDescriptorSetLayout");
     VkPipelineLayoutCreateInfo pi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                       .setLayoutCount = 1, .pSetLayouts = &set_layout };
     check(vkCreatePipelineLayout(device, &pi, NULL, &layout), "vkCreatePipelineLayout");
 
-    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
-                                   { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 } };
+    VkDescriptorPoolSize ps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
+                                   { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 },
+                                   { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 } };
     VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
-                                       .poolSizeCount = 2, .pPoolSizes = ps };
+                                       .poolSizeCount = 3, .pPoolSizes = ps };
     VkDescriptorPool dpool;
     check(vkCreateDescriptorPool(device, &dpi, NULL, &dpool), "vkCreateDescriptorPool");
     VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool,
                                        .descriptorSetCount = 1, .pSetLayouts = &set_layout };
     check(vkAllocateDescriptorSets(device, &ai, &set), "vkAllocateDescriptorSets");
     ensure(&ubo, 256);
-    VkDescriptorBufferInfo bi = { ubo.buf, 0, 256 };
-    VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .descriptorCount = 1,
-                               .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi };
-    vkUpdateDescriptorSets(device, 1, &w, 0, NULL);
+    ensure(&tables, TAB_WORDS * 4);
+    memset(tables.ptr, 0, TAB_WORDS * 4);
+    VkDescriptorBufferInfo bi = { ubo.buf, 0, 256 }, ti = { tables.buf, 0, TAB_WORDS * 4 };
+    VkWriteDescriptorSet w[2] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 2, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &ti },
+    };
+    vkUpdateDescriptorSets(device, 2, w, 0, NULL);
 }
 
 static void report(void)
@@ -635,9 +647,8 @@ static void make_dummy(void)
     dummy->used = UINT64_MAX;               /* never evicted */
 }
 
-/* What units the combiners read (bits 0-2), as vkr_can_draw has checked
-   them; -1 if one is something only the software path does. */
-static int units_read(void)
+/* Which combiner sources the six stages read: bit i for source i. */
+static int sources_read(void)
 {
     int used = 0;
     for (int i = 0; i < 6; i++) {
@@ -647,12 +658,29 @@ static int units_read(void)
         int na = alpha_mode == 0 ? 1 : (alpha_mode == 4 || alpha_mode == 8 || alpha_mode == 9) ? 3 : 2;
         for (int k = 0; k < 3; k++) {
             uint32_t rs = r[0] >> (4 * k) & 0xF, as = r[0] >> (16 + 4 * k) & 0xF;
-            if (k < nr && rs >= 3 && rs <= 5)
-                used |= 1 << (rs - 3);
-            if (k < na && as >= 3 && as <= 5)
-                used |= 1 << (as - 3);
+            if (k < nr)
+                used |= 1 << rs;
+            if (k < na)
+                used |= 1 << as;
         }
     }
+    return used;
+}
+
+/* Fragment lighting is on and a combiner reads it. */
+static int lighting_read(void)
+{
+    return (pica.reg[REG_LIGHTING_ENABLE0] & 1) && (sources_read() & 6);
+}
+
+/* The texture units the shader samples (bits 0-2): those the combiners read,
+   and a normal map's. */
+static int units_read(void)
+{
+    int used = sources_read() >> 3 & 7;
+    uint32_t c0 = pica.reg[0x1C3];
+    if (lighting_read() && (c0 >> 28 & 3) == 1)
+        used |= 1 << (c0 >> 22 & 3);
     return used;
 }
 
@@ -763,13 +791,38 @@ static VkPipeline get_pipeline(const PipeKey *k)
 /* ---------------------------------------------------------------- drawing */
 
 /* Why a combiner source keeps a batch on the software path, or NULL. */
+/* What lighting.c stops on: none of it reaches the shader. */
+static const char *lighting_refused(void)
+{
+    uint32_t c0 = pica.reg[0x1C3], c1 = pica.reg[0x1C4], sel = pica.reg[0x1D1];
+    if (c0 & 1)
+        return "shadowed fragment lighting";
+    uint32_t bump = c0 >> 28 & 3;
+    if (bump > 1)
+        return "tangent-map lighting";
+    if (bump == 1 && ((c0 >> 22 & 3) > 2 || (!unit_unset((int)(c0 >> 22 & 3)) && !unit_ok((int)(c0 >> 22 & 3)))))
+        return "a shadow texture or an unmapped one";
+    static const int off_bit[7] = { 16, 17, -1, 19, 20, 21, 22 };     /* tables D0 D1 SP FR RB RG RR */
+    int nlights = (int)(pica.reg[0x1C2] & 7) + 1, spot = 0;
+    for (int k = 0; k < nlights; k++) {
+        int id = (int)(pica.reg[0x1D9] >> (4 * k) & 7);
+        if (pica.reg[0x140 + 0x10 * id + 9] & 0xC)
+            return "lighting geometric factors";
+        spot |= !(c1 >> (8 + id) & 1);
+    }
+    for (int which = 0; which < 7; which++)
+        if ((which == 2 ? spot : !(c1 >> off_bit[which] & 1)) && (sel >> (4 * which) & 7) > 4)
+            return "lighting's cos(phi) input";
+    return NULL;
+}
+
 static const char *src_refused(uint32_t src)
 {
     switch (src) {
     case 0: case 13: case 14: case 15:
         return NULL;                    /* the vertex colour, the buffer, the constant, the previous stage */
     case 1: case 2:                     /* with lighting off, they read unset_color() */
-        return pica.reg[REG_LIGHTING_ENABLE0] & 1 ? "fragment lighting" : NULL;
+        return pica.reg[REG_LIGHTING_ENABLE0] & 1 ? lighting_refused() : NULL;
     case 3: case 4: case 5:
         return unit_unset((int)src - 3) || unit_ok((int)src - 3) ? NULL : "a shadow texture or an unmapped one";
     case 6:
@@ -804,8 +857,8 @@ static const char *refused(void)
         }
     }
     uint32_t fog = pica.reg[REG_TEXENV_UPDATE_BUFFER] & 7;
-    if (fog)
-        return fog == 5 ? "fog" : "gas";
+    if (fog && fog != 5)
+        return "gas";
     if (pica.reg[REG_COLOR_OPERATION] & 3)
         return "gas or shadow rendering";
     if (pica.reg[REG_FRAGOP_CLIP] & 1)
@@ -972,6 +1025,14 @@ void vkr_draw(const VkrTarget *t, const VkrVertex *v, uint32_t n)
     u[34] = (uint32_t)used;
     u[35] = 0;
     u[36] = unset_color();
+    u[37] = (uint32_t)lighting_read();
+    if (u[37] || (pica.reg[REG_TEXENV_UPDATE_BUFFER] & 7) == 5) {
+        uint32_t *tw = (uint32_t *)tables.ptr;
+        memcpy(tw, &pica.reg[0x140], (0x1DA - 0x140) * 4);
+        tw[TAB_FOG_COLOR] = pica.reg[REG_FOG_COLOR];
+        memcpy(tw + TAB_LIGHTING, pica.lighting_lut, sizeof pica.lighting_lut);
+        memcpy(tw + TAB_FOG, pica.fog_lut, sizeof pica.fog_lut);
+    }
     VkDescriptorImageInfo views[3];
     for (int i = 0; i < 3; i++) {
         views[i] = (VkDescriptorImageInfo){ sampler, dummy_view, VK_IMAGE_LAYOUT_GENERAL };

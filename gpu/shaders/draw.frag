@@ -7,9 +7,9 @@
 //
 // Only state that gpu/vkr.c's vkr_can_draw accepts reaches this shader:
 // combiner sources are the vertex colour, textures 0-2 (or zero when a unit
-// is off), lighting only while it is off, the constant, the
-// previous stage and the buffer (lighting, procedural textures and fog stay
-// on the software path).
+// is off), fragment lighting (gpu/lighting.c), the constant, the previous
+// stage and the buffer, then fog. The procedural texture and gas stay on the
+// software path.
 #version 450
 
 layout(location = 0) noperspective in vec4 v_zw;
@@ -26,6 +26,7 @@ layout(location = 0) out vec4 o_color;
 //   34           bit i: texture unit i is read
 //   35           bit i: texture unit i is off or has no size, and reads word 36
 //   36           what unset units and lighting that is off read (draw.c's unset_color)
+//   37           bit 0: fragment lighting is on and a combiner reads it
 //   40 + 8 * i   texture unit i: width, height, param, lod, border, type, -, coordinate set
 layout(set = 0, binding = 0) uniform State { uvec4 u[16]; };
 
@@ -33,10 +34,18 @@ layout(set = 0, binding = 0) uniform State { uvec4 u[16]; };
 // layers, every mip level texture.c can read. Read with texelFetch only.
 layout(set = 0, binding = 1) uniform sampler2DArray tex[3];
 
+// The lighting and fog state, copied by vkr.c when either is on:
+//   words 0-153      registers 0x140-0x1D9 (lights, lighting config, tables)
+//   154              FOG_COLOR
+//   256 + 256 * i    lighting table i (24 of them)
+//   6400             the fog table (128 entries)
+layout(std430, set = 0, binding = 2) readonly buffer Tables { uint tbl[]; };
+
 uint reg(int i) { return u[i >> 2][i & 3]; }
+uint lreg(int r) { return tbl[r - 0x140]; }
 
 // gpu/draw.c's attribute slots (SEM_*)
-const int SEM_COLOR = 8, SEM_TC0 = 12, SEM_TC1 = 14, SEM_TC0W = 16, SEM_TC2 = 22;
+const int SEM_QUAT = 4, SEM_VIEW = 18, SEM_COLOR = 8, SEM_TC0 = 12, SEM_TC1 = 14, SEM_TC0W = 16, SEM_TC2 = 22;
 
 float slot(vec4 a[6], int k) { return a[k >> 2][k & 3]; }
 
@@ -170,12 +179,190 @@ vec4 sample_unit(int i, Unit t, float u, float v, float w, float lod)
     return c;
 }
 
+// ---------------------------------------------------------------- fragment lighting (lighting.c)
+
+const int LUT_D0 = 0, LUT_D1 = 1, LUT_FR = 3, LUT_RB = 4, LUT_RG = 5, LUT_RR = 6, LUT_SP = 8, LUT_DA = 16;
+
+float f16(uint v)                       // float1.5.10
+{
+    uint e = v >> 10 & 31u, m = v & 0x3FFu;
+    float f = e != 0u ? ldexp(1.0 + float(m) / 1024.0, int(e) - 15) : ldexp(float(m) / 1024.0, -14);
+    return (v >> 15 & 1u) != 0u ? -f : f;
+}
+
+float f20(uint v)                       // float1.7.12
+{
+    uint e = v >> 12 & 127u, m = v & 0xFFFu;
+    if (e == 0u)
+        return 0.0;
+    float f = ldexp(1.0 + float(m) / 4096.0, int(e) - 63);
+    return (v >> 19 & 1u) != 0u ? -f : f;
+}
+
+float fixed13(uint v) { return float(int(v << 19) >> 19) / 2048.0; }
+
+vec3 norm(vec3 a)                       // lighting.c's normalize: zero stays zero
+{
+    float l = length(a);
+    return l > 0.0 ? a / l : a;
+}
+
+vec3 rotate(vec4 q, vec3 v)             // by the unit quaternion q, w the scalar part
+{
+    vec3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+// An entry: 12-bit value (0..1) + 12-bit signed difference to the next.
+float lut_entry(int table, int i, float frac)
+{
+    uint e = tbl[256 + 256 * table + (i & 0xFF)];
+    return float(e & 0xFFFu) / 4096.0 + float(int(e << 8) >> 20) / 2048.0 * frac;
+}
+
+float lut(int table, int which, float x)
+{
+    const float scales[8] = float[8](1.0, 2.0, 4.0, 8.0, 1.0, 1.0, 0.25, 0.5);
+    bool abs_off = (lreg(0x1D0) >> (4 * which + 1) & 1u) != 0u;
+    float v;
+    if (!abs_off) {
+        x = min(abs(x), 1.0);
+        float pos = x * 256.0;
+        int i = pos >= 255.0 ? 255 : int(pos);
+        v = lut_entry(table, i, pos - float(i));
+    } else {
+        x = clamp(x, -1.0, 1.0);
+        float pos = x * 128.0;
+        int i = min(int(floor(pos)), 127);
+        v = lut_entry(table, i, pos - float(i));
+    }
+    return v * scales[lreg(0x1D2) >> (4 * which) & 7u];
+}
+
+bool available(uint config, int table)
+{
+    switch (config) {
+    case 0u: return table == LUT_D0 || table == LUT_RR || table == LUT_SP || table == LUT_DA;
+    case 1u: return table == LUT_FR || table == LUT_RR || table == LUT_SP || table == LUT_DA;
+    case 2u: return table == LUT_D0 || table == LUT_D1 || table == LUT_RR || table == LUT_DA;
+    case 3u: return table == LUT_D0 || table == LUT_D1 || table == LUT_FR || table == LUT_DA;
+    case 4u: return table != LUT_FR;
+    case 5u: return table != LUT_D1;
+    case 6u: return table != LUT_RB && table != LUT_RG;
+    default: return true;
+    }
+}
+
+// The selected input for table `which`; cos(phi) (5+) is refused by vkr.c.
+float lut_input(int which, vec3 n, vec3 v, vec3 l, vec3 h, vec3 spot)
+{
+    switch (lreg(0x1D1) >> (4 * which) & 7u) {
+    case 0u: return dot(n, h);
+    case 1u: return dot(v, h);
+    case 2u: return dot(n, v);
+    case 3u: return dot(l, n);
+    default: return dot(l, spot);
+    }
+}
+
+float channel(uint r, int ch) { return float(r >> (20 - 10 * ch) & 0xFFu) / 255.0; }
+
+// (uint8_t)lroundf(x * 255): half away from zero, negatives wrap
+int to_byte(float x)
+{
+    float v = x * 255.0;
+    return int(v >= 0.0 ? floor(v + 0.5) : -floor(-v + 0.5)) & 255;
+}
+
+void lighting(vec4 quat, vec3 view, bool bumped, ivec4 bump, out ivec4 primary, out ivec4 secondary)
+{
+    uint c0 = lreg(0x1C3), c1 = lreg(0x1C4), env = c0 >> 4 & 0xFu;
+    float ql = length(quat);
+    vec4 q = ql > 0.0 ? quat / ql : quat;
+
+    vec3 surface = vec3(0.0, 0.0, 1.0);
+    if (bumped) {                       // a normal map (vkr.c refuses tangent maps)
+        surface = vec3(bump.rgb) / 127.5 - 1.0;
+        if ((c0 >> 30 & 1u) == 0u)
+            surface.z = sqrt(max(0.0, 1.0 - surface.x * surface.x - surface.y * surface.y));
+        surface = norm(surface);
+    }
+    vec3 n = norm(rotate(q, surface)), v = norm(view);
+
+    uint ambient = lreg(0x1C0);
+    vec3 prim = vec3(channel(ambient, 0), channel(ambient, 1), channel(ambient, 2)), sec = vec3(0.0);
+    float fresnel = 1.0;
+    int nlights = int(lreg(0x1C2) & 7u) + 1;
+    for (int k = 0; k < nlights; k++) {
+        int id = int(lreg(0x1D9) >> (4 * k) & 7u), r = 0x140 + 0x10 * id;
+        uint cfg = lreg(r + 9);
+        vec3 pos = vec3(f16(lreg(r + 4) & 0xFFFFu), f16(lreg(r + 4) >> 16), f16(lreg(r + 5) & 0xFFFFu));
+        vec3 l_unnorm = (cfg & 1u) != 0u ? pos : pos + view;
+        vec3 l = norm(l_unnorm), h = norm(l + v);
+        vec3 spot = vec3(fixed13(lreg(r + 6) & 0x1FFFu), fixed13(lreg(r + 6) >> 16 & 0x1FFFu),
+                         fixed13(lreg(r + 7) & 0x1FFFu));
+
+        float ln = dot(l, n);
+        ln = (cfg & 2u) != 0u ? abs(ln) : max(ln, 0.0);
+
+        float att = 1.0;
+        if ((c1 >> (24 + id) & 1u) == 0u && available(env, LUT_DA)) {
+            float d = clamp(f20(lreg(r + 10)) + f20(lreg(r + 11)) * length(l_unnorm), 0.0, 1.0) * 256.0;
+            int i = d >= 255.0 ? 255 : int(d);
+            att = lut_entry(LUT_DA + id, i, d - float(i));
+        }
+        if ((c1 >> (8 + id) & 1u) == 0u && available(env, LUT_SP))
+            att *= lut(LUT_SP + id, 2, lut_input(2, n, v, l, h, spot));
+
+        float d0 = (c1 >> 16 & 1u) == 0u && available(env, LUT_D0) ? lut(LUT_D0, 0, lut_input(0, n, v, l, h, spot)) : 1.0;
+        float d1 = (c1 >> 17 & 1u) == 0u && available(env, LUT_D1) ? lut(LUT_D1, 1, lut_input(1, n, v, l, h, spot)) : 1.0;
+        vec3 refl;
+        refl.r = (c1 >> 22 & 1u) == 0u && available(env, LUT_RR) ? lut(LUT_RR, 6, lut_input(6, n, v, l, h, spot)) : 1.0;
+        refl.g = (c1 >> 21 & 1u) == 0u && available(env, LUT_RG) ? lut(LUT_RG, 5, lut_input(5, n, v, l, h, spot)) : refl.r;
+        refl.b = (c1 >> 20 & 1u) == 0u && available(env, LUT_RB) ? lut(LUT_RB, 4, lut_input(4, n, v, l, h, spot)) : refl.r;
+        if ((c1 >> 19 & 1u) == 0u && available(env, LUT_FR))
+            fresnel = lut(LUT_FR, 3, lut_input(3, n, v, l, h, spot));
+
+        bool highlight = (c0 >> 27 & 1u) == 0u || dot(l, n) > 0.0;     // clamp highlights
+        for (int ch = 0; ch < 3; ch++) {
+            float diffuse = channel(lreg(r + 2), ch) * ln + channel(lreg(r + 3), ch);
+            float specular = channel(lreg(r), ch) * d0 + channel(lreg(r + 1), ch) * refl[ch] * d1;
+            prim[ch] += diffuse * att;
+            if (highlight)
+                sec[ch] += specular * att;
+        }
+    }
+    uint fsel = c0 >> 2 & 3u;
+    int fa = to_byte(clamp(fresnel, 0.0, 1.0));
+    primary = ivec4(to_byte(min(prim.r, 1.0)), to_byte(min(prim.g, 1.0)), to_byte(min(prim.b, 1.0)),
+                    (fsel & 1u) != 0u ? fa : 255);
+    secondary = ivec4(to_byte(min(sec.r, 1.0)), to_byte(min(sec.g, 1.0)), to_byte(min(sec.b, 1.0)),
+                      (fsel & 2u) != 0u ? fa : 255);
+}
+
+// ---------------------------------------------------------------- fog (draw.c's apply_fog)
+
+ivec4 fog(ivec4 c, float depth)
+{
+    float d = clamp(depth, 0.0, 1.0);
+    if ((reg(31) >> 16 & 1u) != 0u)
+        d = 1.0 - d;
+    float x = d * 128.0;
+    int i = x >= 127.0 ? 127 : int(x);
+    uint e = tbl[6400 + i];
+    float k = clamp(float(e >> 13 & 0x7FFu) / 2048.0 + float(int(e << 19) >> 19) / 2048.0 * (x - float(i)), 0.0, 1.0);
+    uint fc = tbl[154];
+    vec3 f = vec3(fc & 0xFFu, fc >> 8 & 0xFFu, fc >> 16 & 0xFFu);
+    c.rgb = ivec3(floor(vec3(c.rgb) * k + f * (1.0 - k) + 0.5));
+    return c;
+}
+
 // ---------------------------------------------------------------- combiners (draw.c)
 
-ivec4 source(uint src, ivec4 primary, ivec4 texc[3], ivec4 prev, ivec4 buf, ivec4 k, int stage)
+ivec4 source(uint src, ivec4 primary, ivec4 light[2], ivec4 texc[3], ivec4 prev, ivec4 buf, ivec4 k, int stage)
 {
     if (src == 0u) return primary;
-    if (src == 1u || src == 2u) return unpack_color(reg(36));     // lighting is off (vkr_can_draw)
+    if (src == 1u || src == 2u) return light[src - 1u];
     if (src >= 3u && src <= 5u) return texc[src - 3u];
     if (src == 13u) return buf;
     if (src == 14u) return k;
@@ -274,6 +461,16 @@ void main()
         texc[i] = ivec4(sample_unit(i, t, u0, v0, slot(a, SEM_TC0W), lod));
     }
 
+    // Fragment lighting (word 37 bit 0: on and read; off, it reads word 36)
+    ivec4 light[2] = ivec4[2](unpack_color(reg(36)), unpack_color(reg(36)));
+    if ((reg(37) & 1u) != 0u) {
+        uint c0 = lreg(0x1C3);
+        bool bumped = (c0 >> 28 & 3u) != 0u;
+        vec4 quat = vec4(slot(a, SEM_QUAT), slot(a, SEM_QUAT + 1), slot(a, SEM_QUAT + 2), slot(a, SEM_QUAT + 3));
+        vec3 view = vec3(slot(a, SEM_VIEW), slot(a, SEM_VIEW + 1), slot(a, SEM_VIEW + 2));
+        lighting(quat, view, bumped, bumped ? texc[c0 >> 22 & 3u] : ivec4(0), light[0], light[1]);
+    }
+
     ivec4 prev = ivec4(0), buf = unpack_color(reg(30));
     uint update = reg(31);
     for (int i = 0; i < 6; i++) {
@@ -283,8 +480,8 @@ void main()
         ivec3 rgb[3];
         int alpha[3];
         for (int j = 0; j < 3; j++) {
-            rgb[j] = rgb_operand(source(src >> (4 * j) & 0xFu, primary, texc, prev, buf, k, i), op >> (4 * j) & 0xFu);
-            alpha[j] = alpha_operand(source(src >> (16 + 4 * j) & 0xFu, primary, texc, prev, buf, k, i),
+            rgb[j] = rgb_operand(source(src >> (4 * j) & 0xFu, primary, light, texc, prev, buf, k, i), op >> (4 * j) & 0xFu);
+            alpha[j] = alpha_operand(source(src >> (16 + 4 * j) & 0xFu, primary, light, texc, prev, buf, k, i),
                                      op >> (12 + 4 * j) & 7u);
         }
         ivec4 o;
@@ -305,6 +502,9 @@ void main()
         }
         prev = o;
     }
+
+    if ((update & 7u) == 5u)
+        prev = fog(prev, v_zw.x);
 
     uint at = reg(32);
     if ((at & 1u) != 0u && !test(at >> 4 & 7u, uint(prev.a), at >> 8 & 0xFFu))
