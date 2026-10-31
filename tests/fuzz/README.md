@@ -36,7 +36,7 @@ overwrite them. No random PC/SP destinations, SVCs, external branches, or
 privileged instructions are generated. Thumb covers data processing, shifts,
 high registers, PC/SP-relative reads, extensions, memory and balanced stack/multiple
 transfers; branch/exception formats are deliberately excluded by this safety policy.
-Q and GE are not directly compared by M3; SEL exercises GE indirectly.
+M3 compares sticky Q too; SEL exercises GE indirectly.
 
 Generate without compiling or running:
 

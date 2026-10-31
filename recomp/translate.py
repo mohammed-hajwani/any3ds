@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from capstone import CS_MODE_THUMB
 from capstone.arm import (
+    ARM_INS_QADD, ARM_INS_QSUB, ARM_INS_QDADD, ARM_INS_QDSUB, ARM_INS_MRS, ARM_INS_MSR,
     ARM_CC_AL, ARM_CC_EQ, ARM_CC_GE, ARM_CC_GT, ARM_CC_HI, ARM_CC_HS,
     ARM_CC_LE, ARM_CC_LO, ARM_CC_LS, ARM_CC_LT, ARM_CC_MI, ARM_CC_NE,
     ARM_CC_PL, ARM_CC_VC, ARM_CC_VS,
@@ -546,8 +547,7 @@ def _half(x, which):
 def _half_mul(insn, fc):
     """smulxy/smlaxy: signed 16 x 16 multiply of the chosen halves (+ ra).
     smulwy/smlawy: signed 32 x 16 multiply keeping bits 47..16 (+ ra).
-    The accumulating forms set the sticky Q flag on signed overflow; Q isn't
-    modelled (nothing we recompile can read it: mrs is a hard error)."""
+    Accumulating forms set sticky Q on signed overflow (without saturation)."""
     kind, xh, yh, acc = _HALF_MULS[insn.id]
     ops = insn.operands
     if len(ops) != (4 if acc else 3) or any(op.type != ARM_OP_REG for op in ops):
@@ -561,15 +561,14 @@ def _half_mul(insn, fc):
     else:
         expr = f'(uint32_t)(int32_t)(((int64_t)(int32_t){n} * {_half(m, yh)}) >> 16)'
     if acc:
-        expr += f' + {_read_reg(insn, ops[3].reg)}'
+        expr = f'arm_acc_q(ctx, {expr}, {_read_reg(insn, ops[3].reg)})'
     return [f'ctx->r[{rd}] = {expr};']
 
 
 def _saturate(insn, fc):
     """usat rd, #n, rm{, lsl/asr #k}: clamp the (shifted) signed value to
     0 .. 2^n - 1; ssat: to -2^(n-1) .. 2^(n-1) - 1. usat16/ssat16 clamp each
-    signed halfword the same way (no shift). The sticky Q flag they set when
-    clamping isn't modelled (nothing we recompile can read it)."""
+    signed halfword the same way (no shift). Any clamp sets sticky Q."""
     ops = insn.operands
     if len(ops) != 3 or ops[0].type != ARM_OP_REG or ops[1].type != ARM_OP_IMM or ops[2].type != ARM_OP_REG:
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
@@ -579,7 +578,41 @@ def _saturate(insn, fc):
     x, _ = _shift_imm(insn, _read_reg(insn, ops[2].reg), ops[2].shift.type, ops[2].shift.value)
     helper = {ARM_INS_USAT: 'arm_usat', ARM_INS_SSAT: 'arm_ssat',
               ARM_INS_USAT16: 'arm_usat16', ARM_INS_SSAT16: 'arm_ssat16'}[insn.id]
-    return [f'ctx->r[{rd}] = {helper}({x}, {ops[1].imm});']
+    return [f'ctx->r[{rd}] = {helper}(ctx, {x}, {ops[1].imm});']
+
+
+def _qaddsub(insn, fc):
+    ops = insn.operands
+    if _is_thumb(insn) or len(ops) != 3 or any(op.type != ARM_OP_REG for op in ops):
+        raise UnsupportedInstruction(insn, 'unexpected operand shape')
+    if any(_reg_num(insn, op.reg) == PC for op in ops):
+        raise UnsupportedInstruction(insn, 'pc as a saturation operand is unpredictable')
+    rd = _dest_reg(insn, ops[0])
+    a, b = (_read_reg(insn, op.reg) for op in ops[1:])
+    return [f'ctx->r[{rd}] = arm_qaddsub(ctx, {a}, {b}, '
+            f'{int(insn.id in (ARM_INS_QSUB, ARM_INS_QDSUB))}, '
+            f'{int(insn.id in (ARM_INS_QDADD, ARM_INS_QDSUB))});']
+
+
+def _psr(insn, fc):
+    word = _encoding(insn)
+    if word & (1 << 22):
+        raise UnsupportedInstruction(insn, 'SPSR is unavailable in user mode')
+    if insn.id == ARM_INS_MRS:
+        rd = _dest_reg(insn, insn.operands[0])
+        return [f'ctx->r[{rd}] = ctx->n << 31 | ctx->z << 30 | ctx->c << 29 | '
+                f'ctx->v << 28 | ctx->q << 27 | ctx->ge << 16 | {0x30 if _is_thumb(insn) else 0x10}u;']
+    mask = (word >> 16) & 15
+    if mask == 0 or mask & 3:
+        raise UnsupportedInstruction(insn, 'only APSR flags writes are modelled')
+    op = insn.operands[-1]
+    value = _imm(op.imm) if op.type == ARM_OP_IMM else _read_reg(insn, op.reg)
+    lines = ['{', f'    uint32_t psr = {value};']
+    if mask & 8:
+        lines += [f'    ctx->{flag} = (psr >> {bit}) & 1;' for flag, bit in [('n', 31), ('z', 30), ('c', 29), ('v', 28), ('q', 27)]]
+    if mask & 4:
+        lines += ['    ctx->ge = (psr >> 16) & 15;']
+    return lines + ['}']
 
 
 def _long_mul(insn, fc):
@@ -1458,9 +1491,8 @@ def _dual_mul(insn, fc):
         raise UnsupportedInstruction(insn, 'unexpected operand shape')
     rd = _dest_reg(insn, ops[0])
     n, m = _read_reg(insn, ops[1].reg), _read_reg(insn, ops[2].reg)
-    value = f'arm_dual_mul({n}, {m}, {int(insn.id in _DUAL_SWAP)}, {int(sub)})'
-    if acc:
-        value = f'{value} + {_read_reg(insn, ops[3].reg)}'
+    accumulator = _read_reg(insn, ops[3].reg) if acc else '0u'
+    value = f'arm_dual_mul(ctx, {n}, {m}, {int(insn.id in _DUAL_SWAP)}, {int(sub)}, {accumulator})'
     return [f'ctx->r[{rd}] = {value};']
 
 
@@ -1534,6 +1566,9 @@ def _preload(insn, fc):
 # ---------------------------------------------------------------- dispatch
 
 _HANDLERS = {
+    **{op: _qaddsub for op in (ARM_INS_QADD, ARM_INS_QSUB, ARM_INS_QDADD, ARM_INS_QDSUB)},
+    ARM_INS_MRS: _psr,
+    ARM_INS_MSR: _psr,
     **{op: _binary for op in _BINARY},
     **{op: _unary for op in _UNARY},
     **{op: _shift_mnemonic for op in _SHIFT_MNEMONICS},

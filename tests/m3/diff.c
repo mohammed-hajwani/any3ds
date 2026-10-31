@@ -34,6 +34,7 @@ typedef struct {
     uint32_t addr;
     uint32_t r[15];             /* r0..r14 */
     uint32_t nzcv;
+    uint32_t q;
     uint64_t d[16];             /* VFP d0-d15 (= s0-s31) */
     uint32_t fp_nzcv;           /* FPSCR compare flags */
     size_t   writes_before;     /* writes made by earlier instructions */
@@ -86,7 +87,7 @@ static const int uc_regs[15] = {
 
 static int uc_dregs[16];
 
-static void read_uc_state(uint32_t *r, uint32_t *nzcv, uint64_t *d, uint32_t *fp_nzcv)
+static void read_uc_state(uint32_t *r, uint32_t *nzcv, uint32_t *q, uint64_t *d, uint32_t *fp_nzcv)
 {
     void *ptrs[16];
     for (int i = 0; i < 15; i++)
@@ -95,6 +96,7 @@ static void read_uc_state(uint32_t *r, uint32_t *nzcv, uint64_t *d, uint32_t *fp
     uint32_t cpsr, fpscr;
     uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr);
     *nzcv = cpsr >> 28;
+    *q = (cpsr >> 27) & 1;
     for (int i = 0; i < 16; i++)
         ptrs[i] = &d[i];
     uc_reg_read_batch(uc, uc_dregs, ptrs, 16);
@@ -112,7 +114,7 @@ static void on_code(uc_engine *u, uint64_t addr, uint32_t size, void *user)
     Step *s = &ref[ref_len++];
     s->addr = (uint32_t)addr;
     s->writes_before = ref_nwrites;
-    read_uc_state(s->r, &s->nzcv, s->d, &s->fp_nzcv);
+    read_uc_state(s->r, &s->nzcv, &s->q, s->d, &s->fp_nzcv);
 }
 
 static bool on_write(uc_engine *u, uc_mem_type type, uint64_t addr, int size, int64_t value, void *user)
@@ -129,22 +131,23 @@ static bool on_write(uc_engine *u, uc_mem_type type, uint64_t addr, int size, in
 
 typedef enum { UC_RETURNED, UC_LIMIT, UC_FAULT } UcEnd;
 
-static UcEnd run_unicorn(uint32_t entry, const uint32_t *r, uint32_t nzcv, const uint64_t *d, uint32_t fpscr,
+static UcEnd run_unicorn(uint32_t entry, const uint32_t *r, uint32_t nzcv, uint32_t q, const uint64_t *d, uint32_t fpscr,
                          Step *fin)
 {
+    /* Switch banks before writing SP/LR. The emulated program is user mode. */
+    uint32_t cpsr;
+    uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr);
+    cpsr = (cpsr & 0x000F0000u) | 0x10u | (nzcv << 28) | (q << 27);
+    uc_reg_write(uc, UC_ARM_REG_CPSR, &cpsr);
     for (int i = 0; i < 15; i++)
         check_uc(uc_reg_write(uc, uc_regs[i], &r[i]), "reg write");
     for (int i = 0; i < 16; i++)
         check_uc(uc_reg_write(uc, uc_dregs[i], &d[i]), "vfp reg write");
     check_uc(uc_reg_write(uc, UC_ARM_REG_FPSCR, &fpscr), "fpscr write");
-    uint32_t cpsr;
-    uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr);
-    cpsr = (cpsr & 0x0FFFFFFFu & ~0x20u) | (nzcv << 28);      /* flags; ARM (not Thumb) state */
-    uc_reg_write(uc, UC_ARM_REG_CPSR, &cpsr);
 
     ref_len = ref_nwrites = 0;
     uc_err e = uc_emu_start(uc, entry, RETURN_ADDR, 0, LIMIT);
-    read_uc_state(fin->r, &fin->nzcv, fin->d, &fin->fp_nzcv);
+    read_uc_state(fin->r, &fin->nzcv, &fin->q, fin->d, &fin->fp_nzcv);
     uint32_t pc;
     uc_reg_read(uc, UC_ARM_REG_PC, &pc);
     if (e != UC_ERR_OK)
@@ -171,6 +174,8 @@ static void report_header(void)
 
 static void report_state(const Ctx *ctx, const Step *s)
 {
+    if (ctx->q != s->q)
+        printf("    q   recompiled %u  unicorn %u\n", ctx->q, s->q);
     static const char *names[15] = { "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
                                      "r8", "r9", "r10", "r11", "r12", "sp", "lr" };
     for (int i = 0; i < 15; i++)
@@ -202,7 +207,7 @@ static int same_state(const Ctx *ctx, const Step *s)
     uint32_t nzcv = s->nzcv;
     return ctx->n == ((nzcv >> 3) & 1) && ctx->z == ((nzcv >> 2) & 1)
         && ctx->c == ((nzcv >> 1) & 1) && ctx->v == (nzcv & 1)
-        && ctx->fpscr >> 28 == s->fp_nzcv;
+        && ctx->q == s->q && ctx->fpscr >> 28 == s->fp_nzcv;
 }
 
 static void check_writes_done(void)
@@ -352,6 +357,7 @@ int main(int argc, char **argv)
             r[13] = STACK_TOP - 64;     /* room above sp for stack arguments */
             r[14] = RETURN_ADDR;
             uint32_t nzcv = rnd() & 0xF;
+            uint32_t q = (nzcv >> 1) & 1; /* exercise both initial sticky-Q states */
             uint64_t d[16];
             for (int i = 0; i < 16; i++)
                 d[i] = random_vfp();
@@ -360,13 +366,14 @@ int main(int argc, char **argv)
             uint32_t fpscr = (rnd() & 0xFu) << 28 | (rnd() % 2 ? 0x03000000u : 0);
 
             Step fin;
-            UcEnd end = run_unicorn(sym->addr, r, nzcv, d, fpscr, &fin);
+            UcEnd end = run_unicorn(sym->addr, r, nzcv, q, d, fpscr, &fin);
             limited += end != UC_RETURNED;
 
             Ctx ctx;
             memset(&ctx, 0, sizeof ctx);
             memcpy(ctx.r, r, sizeof r);
             ctx.n = (nzcv >> 3) & 1; ctx.z = (nzcv >> 2) & 1; ctx.c = (nzcv >> 1) & 1; ctx.v = nzcv & 1;
+            ctx.q = q;
             memcpy(ctx.vfp.x, d, sizeof d);
             ctx.fpscr = fpscr;
             ctx.mem = mem;

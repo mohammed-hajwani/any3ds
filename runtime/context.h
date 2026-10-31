@@ -29,6 +29,8 @@ typedef struct {
     uint32_t excl_valid;   //   and whether the monitor is armed
     int32_t budget;        // loop iterations left before the next tick (RECOMP_BACKEDGE)
     uint32_t ret_override; // where a tail-called function returns, if not lr (recomp_tail_ret); 0 = lr
+    uint32_t q;            // sticky Q: set by signed saturation and accumulate overflow (CPSR bit 27).
+                           //   Last, so adding it didn't move the fields code built earlier uses.
 } Ctx;
 
 /* ---- Tracing (M3 differential testing) ----
@@ -345,13 +347,15 @@ static inline uint32_t strex64(Ctx *ctx, uint32_t a, uint32_t lo, uint32_t hi)
 
 /* smuad/smusd/smlad/smlsd: the two signed halfword products of a and b
    (b's halves swapped first for the X forms), added or subtracted. */
-static inline uint32_t arm_dual_mul(uint32_t a, uint32_t b, int swap, int sub)
+static inline uint32_t arm_dual_mul(Ctx *ctx, uint32_t a, uint32_t b, int swap, int sub, uint32_t acc)
 {
     if (swap)
         b = (b >> 16) | (b << 16);
     int32_t lo = (int32_t)(int16_t)a * (int16_t)b;
     int32_t hi = (int32_t)(int16_t)(a >> 16) * (int16_t)(b >> 16);
-    return sub ? (uint32_t)lo - (uint32_t)hi : (uint32_t)lo + (uint32_t)hi;
+    int64_t sum = (int64_t)lo + (sub ? -(int64_t)hi : hi) + (int32_t)acc;
+    ctx->q |= sum > INT32_MAX || sum < INT32_MIN;
+    return (uint32_t)sum;
 }
 
 /* sxtb16: sign-extend bytes 0 and 2 into the two halfwords. */
@@ -439,28 +443,54 @@ static inline uint32_t arm_sel(Ctx *ctx, uint32_t a, uint32_t b)
 
 /* usat / ssat: clamp a signed value to n bits, unsigned (0 .. 2^n - 1) or
    signed (-2^(n-1) .. 2^(n-1) - 1). */
-static inline uint32_t arm_usat(uint32_t x, uint32_t n)
+static inline uint32_t arm_usat(Ctx *ctx, uint32_t x, uint32_t n)
 {
     int64_t v = (int32_t)x, max = ((int64_t)1 << n) - 1;
+    ctx->q |= v < 0 || v > max;
     return (uint32_t)(v < 0 ? 0 : v > max ? max : v);
 }
 
-static inline uint32_t arm_ssat(uint32_t x, uint32_t n)
+static inline uint32_t arm_ssat(Ctx *ctx, uint32_t x, uint32_t n)
 {
     int64_t v = (int32_t)x, max = ((int64_t)1 << (n - 1)) - 1, min = -max - 1;
+    ctx->q |= v < min || v > max;
     return (uint32_t)(int32_t)(v < min ? min : v > max ? max : v);
 }
 
 /* usat16 / ssat16: the same for each signed halfword on its own. */
-static inline uint32_t arm_usat16(uint32_t x, uint32_t n)
+static inline uint32_t arm_usat16(Ctx *ctx, uint32_t x, uint32_t n)
 {
-    return arm_usat((uint32_t)(int32_t)(int16_t)x, n) | arm_usat((uint32_t)(int32_t)(int16_t)(x >> 16), n) << 16;
+    uint32_t lo = arm_usat(ctx, (uint32_t)(int32_t)(int16_t)x, n);
+    uint32_t hi = arm_usat(ctx, (uint32_t)(int32_t)(int16_t)(x >> 16), n);
+    return lo | hi << 16;
 }
 
-static inline uint32_t arm_ssat16(uint32_t x, uint32_t n)
+static inline uint32_t arm_ssat16(Ctx *ctx, uint32_t x, uint32_t n)
 {
-    return (arm_ssat((uint32_t)(int32_t)(int16_t)x, n) & 0xFFFFu)
-         | arm_ssat((uint32_t)(int32_t)(int16_t)(x >> 16), n) << 16;
+    uint32_t lo = arm_ssat(ctx, (uint32_t)(int32_t)(int16_t)x, n);
+    uint32_t hi = arm_ssat(ctx, (uint32_t)(int32_t)(int16_t)(x >> 16), n);
+    return (lo & 0xffffu) | hi << 16;
+}
+
+/* Wide arithmetic avoids signed C overflow, including the doubling stage.
+   Q is sticky; neither these helpers nor parallel QADD8/QADD16 change NZCV. */
+static inline uint32_t arm_sat32(Ctx *ctx, int64_t value)
+{
+    if (value > INT32_MAX) { ctx->q = 1; return INT32_MAX; }
+    if (value < INT32_MIN) { ctx->q = 1; return (uint32_t)INT32_MIN; }
+    return (uint32_t)value;
+}
+static inline uint32_t arm_qaddsub(Ctx *ctx, uint32_t a, uint32_t b, int sub, int twice)
+{
+    if (twice)
+        b = arm_sat32(ctx, (int64_t)(int32_t)b * 2);
+    return arm_sat32(ctx, (int64_t)(int32_t)a + (sub ? -(int64_t)(int32_t)b : (int32_t)b));
+}
+static inline uint32_t arm_acc_q(Ctx *ctx, uint32_t product, uint32_t acc)
+{
+    int64_t sum = (int64_t)(int32_t)product + (int32_t)acc;
+    ctx->q |= sum > INT32_MAX || sum < INT32_MIN;
+    return (uint32_t)sum;
 }
 
 /* An indirect call/jump to an address no recompiled function starts at. */

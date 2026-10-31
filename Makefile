@@ -86,7 +86,7 @@ test-m0: $(M0)/test.dis $(M0)/shifts.dis $(M0)/test_harness $(M0)/shifts_harness
 	@timeout 60 ./$(M0)/test_harness
 	@echo '=== M0: barrel shifter ==='
 	@timeout 60 ./$(M0)/shifts_harness
-	@$(REJECT) $(M0)/unsupported.o 'unsupported instruction `qadd'
+	@$(REJECT) $(M0)/unsupported.o 'unsupported instruction `setend'
 
 # ---------------------------------------------------------------- M1
 
@@ -312,7 +312,7 @@ $(REAL)/gen_%.c: $(REAL)/%.elf $(RECOMP_DEP)
 $(REAL)/%_harness: tests/real/harness.c tests/real/real.c $(REAL)/gen_%.c $(RUNTIME_DEP)
 	$(HOST_CC) $(HOST_FLAGS) $< $(REAL)/gen_$*.c $(RUNTIME_SRC) -o $@
 
-REAL_PROGS := real/real_arm real/real_thumb real/extend real/dsp real/tables
+REAL_PROGS := real/real_arm real/real_thumb real/extend real/dsp real/tables real/sat
 RECOMP_FLAGS_tables := --no-symbols    # discovery has to find its jump tables
 $(foreach p,$(REAL_PROGS),$(eval $(call m3_prog,$(p))))
 REAL_DIFFS := $(foreach p,$(REAL_PROGS),$(M3)/$(notdir $(p))_diff)

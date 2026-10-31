@@ -8,8 +8,7 @@
 @   fall-through      a function that runs straight on into the next one
 @                     (libgcc's __aeabi_dsub does this into __adddf3)
 @   uqsub8, pld, ldr pc, [sp], #N (see the end of the file)
-@ The accumulating forms set the sticky Q flag on signed overflow; we don't
-@ model Q, and nothing we recompile reads it (mrs is a hard error).
+@ Accumulating forms set sticky Q on signed overflow; M3 compares it too.
 
     .syntax unified
     .arm
