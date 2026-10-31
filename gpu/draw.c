@@ -59,14 +59,24 @@ static uint32_t attrib_format(uint32_t k)       /* 4 bits: type (0-1), element c
     return (uint32_t)(f >> (4 * k)) & 0xF;
 }
 
-/* The values of vertex `index`'s attributes 0..count-1, from the vertex
-   arrays (or the fixed attributes). */
-static void load_attributes(uint32_t index, Vec4 attr[12])
+/* The vertex arrays as a draw reads them, worked out once per draw
+   (prepare_arrays): where each array is, and where each attribute sits in
+   its elements. */
+typedef struct { uint8_t comp, type, count, size; uint32_t pos; } ArrayAttr;
+typedef struct { uint32_t vaddr, stride, nattr; ArrayAttr attr[12]; } VertexArray;
+static struct {
+    Vec4 init[12];                      /* the fixed attributes, else (0, 0, 0, 1) */
+    uint32_t narrays;
+    VertexArray array[12];
+} arrays;
+
+static void prepare_arrays(void)
 {
     uint32_t high = pica.reg[REG_ATTRIBBUFFERS_FORMAT_HIGH], fixed = high >> 16 & 0xFFF;
     uint32_t base = pica.reg[REG_ATTRIBBUFFERS_LOC] << 3;
     for (int k = 0; k < 12; k++)
-        attr[k] = (fixed >> k & 1) ? pica.fixed_attrib[k] : (Vec4){ 0, 0, 0, 1 };
+        arrays.init[k] = (fixed >> k & 1) ? pica.fixed_attrib[k] : (Vec4){ 0, 0, 0, 1 };
+    arrays.narrays = 0;
     for (int b = 0; b < 12; b++) {
         uint32_t off = pica.reg[REG_ATTRIBBUFFER0_OFFSET + 3 * b] & 0xFFFFFFF;
         uint32_t cfg1 = pica.reg[REG_ATTRIBBUFFER0_OFFSET + 3 * b + 1];
@@ -77,7 +87,10 @@ static void load_attributes(uint32_t index, Vec4 attr[12])
         uint32_t vaddr = gpu_phys_to_virt(base + off);
         if (!vaddr)
             gpu_fatal("vertex array %d at physical %08" PRIx32 " is unmapped", b, base + off);
-        const uint8_t *p = gpu_mem(vaddr + index * stride, stride);
+        VertexArray *a = &arrays.array[arrays.narrays++];
+        a->vaddr = vaddr;
+        a->stride = stride;
+        a->nattr = 0;
         uint32_t pos = 0;
         for (uint32_t c = 0; c < ncomp; c++) {
             uint32_t comp = c < 8 ? cfg1 >> (4 * c) & 0xF : cfg2 >> (4 * (c - 8)) & 0xF;
@@ -90,11 +103,26 @@ static void load_attributes(uint32_t index, Vec4 attr[12])
             pos = (pos + size - 1) / size * size;   /* elements are naturally aligned */
             if (pos + size * count > stride)
                 gpu_fatal("vertex array %d: attribute %" PRIu32 " runs past the %" PRIu32 "-byte stride", b, comp, stride);
-            float v[4] = { 0, 0, 0, 1 };
-            for (uint32_t e = 0; e < count; e++)
-                v[e] = fetch(p + pos + e * size, type);
-            attr[comp] = (Vec4){ v[0], v[1], v[2], v[3] };
+            a->attr[a->nattr++] = (ArrayAttr){ (uint8_t)comp, (uint8_t)type, (uint8_t)count, (uint8_t)size, pos };
             pos += size * count;
+        }
+    }
+}
+
+/* The values of vertex `index`'s attributes 0..count-1, from the vertex
+   arrays (or the fixed attributes), as prepare_arrays found them. */
+static void load_attributes(uint32_t index, Vec4 attr[12])
+{
+    memcpy(attr, arrays.init, sizeof arrays.init);
+    for (uint32_t b = 0; b < arrays.narrays; b++) {
+        const VertexArray *a = &arrays.array[b];
+        const uint8_t *p = gpu_mem(a->vaddr + index * a->stride, a->stride);
+        for (uint32_t k = 0; k < a->nattr; k++) {
+            const ArrayAttr *e = &a->attr[k];
+            float v[4] = { 0, 0, 0, 1 };
+            for (uint32_t i = 0; i < e->count; i++)
+                v[i] = fetch(p + e->pos + i * e->size, e->type);
+            attr[e->comp] = (Vec4){ v[0], v[1], v[2], v[3] };
         }
     }
 }
@@ -122,23 +150,64 @@ static void outputs_to_vertex(const ShaderRegs *s, uint32_t mask, Vertex *out)
     }
 }
 
-static void shade(const Vec4 attr[12], ShaderRegs *regs_out, Vertex *out)
+/* The vertex shader's setup, worked out once per draw (prepare_shade):
+   which input register each attribute goes to, the uniforms, and which
+   output component lands in which vertex slot. */
+static struct {
+    uint32_t ninputs, entry, nout;
+    uint8_t input_reg[12], out_src[64], out_sem[64];
+    uint16_t bools;
+    uint8_t ints[4][4];
+} vs;
+
+static void prepare_shade(void)
 {
     const uint32_t *vsh = &pica.reg[REG_VSH_BASE];
+    vs.ninputs = (vsh[SH_INPUTBUFFER_CONFIG] & 0xF) + 1;
+    if (vs.ninputs > 12)
+        vs.ninputs = 12;
+    uint64_t perm = (uint64_t)vsh[SH_ATTRIBUTES_PERMUTATION_HIGH] << 32 | vsh[SH_ATTRIBUTES_PERMUTATION_LOW];
+    for (uint32_t k = 0; k < vs.ninputs; k++)
+        vs.input_reg[k] = (uint8_t)(perm >> (4 * k) & 0xF);
+    for (int i = 0; i < 4; i++)
+        memcpy(vs.ints[i], &vsh[SH_INTUNIFORM_I0 + i], 4);
+    vs.entry = vsh[SH_ENTRYPOINT] & 0xFFFF;
+    shader_prepare(&pica.vsh);
+    vs.bools = (uint16_t)vsh[SH_BOOLUNIFORM];
+    /* outputs_to_vertex's mapping, flattened: later entries win, as there */
+    vs.nout = 0;
+    uint32_t mask = vsh[SH_OUTMAP_MASK], n = 0, total = pica.reg[REG_SH_OUTMAP_TOTAL] & 7;
+    for (int r = 0; r < 16 && n < total; r++) {
+        if (!(mask >> r & 1))
+            continue;
+        uint32_t map = pica.reg[REG_SH_OUTMAP_O0 + n++];
+        for (int c = 0; c < 4; c++) {
+            uint32_t sem = map >> (8 * c) & 0x1F;
+            if (sem < NSEM) {
+                vs.out_src[vs.nout] = (uint8_t)(4 * r + c);
+                vs.out_sem[vs.nout++] = (uint8_t)sem;
+            }
+        }
+    }
+}
+
+static void shade(const Vec4 attr[12], ShaderRegs *regs_out, Vertex *out)
+{
     ShaderRegs s;
     memset(&s, 0, sizeof s);
-    uint32_t ninputs = (vsh[SH_INPUTBUFFER_CONFIG] & 0xF) + 1;
-    uint64_t perm = (uint64_t)vsh[SH_ATTRIBUTES_PERMUTATION_HIGH] << 32 | vsh[SH_ATTRIBUTES_PERMUTATION_LOW];
-    for (uint32_t k = 0; k < ninputs && k < 12; k++)
-        s.v[perm >> (4 * k) & 0xF] = attr[k];
-    uint8_t ints[4][4];
-    for (int i = 0; i < 4; i++)
-        memcpy(ints[i], &vsh[SH_INTUNIFORM_I0 + i], 4);
-    shader_exec(&pica.vsh, vsh[SH_ENTRYPOINT] & 0xFFFF, (uint16_t)vsh[SH_BOOLUNIFORM], ints, &s);
+    for (uint32_t k = 0; k < vs.ninputs; k++)
+        s.v[vs.input_reg[k]] = attr[k];
+    shader_exec(&pica.vsh, vs.entry, vs.bools, vs.ints, &s);
     if (regs_out)
         *regs_out = s;
-    if (out)
-        outputs_to_vertex(&s, vsh[SH_OUTMAP_MASK], out);
+    if (out) {
+        for (int i = 0; i < NSEM; i++)
+            out->a[i] = 0;
+        out->a[SEM_POS + 3] = 1;
+        const float *o = &s.o[0].x;
+        for (uint32_t i = 0; i < vs.nout; i++)
+            out->a[vs.out_sem[i]] = o[vs.out_src[i]];
+    }
 }
 
 /* ---------------------------------------------------------------- clipping */
@@ -637,6 +706,7 @@ void gpu_stats_report(uint32_t frame)
     }
     memset(part_ns, 0, sizeof part_ns);
     flushes = flushes_parallel = flushes_gpu = 0;
+    vkr_report();
     fprintf(stderr, "gpu stats (frame %u): %llu triangles (%llu clipped away, %llu culled), %llu fragments: "
             "%llu failed alpha, %llu stencil, %llu depth; %llu written (%llu read lighting while off)\n", frame,
             (unsigned long long)stats.tris, (unsigned long long)stats.clipped, (unsigned long long)stats.culled,
@@ -1073,10 +1143,32 @@ static int32_t sign10(uint32_t v)       /* a signed 10-bit field */
 }
 
 /* Clip a triangle, map it to the window and draw it. */
+/* Bit p set: the vertex is outside clip plane p (plane_dist < 0, or NaN). */
+static int outcode(const Vertex *v)
+{
+    float x = v->a[0], y = v->a[1], z = v->a[2], w = v->a[3];
+    return !(w - x >= 0) | !(w + x >= 0) << 1 | !(w - y >= 0) << 2 | !(w + y >= 0) << 3 |
+           !(-z >= 0) << 4 | !(w + z >= 0) << 5 | !(w - 1e-6f >= 0) << 6;
+}
+
 static void draw_triangle(const Vertex *a, const Vertex *b, const Vertex *c)
 {
     ClipVertex poly[16];
     const Vertex *in[3] = { a, b, c };
+    stats.tris++;
+    /* Clipping leaves a triangle inside every plane as it is. Up to the
+       first plane that a vertex is outside, it changes nothing either, so
+       if all three are outside that one, nothing is left: the same results
+       as clip_polygon without its copies. */
+    int oa = outcode(a), ob = outcode(b), oc = outcode(c), any = oa | ob | oc;
+    int n = 3;
+    if (any) {
+        int first = any & -any;
+        if (oa & ob & oc & first) {
+            stats.clipped++;
+            return;
+        }
+    }
     for (int i = 0; i < 3; i++) {
         poly[i].v = *in[i];
         poly[i].x = in[i]->a[0];
@@ -1084,8 +1176,8 @@ static void draw_triangle(const Vertex *a, const Vertex *b, const Vertex *c)
         poly[i].z = in[i]->a[2];
         poly[i].w = in[i]->a[3];
     }
-    stats.tris++;
-    int n = clip_polygon(poly, 3);
+    if (any)
+        n = clip_polygon(poly, 3);
     if (n < 3) {
         stats.clipped++;
         return;
@@ -1153,6 +1245,7 @@ static void gs_run(void)
     for (int i = 0; i < 4; i++)
         memcpy(ints[i], &gsh[SH_INTUNIFORM_I0 + i], 4);
     g.on_emit = gs_emit;
+    shader_prepare(&pica.gsh);
     shader_exec(&pica.gsh, gsh[SH_ENTRYPOINT] & 0xFFFF, (uint16_t)gsh[SH_BOOLUNIFORM], ints, &g);
 }
 
@@ -1402,6 +1495,10 @@ static void draw(int indexed)
         fprintf(stderr, "    PICA draw %s: %" PRIu32 " vertices, primitive mode %" PRIu32 "\n",
                 indexed ? "elements" : "arrays", count, pica.reg[REG_PRIMITIVE_CONFIG] >> 8 & 3);
     assembled = 0;
+    if (!count)
+        return;
+    prepare_arrays();
+    prepare_shade();
     if (!nbands)
         pool_start();
     static uint32_t parallel_min;
@@ -1493,6 +1590,7 @@ void pica_immediate_vertex(const Vec4 *attribs)
     int gs = geometry_shader_on();
     if (gs && gs_mode == 1)
         gpu_fatal("immediate-mode vertices with a variable-size geometry shader");
+    prepare_shade();
     shade(attr, &s, gs ? NULL : &v);
     if (gs)
         gs_feed(&s);

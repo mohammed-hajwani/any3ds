@@ -5,7 +5,7 @@ A **static recompiler** for Nintendo 3DS code. It translates 32-bit ARM (ARMv6K)
 
 Why ahead of time? iOS doesn't allow JIT compilation, so 3DS emulators on iPhone fall back to slow interpreters. If the whole program is translated before it runs, nothing has to be generated at runtime.
 
-> **Status:** a personal learning project, now running a commercial game. Milestones M0-M10 built the translator (ARM, Thumb, VFP, real-world control flow, checked instruction by instruction against Unicorn), our own minimal OS layer and our own PICA200 GPU (no third-party emulator code): 49 of devkitPro's 62 examples run ([docs/compat.md](docs/compat.md)). Since then it recompiles retail games from the user's own dump (`code.bin` + CRO modules, no symbols) and **Pokémon X boots into its game world**: language select, title screen, Professor Sycamore's intro, name entry, the bedroom, Vaniville Town, Route 1 and the café in Aquacorde, all in 3D. Its AAC music streams get through our DSP's codec protocol, which answers the game properly but decodes to silence for now (there is no sound output yet). It renders in software on all CPU cores (about 15 fps in heavy 3D scenes, near 60 without drawing); a hardware renderer is planned. Development targets x86-64 Linux (WSL2); iOS comes much later.
+> **Status:** a personal learning project, now running a commercial game. Milestones M0-M10 built the translator (ARM, Thumb, VFP, real-world control flow, checked instruction by instruction against Unicorn), our own minimal OS layer and our own PICA200 GPU (no third-party emulator code): 49 of devkitPro's 62 examples run ([docs/compat.md](docs/compat.md)). Since then it recompiles retail games from the user's own dump (`code.bin` + CRO modules, no symbols) and **Pokémon X boots into its game world**: language select, title screen, Professor Sycamore's intro, name entry, the bedroom, Vaniville Town, Route 1 and the café in Aquacorde, all in 3D. Its AAC music streams get through our DSP's codec protocol, which answers the game properly but decodes to silence for now (there is no sound output yet). It draws on the host GPU through **Vulkan** (our own renderer: textures, colour combiners, per-pixel lighting and fog in one shader, giving the same pixels as our software renderer): Lumiose City runs at about **42 fps on an RTX 4060 laptop**, against about 10 in software. It runs on Linux (WSL2) and as a native Windows `.exe`; iOS comes much later.
 
 ## Progress
 
@@ -102,7 +102,7 @@ Only ever your own, decrypted dump, kept in `dumps/` or outside the repo (never 
 tools/build_dump.sh /path/to/your/game.3ds out/game     # recompile everything (~8 min); OS_ONLY=1 rebuilds just the OS layer
 out/game/run --romfs /path/to/your/game.3ds --save out/game/save --live out/game/live.bmp --input out/game/keys.txt --speed 1
 ```
-`--live` saves both screens every 30 frames and `tools/live.html` (served by `tools/live_server.py`) shows them with buttons that write `--input`. `--speed 1` plays at the 3DS's own speed (0 = as fast as possible). Runs are deterministic: `--hold FRAME:KEYS` and `--touch FRAME:X,Y` replay a session exactly. `GPU_SKIP_UNTIL=N` fast-forwards to frame N without drawing; `GPU_TRACE=N` and `HLE_TRACE=N` trace the GPU or the OS from frame N; `GPU_THREADS=N` sets the drawing threads.
+`GPU_BACKEND=vulkan` draws on the GPU (otherwise the software renderer draws), and `--window 2` opens a window at twice the 3DS's size: arrow keys for the D-pad, X/Z for A/B, S/A for X/Y, Q/W for L/R, Enter for START, Backspace for SELECT, and the mouse on the bottom screen. A native Windows build is cross-compiled from WSL with `tools/build_win.sh out/game`. `--live` saves both screens every 30 frames and `tools/live.html` (served by `tools/live_server.py`) shows them with buttons that write `--input`. `--speed 1` plays at the 3DS's own speed (0 = as fast as possible). Runs are deterministic: `--hold FRAME:KEYS` and `--touch FRAME:X,Y` replay a session exactly. `GPU_SKIP_UNTIL=N` fast-forwards to frame N without drawing; `GPU_TRACE=N` and `HLE_TRACE=N` trace the GPU or the OS from frame N; `GPU_THREADS=N` sets the drawing threads.
 
 `make compat` builds, recompiles and runs every example in devkitPro's `3ds-examples` (installed with `3ds-dev`) and writes the table in [docs/compat.md](docs/compat.md). It takes about 4 minutes, and seconds when nothing changed.
 
@@ -128,8 +128,10 @@ hle/               the OS layer: high-level emulation of the 3DS kernel and serv
 gpu/               our own emulation of the 3DS GPU (PICA200), from the 3dbrew docs
   gx.c pixel.c     2D engines (fill, display transfer, texture copy), formats, tiling, float24
   regs.c           command lists: register writes and the data FIFOs
-  shader.c         vertex shader interpreter
+  shader.c         vertex shader interpreter (each program decoded once)
   draw.c           vertex fetch, clipping, rasteriser, colour combiners, tests, blending
+  texture.c lighting.c   texture units and the procedural texture; per-pixel lighting
+  vkr.c shaders/   the Vulkan renderer: the pixel stage as one GLSL shader, render targets kept on the GPU
 tests/
   m0/ ... m5/      one directory per milestone
   real/            -O2 code + libgcc; extends, DSP multiplies, saturation, unusual control flow
@@ -168,7 +170,8 @@ dumps/  out/       gitignored: your own dumps and all generated code
 | M11 | Retail code: `code.bin` + CROs from your own dump, function discovery without symbols | ✅ |
 | M12 | Audio DSP, silent for now: voices consumed at the right rate, the AAC codec protocol answered with silence | ✅ |
 | — | Pokémon X boots into its game world; 7x faster (`-O1` generated code), drawing on all cores | ✅ |
-| next | The game's script engine, sound output, a hardware renderer (Vulkan, later Metal), savestates | |
+| — | Native Windows build, and a Vulkan renderer matching the software one pixel for pixel: Pokémon X at ~42 fps | ✅ |
+| next | 60 fps (vertex shading is the biggest cost left), sound output, savestates, Metal for iOS | |
 | later | Cycle counting, interpreter fallback for unresolved jumps, iOS shell app | |
 
 ## Contributing

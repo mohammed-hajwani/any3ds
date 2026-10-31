@@ -95,12 +95,21 @@ it.
    before its first use after a sync, so writes by the CPU, GX or software
    are uploaded. Pokémon X in Lumiose: 34.7 fps (software: 9.7), the frame
    identical to step 4; 7142 batches in 360 submissions.
-6. **Pokémon X at 60 fps:** profile. At 34.7 fps a second of Lumiose
-   spends about 0.67 s shading vertices on the CPU, 0.73 s in the GPU path
-   (hashing, uploads, read-backs, waiting) and 0.31 s in game code and the OS.
-   Candidates: read back only at the end of a frame or when memory is read,
-   check memory by watching writes instead of hashing, vertex shading on
-   the GPU.
+6. **Towards 60 fps** (in progress). Measured with GPU_STATS=1 (the
+   "vulkan:" line splits the GPU path's time). Done so far, each giving a
+   byte-identical Lumiose frame: the OS layer and GPU built with -O2 in the
+   Windows build; the shader interpreter decodes each program once (and
+   skips the control-flow stacks when they are empty); vertex arrays and
+   the shader's inputs and outputs are worked out once per draw; triangles
+   entirely outside a clip plane are dropped before clipping copies them;
+   RGBA8 and depth targets convert between tiles and rows in memory order;
+   a texture's bytes are hashed at most once between syncs. Lumiose: 35 ->
+   42.4 fps. A second there now spends about 0.41 s shading vertices, 0.46 s
+   in vkr_draw (0.10 s of it textures, 0.06 hashing targets), 0.13 s waiting
+   for the GPU, 0.08 s reading back, and the rest in game code. Next: run
+   small draws' vertices on several threads, keep the vertex data in the
+   GPU's buffer without a copy, read targets back only when something reads
+   them.
 
 `GPU_BACKEND=software` keeps the current renderer, for tests and for
 comparing pictures.

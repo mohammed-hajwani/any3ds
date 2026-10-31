@@ -71,6 +71,7 @@ static VkQueue queue;
 static uint32_t family;
 static int has_logic_op;
 static void make_dummy(void);
+static void tile_tables(void);
 static VkCommandPool pool;
 static VkCommandBuffer cmd, tcmd;       /* drawing; texture uploads */
 static VkFence done, tdone;
@@ -133,7 +134,12 @@ static uint64_t clock_;
 static int recording;                   /* cmd holds batches not yet submitted */
 static Surface *in_pass;                /* the surface whose render pass is open */
 static uint64_t epoch = 1;              /* counts submissions */
+static uint64_t mem_epoch = 1;          /* counts vkr_sync calls: 3DS memory may have changed at each */
 static uint64_t submits, uploads;       /* reported at exit */
+/* GPU_STATS=1: where the Vulkan path's time goes, printed with draw.c's
+   stats each second (vkr_report). */
+enum { VKT_RECORD, VKT_HASH, VKT_UPLOAD, VKT_TEXTURE, VKT_WAIT, VKT_DOWNLOAD, VKT_COUNT };
+static uint64_t vt[VKT_COUNT], vt_submits, vt_uploads;
 static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h);
 
 /* The pipeline state that can't be dynamic, and its pipelines. */
@@ -403,6 +409,7 @@ static void init(void)
     ensure(&vbo, 4 << 20);
     ensure(&up, 8 << 20);
 
+    tile_tables();
     make_pass();
     make_layout();
     make_dummy();
@@ -456,8 +463,11 @@ static size_t depth_bytes(const Surface *s)
 
 static uint64_t surface_hash(const Surface *s)
 {
+    uint64_t t0 = gpu_now_ns();
     uint64_t h = hash_bytes(s->color, color_bytes(s), 0xCBF29CE484222325ull);
-    return hash_bytes(s->depth, depth_bytes(s), h);
+    h = hash_bytes(s->depth, depth_bytes(s), h);
+    vt[VKT_HASH] += gpu_now_ns() - t0;
+    return h;
 }
 
 static int overlap(const uint8_t *a, size_t an, const uint8_t *b, size_t bn)
@@ -553,6 +563,7 @@ typedef struct {
     VkDeviceMemory mem;
     VkImageView view;
     uint64_t used, epoch;               /* epoch: the last submission that reads it */
+    uint64_t checked;                   /* mem_epoch when its bytes were last hashed */
 } Texture;
 #define NTEX 512
 static Texture textures[NTEX];
@@ -647,7 +658,16 @@ static void upload_texture(Texture *x, const TexUnit *t, const uint8_t *const *d
 }
 
 /* Texture unit `unit`'s texture on the GPU, decoded if it isn't yet. */
+static Texture *get_texture_(int unit);
 static Texture *get_texture(int unit)
+{
+    uint64_t t0 = gpu_now_ns();
+    Texture *x = get_texture_(unit);
+    vt[VKT_TEXTURE] += gpu_now_ns() - t0;
+    return x;
+}
+
+static Texture *get_texture_(int unit)
 {
     TexUnit t;
     tex_unit_read(unit, &t);
@@ -662,7 +682,6 @@ static Texture *get_texture(int unit)
     uint32_t bytes = 0, w = t.width, h = t.height;
     for (uint32_t l = 0; l < k.levels; l++, w /= 2, h /= 2)
         bytes += tex_level_size(t.format, w, h);
-    uint64_t hash = 0xCBF29CE484222325ull;
     for (uint32_t f = 0; f < k.faces; f++) {
         k.addr[f] = t.addr[f];
         uint32_t v = gpu_phys_to_virt(t.addr[f]);
@@ -670,8 +689,25 @@ static Texture *get_texture(int unit)
             gpu_fatal("texture at physical %08" PRIx32 " is unmapped", t.addr[f]);
         data[f] = gpu_mem(v, bytes);
         sync_if_drawn(data[f], bytes);      /* rendering to a texture */
-        hash = hash_bytes(data[f], bytes, hash);
     }
+
+    /* Memory only changes at a vkr_sync: a texture whose bytes were hashed
+       since is still the same. */
+    static Texture *recent[256];
+    uint32_t hint = (k.addr[0] >> 3 ^ k.width * 31 ^ k.height * 131 ^ k.format * 7 ^ k.levels) & 255;
+    Texture *r = recent[hint];
+    if (r && r->img && r->checked == mem_epoch) {
+        TexKey same = r->key;
+        same.hash = 0;
+        if (memcmp(&same, &k, sizeof k) == 0) {
+            r->used = ++clock_;
+            return r;
+        }
+    }
+
+    uint64_t hash = 0xCBF29CE484222325ull;
+    for (uint32_t f = 0; f < k.faces; f++)
+        hash = hash_bytes(data[f], bytes, hash);
     k.hash = hash;
 
     Texture *x = NULL, *lru = &textures[0];
@@ -694,6 +730,8 @@ static Texture *get_texture(int unit)
         upload_texture(x, &t, data);
     }
     x->used = ++clock_;
+    x->checked = mem_epoch;
+    recent[hint] = x;
     return x;
 }
 
@@ -970,10 +1008,92 @@ static void barrier(VkPipelineStageFlags src, VkAccessFlags src_access, VkPipeli
 #define ATTACH_RW (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | \
                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
 
+/* Pixel k of an 8x8 tile in memory is at (tile_x[k], tile_y[k]) in it. */
+static uint8_t tile_x[64], tile_y[64];
+
+static void tile_tables(void)
+{
+    for (uint32_t y = 0; y < 8; y++)
+        for (uint32_t x = 0; x < 8; x++) {
+            uint32_t k = tile_index(x, y, 8);
+            tile_x[k] = (uint8_t)x;
+            tile_y[k] = (uint8_t)y;
+        }
+}
+
+/* The common case, a whole number of tiles: memory in order, pixel by
+   pixel, with RGBA8 colour (byte-swapped words). Same results as below. */
+static int fast_layout(const Surface *s)
+{
+    return s->w % 8 == 0 && s->h % 8 == 0 && (!s->color || s->color_fmt == PIXEL_RGBA8);
+}
+
+static void upload_fast(const Surface *s, uint8_t *p)
+{
+    uint32_t w = s->w, h = s->h, npix = w * h, bits = s->depth_fmt == 0 ? 16 : 24;
+    uint32_t *color = (uint32_t *)p;
+    float *depth = (float *)(p + 4 * (size_t)npix);
+    uint8_t *stencil = p + 8 * (size_t)npix;
+    uint32_t dsize = depth_size(s->depth_fmt), dmax = (1u << bits) - 1;
+    float scale = ldexpf(1, -(int)bits);
+    uint32_t idx = 0;
+    for (uint32_t ty = 0; ty < h; ty += 8)
+        for (uint32_t tx = 0; tx < w; tx += 8)
+            for (uint32_t k = 0; k < 64; k++, idx++) {
+                uint32_t i = (ty + tile_y[k]) * w + tx + tile_x[k];
+                uint32_t c = 0;
+                if (s->color) {
+                    memcpy(&c, s->color + 4 * (size_t)idx, 4);
+                    c = __builtin_bswap32(c);       /* memory a, b, g, r -> r, g, b, a */
+                }
+                color[i] = c;
+                uint32_t raw = 0;
+                if (s->depth)
+                    memcpy(&raw, s->depth + (size_t)idx * dsize, dsize);
+                depth[i] = (float)(raw & dmax) * scale;
+                stencil[i] = s->depth_fmt == 3 ? (uint8_t)(raw >> 24) : 0;
+            }
+}
+
+static void download_fast(const Surface *s, const uint8_t *p)
+{
+    uint32_t w = s->w, h = s->h, npix = w * h, bits = s->depth_fmt == 0 ? 16 : 24;
+    int color = s->dirty_color && s->color, depth = s->dirty_depth && s->depth;
+    const uint32_t *cv = (const uint32_t *)p;
+    const float *dv = (const float *)(p + 4 * (size_t)npix);
+    const uint8_t *sv = p + 8 * (size_t)npix;
+    uint32_t dsize = depth_size(s->depth_fmt);
+    float scale = ldexpf(1, (int)bits);
+    uint32_t idx = 0;
+    for (uint32_t ty = 0; ty < h; ty += 8)
+        for (uint32_t tx = 0; tx < w; tx += 8)
+            for (uint32_t k = 0; k < 64; k++, idx++) {
+                uint32_t i = (ty + tile_y[k]) * w + tx + tile_x[k];
+                if (color) {
+                    uint32_t c = __builtin_bswap32(cv[i]);
+                    memcpy(s->color + 4 * (size_t)idx, &c, 4);
+                }
+                if (depth) {
+                    uint32_t z = (uint32_t)(dv[i] * scale);
+                    uint8_t *dp = s->depth + (size_t)idx * dsize;
+                    if (s->depth_fmt == 3) {
+                        z = (z & 0xFFFFFF) | (uint32_t)sv[i] << 24;
+                        memcpy(dp, &z, 4);
+                    } else {
+                        memcpy(dp, &z, dsize == 2 ? 2 : 3);
+                    }
+                }
+            }
+}
+
 /* 3DS memory -> an upload area: colour as RGBA8, then depth as floats,
    then stencil bytes, each in rows from the target's first memory row. */
 static void upload(const Surface *s, uint8_t *p)
 {
+    if (fast_layout(s)) {
+        upload_fast(s, p);
+        return;
+    }
     uint32_t w = s->w, h = s->h, npix = w * h, bits = s->depth_fmt == 0 ? 16 : 24;
     float *depth = (float *)(p + 4 * (size_t)npix);
     uint8_t *stencil = p + 8 * (size_t)npix;
@@ -996,6 +1116,10 @@ static void upload(const Surface *s, uint8_t *p)
 /* A read-back area -> 3DS memory, for what the GPU drew on. */
 static void download(const Surface *s, const uint8_t *p)
 {
+    if (fast_layout(s)) {
+        download_fast(s, p);
+        return;
+    }
     uint32_t w = s->w, h = s->h, npix = w * h, bits = s->depth_fmt == 0 ? 16 : 24;
     int color = s->dirty_color && s->color, depth = s->dirty_depth && s->depth;
     const float *dv = (const float *)(p + 4 * (size_t)npix);
@@ -1106,9 +1230,13 @@ void vkr_sync(void)
         }
         vkEndCommandBuffer(cmd);
         VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
+        uint64_t t0 = gpu_now_ns();
         check(vkQueueSubmit(queue, 1, &si, done), "vkQueueSubmit");
         check(vkWaitForFences(device, 1, &done, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        uint64_t t1 = gpu_now_ns();
+        vt[VKT_WAIT] += t1 - t0;
         submits++;
+        vt_submits++;
         for (int i = 0; i < NSURF; i++) {
             Surface *s = &surf[i];
             if (!s->dirty_color && !s->dirty_depth)
@@ -1117,6 +1245,7 @@ void vkr_sync(void)
             s->dirty_color = s->dirty_depth = 0;
             s->hash = surface_hash(s);
         }
+        vt[VKT_DOWNLOAD] += gpu_now_ns() - t1;
         recording = 0;
         epoch++;
         ubo.used = vbo.used = up.used = tables.used = 0;
@@ -1127,9 +1256,31 @@ void vkr_sync(void)
     /* From here others may write 3DS memory: check it before the next use. */
     for (int i = 0; i < NSURF; i++)
         surf[i].verified = 0;
+    mem_epoch++;
 }
 
+static void vkr_draw_(const VkrTarget *t, const VkrVertex *v, uint32_t n);
 void vkr_draw(const VkrTarget *t, const VkrVertex *v, uint32_t n)
+{
+    uint64_t t0 = gpu_now_ns();
+    vkr_draw_(t, v, n);
+    vt[VKT_RECORD] += gpu_now_ns() - t0;
+}
+
+void vkr_report(void)
+{
+    if (state != 1)
+        return;
+    /* (vkr_draw's total includes the hashing, uploads, textures and syncs it caused) */
+    fprintf(stderr, "vulkan: %llu submissions, %llu uploads; ms: in vkr_draw %.0f (hash %.0f, upload %.0f, "
+            "textures %.0f), waiting for the GPU %.0f, read-back %.0f\n", (unsigned long long)vt_submits,
+            (unsigned long long)vt_uploads, vt[VKT_RECORD] / 1e6, vt[VKT_HASH] / 1e6, vt[VKT_UPLOAD] / 1e6,
+            vt[VKT_TEXTURE] / 1e6, vt[VKT_WAIT] / 1e6, vt[VKT_DOWNLOAD] / 1e6);
+    memset(vt, 0, sizeof vt);
+    vt_submits = vt_uploads = 0;
+}
+
+static void vkr_draw_(const VkrTarget *t, const VkrVertex *v, uint32_t n)
 {
     uint32_t w = t->width, h = t->height, npix = w * h;
     if (!n || !npix)
@@ -1220,7 +1371,10 @@ void vkr_draw(const VkrTarget *t, const VkrVertex *v, uint32_t n)
         if (!s->valid || hash != s->hash) {
             end_pass();
             VkDeviceSize at = ring_take(&up, upsize, 16);
+            uint64_t t0 = gpu_now_ns();
             upload(s, up.ptr + at);
+            vt[VKT_UPLOAD] += gpu_now_ns() - t0;
+            vt_uploads++;
             /* Everything is uploaded, so the old contents can go: UNDEFINED -> GENERAL. */
             VkImageMemoryBarrier ib[2] = {
                 { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,

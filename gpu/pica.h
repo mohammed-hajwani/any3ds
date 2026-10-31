@@ -64,6 +64,7 @@ typedef struct {
     uint32_t uniform_index, uniform_f32;
     uint32_t uniform_words[4];      /* a uniform being assembled from 3 (f24) or 4 (f32) words */
     uint32_t uniform_count;
+    uint32_t version;               /* counts writes to code and opdesc (shader.c's decoded tables) */
 } ShaderUnit;
 
 typedef struct {
@@ -99,6 +100,9 @@ typedef struct ShaderRegs {
 /* Run a unit's program from word `entry` until END. bools: b0-b15;
    ints: i0-i3 as (x, y, z, w) bytes. */
 void shader_exec(const ShaderUnit *unit, uint32_t entry, uint16_t bools, const uint8_t ints[4][4], ShaderRegs *s);
+/* Decode a unit's program for shader_exec, if it changed. Call it before
+   running vertices on several threads (they only read the tables). */
+void shader_prepare(const ShaderUnit *unit);
 extern const char *const pica_reg_names[PICA_REGS];
 
 /* Run a command list (virtual address, size in bytes). */

@@ -69,10 +69,12 @@ static void shader_unit_write(ShaderUnit *u, uint32_t off, uint32_t value)
         u->code_index = value & 0xFFF;
     } else if (off >= SH_CODETRANSFER_DATA && off < SH_CODETRANSFER_DATA + 8) {
         u->code[u->code_index++ & 0xFFF] = value;
+        u->version++;
     } else if (off == SH_OPDESCS_INDEX) {
         u->opdesc_index = value & 0x7F;
     } else if (off >= SH_OPDESCS_DATA && off < SH_OPDESCS_DATA + 8) {
         u->opdesc[u->opdesc_index++ & 0x7F] = value;
+        u->version++;
     }
 }
 

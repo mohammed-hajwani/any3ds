@@ -26,5 +26,6 @@ void vkr_draw(const VkrTarget *t, const VkrVertex *v, uint32_t n);    /* n verti
    it before anything else reads or writes render targets: the end of a
    command list, a batch drawn in software. */
 void vkr_sync(void);
+void vkr_report(void);                  /* GPU_STATS=1: the last second's timings */
 
 #endif
