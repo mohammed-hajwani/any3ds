@@ -91,9 +91,10 @@ performance profile:
 | Layer | Language | Runs | Tested by |
 |---|---|---|---|
 | `recomp/` | Python 3 | ahead of time, on a PC | its own output being correct |
-| generated C + `runtime/` | C | per guest instruction | Unicorn lockstep diff (M3) |
+| generated C + `runtime/` | C | per guest instruction | Unicorn lockstep diff (M3) + the fuzzer |
 | `hle/` | C | per OS call | golden logs, frame hashes |
-| `gpu/` | C | per draw | 469 unit checks + frame hashes |
+| `gpu/` (software) | C | per draw | 469 unit checks + frame hashes |
+| `gpu/vkr.c` + GLSL | C + SPIR-V | per draw batch, on the host GPU | agreement with the software path (§5.5) |
 
 The split is deliberate: the slow, clever, rewrite-friendly part is Python and
 runs offline; everything on the hot path is plain C.
@@ -270,6 +271,19 @@ that table is a function**, and the fall-through between them is a tail call.
 Expect more of this: a dispatch table is how every interpreter, state machine
 and message pump is written, and each one hides its code from static analysis in
 a slightly different way.
+
+Two later rules are worth recording because they show where the reasoning has
+landed. **An empty function (`bx lr` alone) is never the middle of another one**
+— splitting there is always safe, since whatever runs into it merely calls it;
+without that, stepping out of the game's front door called an empty handler
+through a pointer and found nothing. And **a guess that begins with text is
+data**: six or more printable characters followed by a NUL cannot be
+unconditional ARM code, because that always has a top byte of 0xE0 or more.
+Something pointed at the string `"swp_parts01"`, discovery took it for a
+function, its decoded "instructions" ran into the real function behind it, and
+that function was then dropped as a mid-function — which showed up as a crash in
+a café in Aquacorde. The lesson in both: when a heuristic promotes something to
+"function", the damage usually appears as a *different* function going missing.
 
 **Why.** Retail games have no symbols at all. Without this there is no path to
 commercial software, and 3dsx homebrew only gets you so far.
@@ -488,6 +502,13 @@ is the part of an ARM translator where "nearly right" means weeks of debugging.
 **What it costs.** Four stores per flag-setting instruction, and ARM code sets
 flags on most instructions while reading them on few. With state in memory
 (§3.1) clang cannot always eliminate the dead ones.
+
+There is a fifth flag now: **Q**, the sticky saturation flag, set by the
+saturating instructions (`qadd`/`qsub`/`qdadd`/`qdsub`, `ssat`/`usat`, the
+multiply-accumulates that can overflow) and cleared only by writing it, which
+`msr` can. It was appended to `Ctx` rather than placed with `n/z/c/v`
+deliberately, so every existing field keeps its offset — worth knowing before
+anyone tidies that struct.
 
 **Lever.** Dead-flag elimination: a backwards pass per function marking, for
 each flag-setting instruction, whether any reachable instruction reads that flag
@@ -979,16 +1000,18 @@ every pixel is deterministic, so a frame hash is a valid test.
 - **Software, but SIMD and multithreaded**: the obvious middle step.
 
 **What it costs.** Speed, and this is now measured rather than predicted:
-**~15 fps in heavy 3D scenes, against near 60 with drawing skipped** (§8.4).
+**~10-15 fps in 3D scenes depending on the scene, against near 60 with drawing
+skipped** (§8.4).
 The GPU became the bottleneck exactly as expected, and before the recompiled
 CPU code did. Spreading rasterisation across cores (§5.2) bought a multiple, not
 an order of magnitude; software shading of every fragment is the floor.
 
-**Lever.** The architecture to aim for: keep this software path as the
-*reference* (it is a correctness oracle you cannot buy), and add a hardware
-backend behind the same interface. Then any disagreement between them is a bug
-you can localise. That is a much stronger position than having only a fast
-renderer.
+**Lever (taken — see §5.5).** The plan this section argued for is now built:
+the software path stayed as the *reference*, and a Vulkan renderer was added
+behind the same interface, with agreement between the two as a test. Software is
+still the default backend; `GPU_BACKEND=vulkan` selects the fast one. Keeping
+both is not redundancy — it is the only reason a hardware renderer can be
+trusted.
 
 ### 5.2 Synchronous in order, but rasterised on every core
 
@@ -1020,6 +1043,21 @@ copy for everything else:
 - `GPU_THREADS=N` sets the count, and the GPU test suite passes with 1 and with
   many. That equivalence *is* the test, and it is only expressible because the
   design promises identical output rather than merely correct output.
+
+The **vertex** stage was parallelised the same way afterwards, under the same
+rule. The vertex shader has no side effects and its state is fixed for the
+duration of a draw, which licenses two things: indexed draws **cache** shaded
+vertices and reuse them, and a draw of 1024+ vertices (no geometry shader)
+shades its distinct vertices on every thread first and *then* assembles
+primitives in order — the same triangles, in the same order. `make test-gpu`
+runs with the threshold lowered to 1 as well as with `GPU_THREADS=1`, so the
+equivalence is tested from both ends.
+
+Batches also got bigger, by narrowing what forces a flush: register writes from
+`0x200` up (vertex arrays, primitive setup, the shader units) no longer drain
+the queue, because nothing the *pixel* stage reads lives there. That is the
+flush rule from above, stated more precisely rather than loosened — and it is
+what lets consecutive draws batch together at all.
 
 **Why.** It was the one place where parallelism was available without touching
 the determinism the whole test strategy rests on (§4.2, §6.4). The CPU side
@@ -1059,6 +1097,12 @@ definition, and interpreting is the correct baseline. float32 is a deliberate
 simplification: it is *more* precise than the hardware, which mostly shows up as
 sub-pixel differences.
 
+The interpreter now **decodes each program once** per shader unit (tables built
+from the code and descriptor words, re-checked against them) and skips the
+call/if/loop stacks while they are empty. That is the cheap half of what a
+shader recompiler would buy, without a compiler at run time — which matters,
+because on iOS there could not be one for CPU code anyway.
+
 **Instead we could have** implemented exact float24 (truncate every result
 through `f32_to_f24` — slower but bit-exact), or translated shaders to host
 shaders at run time (which, per §5.1, is legal even on iOS).
@@ -1083,6 +1127,74 @@ listed as stopping for exactly this reason).
 the hardware and the patience; or they are the specific places where you might
 decide the GPLv2 trade is worth it. A conscious, isolated decision — which is
 exactly how you want that kind of thing to be structured.
+
+### 5.5 A second renderer: Vulkan, checked against the first
+
+**What we do.** `gpu/vkr.c` draws on the host GPU. It takes the *same queue*
+the software rasteriser drains (§5.2), batch by batch, and the division of
+labour is deliberate:
+
+- **Stays on the CPU:** command lists, the GX engines, texture *decoding*,
+  vertex shading (still multithreaded, still the interpreter) and clipping.
+  Triangles arrive at the GPU already in window coordinates with `1/w`
+  alongside, which is all a hardware rasteriser needs — and makes perspective-
+  correct interpolation fall out for free.
+- **Moves to the GPU:** the whole pixel stage as *one* fragment shader — six
+  combiner stages, alpha test, per-pixel lighting with its 24 tables,
+  spotlights, attenuation, Fresnel, normal maps, and fog — reading state from a
+  uniform block, plus the fixed-function state (depth, stencil, blending, logic
+  op, masks, culling, scissor) which maps nearly one-to-one onto Vulkan's.
+- **Textures** are decoded by `texture.c`'s existing decoder into RGBA8 (every
+  reachable mip level, cube faces as layers) and cached by address, size, format
+  and a hash of their bytes. The shader then does `texture.c`'s wrap, border,
+  filtering, LOD and mip selection *itself*, in the same order of operations,
+  with `texelFetch` — rather than handing any of it to the sampler.
+- **Render targets** live in 3DS memory, tiled. A surface cache keeps a GPU
+  image per buffer; batches are recorded into one command buffer and submitted
+  by `vkr_sync` at the end of a command list, before a software batch, and
+  before a texture is read from memory the GPU drew on. Only targets that were
+  drawn on are read back.
+
+**Why it is trustworthy.** Three choices, and they are the whole reason this
+can be believed:
+
+1. **Exactness over convenience.** The shader runs the combiners in the software
+   path's *integer* arithmetic. Depth is `D32_SFLOAT` holding the PICA's integer
+   depth times 2^-bits — a value floats represent exactly — so depth tests
+   compare the same integers as software. The known, bounded differences are
+   written down: blending may round by one step, and a pixel exactly on a shared
+   edge may go to the other triangle.
+2. **Per-batch fallback.** `vkr_can_draw` asks whether the current state is one
+   the GPU path covers; if not, *that batch* goes to software, and the two mix
+   freely because targets are shared through 3DS memory. So the renderer was
+   correct at every step of its construction, including when it only did flat
+   colours — and the batches left behind are counted by reason and printed at
+   exit, which is a to-do list that maintains itself.
+3. **Agreement is a test.** `make test-vulkan` re-runs every GPU example with
+   `GPU_BACKEND=vulkan` and compares against the software frames from the
+   compat sweep, on **lavapipe** — a CPU driver — so it needs no GPU and could
+   run anywhere, CI included (it does not yet: §6.8).
+
+**Instead we could have** translated PICA vertex shaders to GPU shaders too (a
+later, optional step; vertex shading is not the bottleneck), compiled a
+specialised shader per state combination instead of one shader with uniform
+branches (faster in theory, a shader cache and a compiler dependency in
+practice — and the current branches are uniform across a draw, which modern GPUs
+handle well), or used Vulkan samplers for filtering instead of doing it in the
+shader (much less code, and it would have given up bit-comparability with the
+software path immediately).
+
+**What it costs.** ~1500 lines of C, a 519-line GLSL shader compiled at build
+time into a committed SPIR-V header (so no shader compiler ships), and a second
+implementation of every pixel-stage rule — which must be kept in step with the
+first by hand. The payoff is measured: **Lumiose City at ~42 fps against ~10 in
+software**, same frame.
+
+**Lever.** The duplication is the thing to watch. Every pixel-stage rule now
+exists twice, in C and in GLSL, and only `make test-vulkan` holds them together
+— so that test is now load-bearing and should run on every change to either.
+If the two ever drift badly, the answer is to generate both from one
+description rather than to delete the software path, which is the oracle.
 
 ---
 
@@ -1115,12 +1227,36 @@ divergence tells you nothing about where), compared against hardware traces
 that take function pointers (random inputs would make them call random
 addresses), and runtime.
 
-**Lever.** The one thing missing is a **fuzzer**: generate random *encodings*
-(all condition codes, all shift forms, all register combinations) and diff them
-against Unicorn, rather than only testing instructions that appear in programs
-you compiled. That would have found the Capstone bugs before real code did, and
-it is maybe 150 lines on top of the existing harness. Highest-value test work
-available.
+**Lever (taken).** The gap here used to be that only instruction *forms a
+compiler happened to emit* were ever tested. `make fuzz SEED=1 N=200`
+(`tests/fuzz/gen.py`) now generates random ARM and Thumb programs — 10-40
+instructions and a return — assembles them, recompiles them, and hands them to
+this same M3 driver. ~11,000 random instructions, no divergences, and it
+immediately named four instructions that were not translated at all
+(`qadd`/`qsub`/`qdadd`/`qdsub`), which were then implemented with the sticky Q
+flag (§3.3).
+
+Four decisions in it are worth copying into any future fuzzer:
+
+- **It implements no second oracle.** `gen.py` is standard-library Python that
+  drives the assembler, the recompiler and the existing driver. The oracle is
+  still Unicorn, so there is nothing new to be wrong.
+- **Rejections are gaps, not passes.** An instruction the translator refuses
+  removes its setup and is listed separately; it never silently becomes a tick.
+- **Failure modes are distinguished by exit code**: 1 for a confirmed
+  divergence, 2 for an assembler error, timeout or harness failure. It cannot
+  pass by failing to run.
+- **Unpredictable encodings are excluded by construction**, not triaged: no
+  PC/SP destinations, no svc, no privileged instructions, no branch formats, and
+  memory bases pinned inside the driver's 4 KiB scratch so random arithmetic
+  cannot move them. Hardware and Unicorn are allowed to disagree about
+  UNPREDICTABLE encodings, so generating them would only manufacture phantoms.
+
+It also shrinks: chunk deletion, then unit deletion, keeping the failing
+mnemonic, with reproducers committed to `tests/fuzz/found/`. And it is
+deliberately *outside* `make test` — found cases need human triage and the run
+is long. That is right, and it is also why it should be a scheduled CI job
+(§6.8) rather than something you remember to run.
 
 ### 6.2 Differential testing against natively compiled C
 
@@ -1179,8 +1315,20 @@ retail games as the metric (not committable, not shareable, not reproducible).
 **What it costs.** Depends on devkitPro's examples being installed, and 8 of
 them do not build for reasons that have nothing to do with us.
 
-**Lever.** This is the right metric and the right harness. The missing piece is
-that **nothing runs it automatically** — see §9.9.
+**The harness itself was wrong, and an outsider found it.** The sweep counted a
+run as `runs` if its log said it had exited — *before* checking the exit code or
+the sanitizer reports. So a run that tripped ASan and died could still be
+scored as a pass. A sanitizer report or a nonzero exit now wins.
+
+That is the worst category of bug there is: not in the thing being measured, in
+the thing doing the measuring, inflating your own numbers. It is also the
+category you structurally cannot find yourself, because you wrote both halves.
+It came from an outside review within days of the repository going public, which
+is the clearest argument for being public that this project has produced.
+
+**Lever.** This is the right metric and the right harness, and it now runs in CI
+(§6.8). Treat the harness as code that needs review like any other — it is the
+only code whose bugs make everything else look better than it is.
 
 ### 6.6 Tracing and introspection
 
@@ -1253,6 +1401,44 @@ than it was: it is what stands between `-O1` and `-O2` on a game, and `-O0` to
 Makefile is near the limit of what is pleasant to extend; a generated build
 (CMake/ninja) would pay for itself eventually. Not urgent.
 
+### 6.8 CI, and briefs as a unit of work
+
+**CI.** `make test` runs on every push and pull request to `main`, inside the
+official devkitPro container **pinned to an image digest**, with clang's
+sanitizer runtimes, the Vulkan headers and `libunicorn-dev` — and a step that
+*fails the build* if Unicorn is not 2.0.1, because the reference tests were
+developed against it and a reference CPU silently changing version is the one
+dependency update that could invalidate every result. The checkout runs with
+`persist-credentials: false` and the job with `permissions: contents: read`.
+
+Setting it up paid for itself immediately by finding a bug nobody could have hit
+locally: a clean checkout failed because one test's output directory only ever
+existed because an earlier run had made it. That is the general value of CI here
+— not catching regressions so much as **proving the repository builds for
+someone who is not you**, which for a public project is the whole game.
+
+An unintended benefit worth knowing: because the container holds devkitARM,
+libctru, picasso, the examples and Unicorn, CI is now a complete toolchain that
+does not live on any one machine. Translator work can be done from a borrowed
+computer with no local setup at all.
+
+What it does not cover yet: the Windows build (§8.9), `make test-vulkan` (which
+needs lavapipe installed), and `make fuzz` (deliberately outside `make test`,
+but a natural scheduled or manually-triggered job).
+
+**Briefs.** A newer practice, and an unusual one worth naming: `docs/handoff/`
+holds written briefs for self-contained pieces of work — the CI setup, the
+Windows crash, the fuzzer, the saturating instructions, sound output. The
+saturating-instruction work was then *written by a different agent from its
+brief* and reviewed here, gated on `make test` and `make fuzz`.
+
+That only works because of everything else in this section: a change can be
+handed to a stranger precisely because the oracles (Unicorn lockstep, frame
+hashes, the sweep, the fuzzer) decide whether it is right, instead of the
+author's judgement. It is worth seeing the briefs as the same kind of artefact
+as this document — the project's understanding of itself, written down where it
+can be acted on.
+
 ---
 
 ## 7. The legal architecture
@@ -1271,11 +1457,23 @@ any technical consideration:
 - **No Azahar code**, which is what keeps the licence open — and is why `gpu/`
   and `hle/` exist at all, and why undocumented features stop by name (§5.4).
 
-**Open decision: there is no licence.** The README says "not chosen yet". That
-was correct while reusing Azahar was still on the table; now that `gpu/` and
-`hle/` are your own, it is a decision you can make — and the longer it waits,
-the more contributors and code exist under no terms at all. Pick one (MIT,
-Apache-2.0, or GPLv2 if you still want to leave the Azahar door open).
+**Decided: GPL v2 or later.** This used to be the one open question in this
+section. `LICENSE` is now the FSF's text, and the README states up front that
+there is no Nintendo code, firmware or keys here, that a game needs a dump of a
+cartridge you own, and that requests for ROMs or keys are closed. Contributions
+may only bring in code whose licence is compatible with GPL v2 or later.
+
+Two consequences worth holding consciously, neither of them a problem:
+
+- **The Azahar door is open again.** Having written `gpu/` and `hle/` yourself,
+  you were free to pick anything; choosing copyleft means borrowing from Azahar
+  (or any GPL emulator) is now a normal engineering decision rather than a
+  licence event. The undocumented corners of §5.4 are where that may eventually
+  matter.
+- **The App Store is closed for good**, since GPL v2 is widely held to be
+  incompatible with its distribution terms. The practical cost is near zero: the
+  per-game AOT model was never App Store material anyway (§8.1), and sideloading
+  is unaffected. But it is now a settled fact rather than an option.
 
 ---
 
@@ -1345,16 +1543,29 @@ it just had to be collected. The second is that `MemoryFill` is a reminder that
 a hot loop with a modulo in it will out-cost almost any clever thing elsewhere;
 it was a fifth of a whole game.
 
-Where it stands now: roughly **15 fps in heavy 3D scenes and near 60 with
-drawing skipped**. So the CPU translation — the thing this project is *about* —
-is at or near real time on a desktop, and **the software rasteriser is now the
-bottleneck**, exactly as §5.1 and §8.8 predicted. That changes the priority
-order in §9: the next big win is a hardware renderer, not more CPU work.
+That diagnosis — CPU at real time, software rasteriser the bottleneck — held,
+and the answer was built (§5.5). Where it stands now:
+
+| | software | Vulkan |
+|---|---|---|
+| Lumiose City | ~10 fps | **~42 fps** (RTX 4060 laptop) |
+
+with the same frame either way. The remaining gains in that jump came from the
+vertex side and the GPU path, every step held to a byte-identical frame: the
+shader interpreter decoding each program once, vertex arrays and shader
+input/output layout worked out once per draw, triangles outside a clip plane
+dropped before clipping copies them, and the OS layer built at `-O2`.
+
+So the project now runs a commercial game at roughly two thirds of the
+console's frame rate in its most demanding area, on a laptop. The honest caveats:
+that is one scene, on one GPU, on x86-64 — nothing has been measured on arm64,
+which is the platform the whole thing is for.
 
 What is still unmeasured: there is no committed, repeatable benchmark, so none
 of this is regression-protected — the next change that costs 20% will not
-announce itself. And register localisation and flag liveness (§3.1, §3.3) remain
-reasoning rather than measurement; they are now second-order against the GPU.
+announce itself, and there are now two renderers and two platforms for it to
+hide in. Register localisation and flag liveness (§3.1, §3.3) remain reasoning
+rather than measurement, and are now third-order.
 
 ### 8.5 Zero is not a safe default for data the HLE invents
 
@@ -1398,7 +1609,34 @@ which is a trade nothing on the CPU side can offer.
 What remains: one core for all guest code, forever, unless you are willing to
 lose deterministic runs. On a phone that is the number that decides whether a
 game is playable, and it is why §9.12 (moving shading off the CPU entirely)
-matters more than any further CPU-side micro-optimisation.
+mattered more than any further CPU-side micro-optimisation.
+
+### 8.9 Windows is now a second platform, and only one of them is tested
+
+The Vulkan renderer needs a real GPU, which meant native Windows: programs are
+cross-compiled from WSL with `clang --target=x86_64-w64-mingw32` and
+winpthreads, and `runtime/host.h` holds everything that differs — the 4 GiB
+guest space (`VirtualAlloc` instead of `mmap`), the mapped RomFS
+(`MapViewOfFile`), binary file opens, `pread`/`pwrite`, `mkdir`, `ftruncate`,
+rename-over for the live view, and the CPU count. That the list is that short,
+for 25k lines of C, is a good sign about the portability of the rest.
+
+The cost is that the project now has two platforms and CI covers one. The bugs
+that have actually appeared on Windows are exactly the ones Linux cannot show:
+a 2 GB dump overflowing a 32-bit `off_t`, a too-small main stack, and — the
+expensive one — clang's native thread-locals misbehaving in a static MinGW
+link, so the rasteriser's per-thread stats pointer held garbage (`-femulated-tls`
+fixes it). Link-level and ABI-level problems, invisible to a Linux build.
+
+The cheap mitigation is that the Windows build is a *cross*-compile: CI can
+build the `.exe` without being able to run it, which would catch that whole
+class. The expensive half — actually running it — needs a Windows runner, and
+can wait.
+
+A second thing worth noting: the correctness story survived the port intact.
+The recompiled hello world built for Windows produces a last frame matching the
+same `hello_frame.sha256` as on Linux. A pixel-exact hash is a stronger
+portability test than any amount of "it seems to work".
 
 ---
 
@@ -1406,13 +1644,28 @@ matters more than any further CPU-side micro-optimisation.
 
 Ranked by (value ÷ effort), with what each depends on.
 
-**Re-ranked after the first speed round.** Two of these are done and one has
-moved to the top. `-O1`, the `recomp_find` cache and the `MemoryFill` fix
-together bought ~7x (§8.4), which retired most of 9.7 and the urgent half of
-9.1 — and moved the bottleneck to the software rasteriser. So the order is now
-roughly: **9.12 (hardware renderer)**, then 9.2 (the `-O1` → `-O2` unlock),
-then 9.1 (lock in what you measured), then 9.6 (interpreter fallback), then the
-IR chain 9.3 → 9.4 → 9.5, with 9.8/9.9/9.11 cheap and worth doing any time.
+**Re-ranked twice; most of this list is now done.** The first speed round
+(`-O1`, the `recomp_find` cache, the `MemoryFill` fix) bought ~7x and retired
+most of 9.7. Then the second round built 9.12 (the Vulkan renderer, §5.5), 9.8
+(the fuzzer, §6.1), 9.9 (CI, §6.8) and 9.11 (GPL v2+, §7).
+
+What is actually left, in order:
+
+1. **9.1 — a committed benchmark.** Now the most valuable item on the list, for
+   the opposite reason to when it was written: not to find out how fast this is,
+   but to keep it. There are two renderers and two platforms for a regression to
+   hide in, and nothing watching.
+2. **9.2 — narrow the computed-jump switches.** Still the `-O1` → `-O2` unlock,
+   still the reason single generated files reach 100 MB.
+3. **9.6 — the interpreter fallback.** Unchanged, and still the thing that turns
+   three structural limits into slow paths.
+4. **9.3 → 9.4 → 9.5 — the IR chain.** Now third-order for speed, but still what
+   makes `translate.py` maintainable.
+5. **9.10 — your own decoder.** Cheaper to attempt than it was, because the
+   fuzzer now backstops it.
+
+Plus the two gaps the new work opened: the Windows cross-build and `make fuzz`
+belong in CI (§6.8, §8.9), and `make test-vulkan` is now load-bearing (§5.5).
 
 ### 9.1 Lock in what you measured (the benchmark, now for regressions)
 
@@ -1499,20 +1752,20 @@ again, e.g. in a game that loads many CRO modules and calls across them.
 
 *Effort:* an afternoon in `emit_c.py` + `runtime.c`, if it is ever needed.
 
-### 9.8 An instruction fuzzer
+### 9.8 An instruction fuzzer — done
 
-§6.1. Random encodings → diff against Unicorn. Catches whole classes of
-Capstone-trust and flag-semantics bugs that real programs only reach by luck.
+§6.1. `make fuzz` generates random ARM and Thumb programs and diffs them
+against Unicorn through the existing M3 driver. ~11,000 instructions clean, and
+it found four untranslated instructions on its first run. What remains is only
+to schedule it (§6.8) so it runs without being remembered, and to keep feeding
+`tests/fuzz/found/` as a regression corpus.
 
-*Effort:* ~150 lines on the existing harness. *Value:* high, permanently.
+### 9.9 CI — done
 
-### 9.9 CI
-
-There is no `.github/` at all. `make test` is a strong gate that currently only
-runs when you remember. devkitPro publish Docker images, so an Actions workflow
-running `make test` (and the sweep, nightly) is very doable.
-
-*Effort:* a day. *Value:* the gate becomes real.
+§6.8. `make test` runs on every push and pull request in a digest-pinned
+devkitPro container, with a hard check that Unicorn is still 2.0.1. Remaining:
+the Windows cross-build, `make test-vulkan` on lavapipe, and a scheduled
+`make fuzz`.
 
 ### 9.10 Write the decoder (optional)
 
@@ -1522,27 +1775,21 @@ Capstone for comment text. Removes every workaround and the version pin.
 *Effort:* medium, well-tested by 9.8. *Value:* correctness confidence and the
 end of fighting a disassembler for semantic facts.
 
-### 9.11 Choose a licence
+### 9.11 Choose a licence — done
 
-§7. It is a one-line change and a real decision; the cost of deferring grows.
+§7. GPL v2 or later, with the legal statement up front in the README and
+contribution rules to match.
 
-### 9.12 The hardware GPU backend — now the top item
+### 9.12 The hardware GPU backend — done
 
-§5.1, §8.4. The measurement moved this from "someday" to "next": the CPU
-translation is at or near real time and the software rasteriser is what holds
-the frame rate at ~15 fps in 3D.
+§5.5. Built in five steps, software kept as the reference oracle, agreement
+made a test on a CPU Vulkan driver so it runs anywhere. ~10 fps → ~42 fps in
+Lumiose, same frame.
 
-Keep the software path as the **reference oracle** — it is a correctness
-asset you cannot buy, and the §5.2 banding means it already produces
-deterministic, comparable frames. Add a Vulkan (later Metal) backend behind the
-same interface and diff frames between the two; any disagreement is a localised
-bug rather than a mystery. Two things in your favour: run-time *shader*
-compilation is allowed on iOS even though CPU JIT is not, so this half of the
-system may be dynamic; and the flush-on-state-change discipline (§5.2) is
-already close to how you would batch draws for a real GPU.
-
-*Effort:* large. *Value:* the difference between "correct" and "playable", and
-it is the only item on this list that can still buy an order of magnitude.
+What is left of it: MoltenVK/Metal for the iOS endgame (a port of this, not a
+third renderer), vertex shaders on the GPU if they ever become the bottleneck,
+and keeping the two pixel-stage implementations in step — which is now
+`make test-vulkan`'s job and nothing else's.
 
 ---
 
@@ -1571,8 +1818,9 @@ it is the only item on this list that can still buy an order of magnitude.
 | 4.3 | virtual clock, `--speed N` paces it | wall clock | deterministic by default, playable on request | pacing only waits, never skips |
 | 4.6 | unknown = named stop (undocumented hardware: read zero, log once) | log and continue | always a named next task | one gap stops the app; the zero-reads are hypotheses |
 | 4.9 | services sample shared memory each frame | write traps / check per svc | flat memory has no write hooks | a guest that writes twice per frame loses a change |
-| 5.1 | own software GPU | Azahar's / host GPU | licence; pixel-exact oracle | ~15 fps in 3D: now the bottleneck |
+| 5.1 | own software GPU, kept as the reference | Azahar's / only a host GPU | licence; a pixel-exact oracle | ~10 fps in 3D on its own |
+| 5.5 | a second renderer in Vulkan, agreement tested | samplers/specialised shaders; no software path | ~42 fps, same frame; correct at every step | every pixel rule exists twice, in C and GLSL |
 | 5.2 | rasterise in row-stripe bands on all cores | per-tile queues / a GPU thread | parallel with byte-identical output | no CPU/GPU overlap; state changes serialise |
 | 5.3 | interpret shaders, float32 | exact float24 / host shaders | shaders only exist at run time | precision artefacts possible |
-| 6.1 | Unicorn lockstep diff | exit-state compare | pinpoints the exact instruction | test-only dependency |
+| 6.1 | Unicorn lockstep diff, plus a fuzzer | exit-state compare | pinpoints the exact instruction; random coverage | test-only dependency, pinned to 2.0.1 |
 | 6.5 | compat sweep as metric | curated suite | honest, external, regression-proof | needs devkitPro examples |
